@@ -7002,13 +7002,15 @@ final class CloudAppModel {
                     revision: 1
                 ))
                 if scenario == "typing" {
+                    // Keep the deterministic fixture alive across slow hosted UI automation.
+                    // Production typing leases still use the short server-provided expiry.
                     presenceCoordinator.handle(TypingUpdateHint(
                         type: "typing_update",
                         dialogId: TelegramFastUITestFixture.primaryDialogId,
                         actorAccountId: TelegramFastUITestFixture.peerAccountId,
                         typingSessionId: "00000000-0000-4000-8000-000000000701",
                         active: true,
-                        expiresInMs: 7_000
+                        expiresInMs: 30_000
                     ))
                 }
             }
