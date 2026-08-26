@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { timingSafeEqual } from "node:crypto";
 import { requireActiveDevice } from "./auth";
-import { draftBodyAAD, draftResponseAAD, open, requestFingerprintHMAC, seal } from "./crypto";
+import { draftBodyAAD, draftResponseAAD, requestFingerprintIndex } from "./crypto";
 import {
   DialogAccessError,
   lockDialogForMutation,
@@ -15,6 +15,8 @@ import {
 } from "./locks";
 import { mediaDTOFromRow, type MediaDTO } from "./media";
 import { notifySyncWakeups } from "./sync-wakeup";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
+import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 
 export class DraftError extends Error {
   constructor(
@@ -192,8 +194,10 @@ function normalizeDraft(input: {
     : { state, text, replyToMsgId, mentions, attachments };
 }
 
-function draftFingerprint(dialogId: string, draft: NormalizedDraft): Buffer {
-  return requestFingerprintHMAC("draft-mutation", JSON.stringify({
+function draftFingerprint(dialogId: string, draft: NormalizedDraft): {
+  canonical: string; digest: Buffer; keyId: string;
+} {
+  const canonical = JSON.stringify({
     dialog_id: dialogId,
     state: draft.state,
     text: draft.text,
@@ -204,30 +208,39 @@ function draftFingerprint(dialogId: string, draft: NormalizedDraft): Buffer {
       media_id: attachment.mediaId,
       position: attachment.position,
     })),
-  }));
+  });
+  const index = requestFingerprintIndex("draft-mutation", canonical);
+  return { canonical, digest: index.digest, keyId: index.keyId };
 }
 
-function draftFromCachedResponse(row: any, accountId: string, operationId: string): DraftDTO {
+async function draftFromCachedResponse(
+  sql: SQL, row: any, accountId: string, operationId: string,
+): Promise<DraftDTO> {
   if (row.status !== "completed" || row.response_key_id == null
     || row.response_nonce == null || row.response_ciphertext == null) {
     throw new DraftError("draft mutation already in progress", 409, "draft_mutation_in_progress");
   }
-  return JSON.parse(open({
+  return JSON.parse((await openForScope(sql, { kind: "account", accountId }, {
     keyId: row.response_key_id,
     nonce: buf(row.response_nonce),
     ciphertext: buf(row.response_ciphertext),
-  }, draftResponseAAD(accountId, operationId)).toString("utf8")) as DraftDTO;
+  }, draftResponseAAD(accountId, operationId))).toString("utf8")) as DraftDTO;
 }
 
 function requireMatchingFingerprint(
   row: any,
   dialogId: string,
-  fingerprint: Buffer,
+  fingerprint: { canonical: string; digest: Buffer; keyId: string },
 ): void {
   const existingFingerprint = buf(row.payload_fingerprint);
+  const expected = requestFingerprintIndex(
+    "draft-mutation",
+    fingerprint.canonical,
+    row.fingerprint_key_id ?? "legacy-v1",
+  ).digest;
   if (row.dialog_id !== dialogId
-    || existingFingerprint.length !== fingerprint.length
-    || !timingSafeEqual(existingFingerprint, fingerprint)) {
+    || existingFingerprint.length !== expected.length
+    || !timingSafeEqual(existingFingerprint, expected)) {
     throw new DraftError(
       "operation id already used with a different draft",
       409,
@@ -302,6 +315,10 @@ export async function loadDrafts(
       AND attachment.dialog_id = ANY(${sql.array(draftDialogIds, "uuid")}::uuid[])
     ORDER BY attachment.dialog_id, attachment.position`;
   const attachmentsByDialog = new Map<string, DraftAttachmentDTO[]>();
+  await preloadEnvelopeKeys(sql, [
+    ...drafts.flatMap((row: any) => [row.body_key_id, row.reply_body_key_id]),
+    ...attachments.map((row: any) => row.file_name_key_id),
+  ].filter(Boolean).map(String));
   for (const row of attachments) {
     const dialogId = String(row.dialog_id);
     const current = attachmentsByDialog.get(dialogId) ?? [];
@@ -309,7 +326,7 @@ export async function loadDrafts(
       attachment_id: row.attachment_id,
       media_id: row.media_id,
       position: n(row.position),
-      media: mediaDTOFromRow(row),
+      media: await mediaDTOFromRow(sql, row),
     });
     attachmentsByDialog.set(dialogId, current);
   }
@@ -318,11 +335,11 @@ export async function loadDrafts(
   for (const row of drafts) {
     const dialogId = String(row.dialog_id);
     const revision = n(row.revision);
-    const text = open({
+    const text = (await openForScope(sql, { kind: "account", accountId }, {
       keyId: row.body_key_id,
       nonce: buf(row.body_nonce),
       ciphertext: buf(row.body_ciphertext),
-    }, draftBodyAAD(accountId, dialogId, revision)).toString("utf8");
+    }, draftBodyAAD(accountId, dialogId, revision))).toString("utf8");
     const replyToMsgId = row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id);
     let replyPreview: DraftReplyPreviewDTO | null = null;
     if (replyToMsgId != null) {
@@ -330,13 +347,18 @@ export async function loadDrafts(
         row.reply_expires_at != null
         && new Date(row.reply_expires_at).getTime() <= Date.now()
       );
-      const replyText = unavailable || row.reply_body_ciphertext == null ? "" : open({
-        keyId: row.reply_body_key_id,
-        nonce: buf(row.reply_body_nonce),
-        ciphertext: buf(row.reply_body_ciphertext),
-      }, Buffer.from(
-        `toj/msg|${dialogId}|${replyToMsgId}|${row.reply_sender_account_id}`,
-        "utf8",
+      const replyText = unavailable || row.reply_body_ciphertext == null ? "" : (await openForScope(
+        sql,
+        { kind: "account", accountId: String(row.reply_sender_account_id) },
+        {
+          keyId: row.reply_body_key_id,
+          nonce: buf(row.reply_body_nonce),
+          ciphertext: buf(row.reply_body_ciphertext),
+        },
+        Buffer.from(
+          `toj/msg|${dialogId}|${replyToMsgId}|${row.reply_sender_account_id}`,
+          "utf8",
+        ),
       )).toString("utf8");
       replyPreview = {
         msg_id: replyToMsgId,
@@ -411,12 +433,23 @@ export async function putDraft(sql: SQL, input: {
       draftMutationReceiptKey(input.accountId, operationId),
     ]);
     const tombstone = (await tx`
-      SELECT dialog_id, payload_fingerprint, resulting_revision
+      SELECT dialog_id, payload_fingerprint, fingerprint_key_id, resulting_revision
       FROM draft_mutation_tombstones
       WHERE account_id = ${input.accountId} AND operation_id = ${operationId}
       FOR SHARE`)[0];
     if (tombstone) {
+      if (tombstone.fingerprint_key_id === EXPIRED_BLIND_INDEX_KEY_ID) {
+        await authorizeDuplicate(tx, input.accountId, input.deviceId, String(tombstone.dialog_id));
+        throw new DraftError(
+          "draft receipt no longer has a recoverable result", 409, "draft_result_expired",
+        );
+      }
       requireMatchingFingerprint(tombstone, dialogId, fingerprint);
+      if (String(tombstone.fingerprint_key_id ?? "legacy-v1") !== fingerprint.keyId) {
+        await tx`UPDATE draft_mutation_tombstones
+          SET payload_fingerprint = ${fingerprint.digest}, fingerprint_key_id = ${fingerprint.keyId}
+          WHERE account_id = ${input.accountId} AND operation_id = ${operationId}`;
+      }
       await authorizeDuplicate(tx, input.accountId, input.deviceId, dialogId);
       const current = (await loadDrafts(tx, input.accountId, [dialogId])).get(dialogId);
       if (!current) {
@@ -427,22 +460,28 @@ export async function putDraft(sql: SQL, input: {
 
     const claim = await tx`
       INSERT INTO draft_mutation_requests (
-        account_id, operation_id, dialog_id, payload_fingerprint, status
+        account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id, status
       )
-      VALUES (${input.accountId}, ${operationId}, ${dialogId}, ${fingerprint}, 'pending')
+      VALUES (${input.accountId}, ${operationId}, ${dialogId},
+              ${fingerprint.digest}, ${fingerprint.keyId}, 'pending')
       ON CONFLICT (account_id, operation_id) DO NOTHING
       RETURNING operation_id`;
     if (claim.length === 0) {
       const existing = (await tx`
-        SELECT dialog_id, payload_fingerprint, status, response_key_id,
+        SELECT dialog_id, payload_fingerprint, fingerprint_key_id, status, response_key_id,
                response_nonce, response_ciphertext
         FROM draft_mutation_requests
         WHERE account_id = ${input.accountId} AND operation_id = ${operationId}
         FOR UPDATE`)[0];
       requireMatchingFingerprint(existing, dialogId, fingerprint);
+      if (String(existing.fingerprint_key_id ?? "legacy-v1") !== fingerprint.keyId) {
+        await tx`UPDATE draft_mutation_requests
+          SET payload_fingerprint = ${fingerprint.digest}, fingerprint_key_id = ${fingerprint.keyId}
+          WHERE account_id = ${input.accountId} AND operation_id = ${operationId}`;
+      }
       await authorizeDuplicate(tx, input.accountId, input.deviceId, dialogId);
       return {
-        draft: draftFromCachedResponse(existing, input.accountId, operationId),
+        draft: await draftFromCachedResponse(tx, existing, input.accountId, operationId),
         duplicate: true,
         pushes: [],
       };
@@ -508,7 +547,9 @@ export async function putDraft(sql: SQL, input: {
     });
     const revision = pushes[0]?.pts;
     if (!revision) throw new DraftError("unable to allocate draft revision", 409);
-    const sealed = seal(
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId: input.accountId },
       normalized.state === "active" ? normalized.text : "",
       draftBodyAAD(input.accountId, dialogId, revision),
     );
@@ -563,7 +604,12 @@ export async function putDraft(sql: SQL, input: {
     const draft = loaded.get(dialogId);
     if (!draft) throw new DraftError("draft persistence failed", 500);
     draft.updated_at = iso(stored.updated_at);
-    const cached = seal(JSON.stringify(draft), draftResponseAAD(input.accountId, operationId));
+    const cached = await sealForScope(
+      tx,
+      { kind: "account", accountId: input.accountId },
+      JSON.stringify(draft),
+      draftResponseAAD(input.accountId, operationId),
+    );
     await tx`
       UPDATE draft_mutation_requests SET
         status = 'completed',
@@ -613,7 +659,12 @@ export async function consumeDraftInTransaction(
   });
   const revision = pushes[0]?.pts;
   if (!revision) throw new DraftError("unable to allocate draft revision", 409);
-  const sealed = seal("", draftBodyAAD(input.accountId, input.dialogId, revision));
+  const sealed = await sealForScope(
+    sql,
+    { kind: "account", accountId: input.accountId },
+    "",
+    draftBodyAAD(input.accountId, input.dialogId, revision),
+  );
   await sql`
     UPDATE account_dialog_drafts SET
       state = 'cleared',
@@ -660,9 +711,11 @@ export async function purgeRevokedDialogDraftState(
     FOR UPDATE`;
   await sql`
     INSERT INTO draft_mutation_tombstones (
-      account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+      account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+      resulting_revision
     )
-    SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+    SELECT account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+           resulting_revision
     FROM draft_mutation_requests
     WHERE account_id = ${accountId} AND dialog_id = ${dialogId} AND status = 'completed'
     ON CONFLICT (account_id, operation_id) DO NOTHING`;

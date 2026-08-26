@@ -2,6 +2,7 @@ import { $ } from "bun";
 import { DEFAULT_URL, makeSql } from "./db";
 import { backfillMessageForwardMarkers } from "./message-forward-backfill";
 import { reconcileExistingSavedDialogs } from "./saved-dialog-reconciliation";
+import { backfillBlindIndexKeyLabels } from "./blind-index-label-migration";
 
 // Apply contract DDL atomically, build indexes on existing hot tables without blocking writes,
 // then validate the new constraint under a short lock timeout. Every phase is idempotent.
@@ -60,6 +61,7 @@ const cloudProductivityContract = new URL(
   import.meta.url,
 ).pathname;
 const presenceExpandSchema = new URL("./schema-presence-expand.sql", import.meta.url).pathname;
+const cryptoWriteFence = new URL("./schema-crypto-write-fence.sql", import.meta.url).pathname;
 const messagingParityExpand = new URL(
   "./schema-messaging-parity-expand.sql",
   import.meta.url,
@@ -127,11 +129,27 @@ if (!forwardMigrationComplete) {
 const migrationSql = makeSql(url);
 let messageForwardBackfill;
 let savedDialogReconciliation;
+let coreBlindIndexLabelBackfill;
 try {
+  coreBlindIndexLabelBackfill = await backfillBlindIndexKeyLabels(migrationSql, [
+    "devices", "otp-network", "call-network",
+  ]);
   messageForwardBackfill = await backfillMessageForwardMarkers(migrationSql);
   savedDialogReconciliation = await reconcileExistingSavedDialogs(migrationSql);
 } finally {
   await migrationSql.end();
+}
+for (const [table, constraint] of [
+  ["devices", "devices_push_hash_key_check"],
+  ["devices", "devices_voip_push_hash_key_check"],
+  ["otp_challenges", "otp_challenges_network_hash_key_check"],
+  ["call_invite_attempts", "call_invite_attempts_network_hash_key_check"],
+  ["send_requests", "send_requests_fingerprint_key_check"],
+] as const) {
+  await $`psql ${url} -v ON_ERROR_STOP=1 -c ${
+    `SET lock_timeout = '2s'; SET statement_timeout = '30min';`
+      + ` ALTER TABLE ${table} VALIDATE CONSTRAINT ${constraint}`
+  }`.quiet();
 }
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messageForwardContractSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE devices VALIDATE CONSTRAINT devices_voip_push_environment_check"`.quiet();
@@ -447,6 +465,16 @@ while (true) {
 }
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityExpand}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityConcurrent}`.quiet();
+const productivityBackfillSql = makeSql(url);
+let productivityBlindIndexLabelBackfill;
+try {
+  productivityBlindIndexLabelBackfill = await backfillBlindIndexKeyLabels(
+    productivityBackfillSql,
+    ["message-preview-url"],
+  );
+} finally {
+  await productivityBackfillSql.end();
+}
 await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
   SET lock_timeout = '2s';
   SET statement_timeout = '30min';
@@ -472,6 +500,12 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
   ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_auto_delete_seconds_check;
   ALTER TABLE push_account_bindings
     VALIDATE CONSTRAINT push_account_bindings_enabled_check;
+  ALTER TABLE push_installations
+    VALIDATE CONSTRAINT push_installations_normal_hash_key_check;
+  ALTER TABLE push_installations
+    VALIDATE CONSTRAINT push_installations_voip_hash_key_check;
+  ALTER TABLE two_factor_attempt_budgets
+    VALIDATE CONSTRAINT two_factor_attempt_network_key_check;
   DO $$
   BEGIN
     IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'messages'::regclass
@@ -490,6 +524,9 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
   $$;
 `}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messagingParityContract}`.quiet();
+// The write fence attaches triggers to every encrypted table, so it must run after the
+// messaging-parity tables it also guards (message_polls, push_installations) exist.
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cryptoWriteFence}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${accountPrivateCleanupExpand}`.quiet();
 let accountPrivateCleanupReconciliations = 0;
 const cleanupMigrationSql = makeSql(url);
@@ -725,6 +762,10 @@ console.log(JSON.stringify({
     forwardMarkersProcessed: messageForwardBackfill.processed,
     forwardMarkerBatches: messageForwardBackfill.batches,
     dialogsReconciled: savedDialogReconciliation.processed,
+  },
+  blindIndexLabels: {
+    core: coreBlindIndexLabelBackfill,
+    productivity: productivityBlindIndexLabelBackfill,
   },
   dialogPreferences: {
     rowsScanned: preferenceRowsScanned,

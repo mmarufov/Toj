@@ -10,6 +10,8 @@ ALTER TABLE send_requests
   VALIDATE CONSTRAINT send_requests_fingerprint_size_check;
 ALTER TABLE scheduled_delivery_mutation_requests
   VALIDATE CONSTRAINT scheduled_delivery_request_fingerprint_size_check;
+ALTER TABLE message_link_previews
+  VALIDATE CONSTRAINT message_link_previews_url_hash_key_check;
 
 DO $$
 BEGIN
@@ -27,6 +29,8 @@ END;
 $$;
 
 INSERT INTO schema_migrations(name) VALUES ('cloud-productivity-contract-v1')
+ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(name) VALUES ('cloud-productivity-encryption-contract-v2')
 ON CONFLICT DO NOTHING;
 
 COMMIT;

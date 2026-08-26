@@ -249,8 +249,6 @@ describe.serial("presence_v1", () => {
 
   test("credential audit closes a revoked socket after a missed notification", async () => {
     const { alice } = await directPair();
-    const previousNotificationURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
-    process.env.TOJ_CALL_NOTIFY_DATABASE_URL = "postgres://127.0.0.1:1/unreachable";
     const server = startCloudServer(0, db, null, null, {
       backgroundWorkers: true,
       socketAuthorizationIntervalMs: 250,
@@ -269,7 +267,13 @@ describe.serial("presence_v1", () => {
     const closed = new Promise<CloseEvent>((resolve) => { socket.onclose = resolve; });
     try {
       await opened;
-      await revokeDeviceAndTerminateCalls(db, alice.accountId, alice.deviceId);
+      // Deliberately bypass both revocation notification channels. The periodic database
+      // reconciliation must still distinguish a revoked device from a disabled account and
+      // deliver the terminal control event before closing the transport.
+      await db`
+        UPDATE devices
+        SET revoked_at = now()
+        WHERE id = ${alice.deviceId} AND account_id = ${alice.accountId}`;
       const close = await Promise.race([
         closed,
         Bun.sleep(3_000).then(() => { throw new Error("authorization audit timed out"); }),
@@ -281,8 +285,6 @@ describe.serial("presence_v1", () => {
     } finally {
       socket.close();
       await Promise.race([server.stop(true), Bun.sleep(1_000)]);
-      if (previousNotificationURL === undefined) delete process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
-      else process.env.TOJ_CALL_NOTIFY_DATABASE_URL = previousNotificationURL;
     }
   }, 6_000);
 

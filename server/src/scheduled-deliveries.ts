@@ -1,16 +1,16 @@
 import type { SQL } from "bun";
 import {
-  open,
-  requestFingerprintHMAC,
+  requestFingerprintIndex,
   scheduledItemAAD,
-  seal,
 } from "./crypto";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
 import { lockAccountMutations, lockMutationKeys } from "./locks";
 import { requireDialogReadAccess } from "./dialog-access";
 import { sendMediaGroup, sendMessage, SyncError } from "./sync";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { touchWorkerHeartbeat } from "./cloud-productivity-readiness";
 import { linkPreviewsEnabledForAccount } from "./cloud-productivity-readiness";
+import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 import {
   adjustProductivityActiveJobs,
   productivityWorkerLeaseSeconds,
@@ -281,34 +281,46 @@ function itemPayload(item: ScheduledDeliveryItemDTO): StoredItemPayload {
   };
 }
 
-function fingerprint(operation: string, deliveryId: string, payload: unknown): Buffer {
-  return requestFingerprintHMAC(
+type MutationFingerprint = { canonical: string; digest: Buffer; keyId: string };
+
+function fingerprint(
+  operation: string,
+  deliveryId: string,
+  payload: unknown,
+): MutationFingerprint {
+  const canonical = JSON.stringify({ operation, deliveryId, payload });
+  const index = requestFingerprintIndex(
     "scheduled-delivery-mutation",
-    JSON.stringify({ operation, deliveryId, payload }),
+    canonical,
   );
+  return { canonical, digest: index.digest, keyId: index.keyId };
 }
 
 function sameBuffer(left: unknown, right: Buffer): boolean {
   return Buffer.from(left as Uint8Array).equals(right);
 }
 
-function deliveryDTO(
+async function deliveryDTO(
+  sql: SQL,
   accountId: string,
   row: any,
   itemRows: any[],
-): ScheduledDeliveryDTO {
+): Promise<ScheduledDeliveryDTO> {
   const deliveryId = String(row.id);
-  const items = itemRows.flatMap((item: any): ScheduledDeliveryItemDTO[] => {
-    if (!item.payload_key_id || !item.payload_nonce || !item.payload_ciphertext) return [];
-    const payload = JSON.parse(open(
+  const items: ScheduledDeliveryItemDTO[] = [];
+  for (const item of itemRows) {
+    if (!item.payload_key_id || !item.payload_nonce || !item.payload_ciphertext) continue;
+    const payload = JSON.parse((await openForScope(
+      sql,
+      { kind: "account", accountId },
       {
         keyId: String(item.payload_key_id),
         nonce: Buffer.from(item.payload_nonce),
         ciphertext: Buffer.from(item.payload_ciphertext),
       },
       scheduledItemAAD(accountId, deliveryId, n(item.item_index), String(item.client_msg_id)),
-    ).toString("utf8")) as StoredItemPayload;
-    return [{
+    )).toString("utf8")) as StoredItemPayload;
+    items.push({
       clientMsgId: String(item.client_msg_id),
       kind: String(item.kind) as ScheduledDeliveryItemDTO["kind"],
       mediaId: item.media_id == null ? null : String(item.media_id),
@@ -316,8 +328,8 @@ function deliveryDTO(
       replyToMsgId: payload.replyToMsgId ?? null,
       mentions: payload.mentions ?? [],
       linkPreviewCandidate: payload.linkPreviewCandidate ?? null,
-    }];
-  });
+    });
+  }
   return {
     id: String(row.id),
     dialogId: String(row.dialog_id),
@@ -355,7 +367,8 @@ async function loadDelivery(
     FROM scheduled_delivery_items
     WHERE delivery_id = ${deliveryId}
     ORDER BY item_index`;
-  return deliveryDTO(accountId, row, itemRows);
+  await preloadEnvelopeKeys(sql, itemRows.map((item: any) => String(item.payload_key_id ?? "")));
+  return await deliveryDTO(sql, accountId, row, itemRows);
 }
 
 export async function getScheduledDelivery(
@@ -431,9 +444,13 @@ export async function listScheduledDeliveries(
       grouped.push(item);
       itemsByDelivery.set(deliveryId, grouped);
     }
-    const deliveries = selected.map((row: any) =>
-      deliveryDTO(accountId, row, itemsByDelivery.get(String(row.id)) ?? [])
+    await preloadEnvelopeKeys(
+      tx,
+      itemRows.map((item: any) => String(item.payload_key_id ?? "")),
     );
+    const deliveries = await Promise.all(selected.map((row: any) =>
+      deliveryDTO(tx, accountId, row, itemsByDelivery.get(String(row.id)) ?? [])
+    ));
     const last = selected.at(-1);
     return {
       collectionRevision: n(state?.revision ?? 0),
@@ -503,40 +520,61 @@ async function claimMutation(
     deliveryId: string;
     operation: "create" | "update" | "reschedule" | "cancel";
     expectedRevision: number | null;
-    fingerprint: Buffer;
-    requestFingerprint: Buffer;
+    fingerprint: MutationFingerprint;
+    requestFingerprint: MutationFingerprint;
   },
 ): Promise<{ duplicate: boolean; receiptRevision: number | null }> {
   const inserted = await sql`
     INSERT INTO scheduled_delivery_mutation_requests (
       account_id, client_mutation_id, delivery_id, operation, expected_revision, fingerprint,
-      request_fingerprint
+      request_fingerprint, fingerprint_key_id
     ) VALUES (
       ${input.accountId}, ${input.clientMutationId}, ${input.deliveryId}, ${input.operation},
-      ${input.expectedRevision}, ${input.fingerprint}, ${input.requestFingerprint}
+      ${input.expectedRevision}, ${input.fingerprint.digest}, ${input.requestFingerprint.digest},
+      ${input.fingerprint.keyId}
     )
     ON CONFLICT (account_id, client_mutation_id) DO NOTHING
     RETURNING status`;
   if (inserted.length) return { duplicate: false, receiptRevision: null };
   const row = (await sql`
     SELECT delivery_id, operation, expected_revision, fingerprint, request_fingerprint,
-           status, result_revision
+           fingerprint_key_id, status, result_revision
     FROM scheduled_delivery_mutation_requests
     WHERE account_id = ${input.accountId} AND client_mutation_id = ${input.clientMutationId}
     FOR UPDATE`)[0];
+  if (row.fingerprint_key_id === EXPIRED_BLIND_INDEX_KEY_ID) {
+    throw new ScheduledDeliveryError(
+      "scheduled mutation result has expired", "mutation_result_expired", 409,
+    );
+  }
+  const candidate = row.request_fingerprint == null
+    ? input.fingerprint
+    : input.requestFingerprint;
+  const storedDigest = row.request_fingerprint == null
+    ? row.fingerprint
+    : row.request_fingerprint;
+  const expectedDigest = requestFingerprintIndex(
+    "scheduled-delivery-mutation",
+    candidate.canonical,
+    row.fingerprint_key_id ?? "legacy-v1",
+  ).digest;
   if (
     String(row.delivery_id) !== input.deliveryId
     || row.operation !== input.operation
     || (row.expected_revision == null ? null : n(row.expected_revision)) !== input.expectedRevision
-    || (row.request_fingerprint == null
-      ? !sameBuffer(row.fingerprint, input.fingerprint)
-      : !sameBuffer(row.request_fingerprint, input.requestFingerprint))
+    || !sameBuffer(storedDigest, expectedDigest)
   ) {
     throw new ScheduledDeliveryError(
       "mutation id was reused with different input",
       "idempotency_conflict",
       409,
     );
+  }
+  if (String(row.fingerprint_key_id ?? "legacy-v1") !== input.requestFingerprint.keyId) {
+    await sql`UPDATE scheduled_delivery_mutation_requests
+      SET request_fingerprint = ${input.requestFingerprint.digest},
+          fingerprint_key_id = ${input.requestFingerprint.keyId}
+      WHERE account_id = ${input.accountId} AND client_mutation_id = ${input.clientMutationId}`;
   }
   if (row.status !== "completed") {
     throw new ScheduledDeliveryError("schedule mutation is in progress", "mutation_in_progress", 409);
@@ -596,7 +634,9 @@ async function replaceItems(
 ): Promise<void> {
   await sql`DELETE FROM scheduled_delivery_items WHERE delivery_id = ${deliveryId}`;
   for (const [index, item] of items.entries()) {
-    const sealed = seal(
+    const sealed = await sealForScope(
+      sql,
+      { kind: "account", accountId },
       JSON.stringify(itemPayload(item)),
       scheduledItemAAD(accountId, deliveryId, index, item.clientMsgId),
     );

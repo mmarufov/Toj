@@ -421,7 +421,7 @@ private struct CloudAuthView: View {
                     .padding(.top, 18)
                 }
 
-                Label("Your conversations stay private", systemImage: "lock.fill")
+                Label("Cloud chats sync across your devices", systemImage: "cloud.fill")
                     .font(.caption)
                     .foregroundStyle(TojTheme.secondaryText)
                     .symbolRenderingMode(.hierarchical)

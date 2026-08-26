@@ -697,6 +697,8 @@ test("pre-expand schema fails traffic readiness with both switches off while met
       expect(readiness.status).toBe(503);
       expect(await readiness.json()).toMatchObject({
         status: "not_ready",
+        encryption: { ready: false, schema: { ready: false } },
+        blindIndexes: { ready: false, schemaReady: false },
         dialogPreferences: {
           ready: false,
           missingTables: expect.arrayContaining([
@@ -712,7 +714,10 @@ test("pre-expand schema fails traffic readiness with both switches off while met
         headers: { authorization: "Bearer readiness-metrics-token" },
       });
       expect(metrics.status).toBe(200);
-      expect(await metrics.text()).toContain("toj_dialog_preference_schema_available 0");
+      const metricsBody = await metrics.text();
+      expect(metricsBody).toContain("toj_dialog_preference_schema_available 0");
+      expect(metricsBody).toContain("toj_envelope_crypto_schema_available 0");
+      expect(metricsBody).toContain("toj_blind_index_persisted_references 0");
     } finally {
       await server.stop(true);
       if (previousEntrypoint === undefined) delete process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;

@@ -1,7 +1,9 @@
 import type { SQL } from "bun";
-import { chatFolderTitleAAD, open, requestFingerprintHMAC, seal } from "./crypto";
+import { chatFolderTitleAAD, requestFingerprintIndex } from "./crypto";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
 import { lockAccountMutations, lockMutationKeys } from "./locks";
 import { notifySyncWakeups } from "./sync-wakeup";
+import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ICONS = new Set([
@@ -177,18 +179,21 @@ async function loadSnapshot(sql: SQL, accountId: string): Promise<ChatFolderSnap
     WHERE folder.account_id = ${accountId}
     GROUP BY folder.account_id, folder.folder_id
     ORDER BY folder.position, folder.folder_id`;
-  return {
-    collectionRevision: n(state?.revision ?? 0),
-    folders: rows.map((row: any): ChatFolderDTO => ({
+  await preloadEnvelopeKeys(sql, rows.map((row: any) => String(row.title_key_id)));
+  const folders: ChatFolderDTO[] = [];
+  for (const row of rows) {
+    folders.push({
       folderId: String(row.folder_id),
-      title: open(
+      title: (await openForScope(
+        sql,
+        { kind: "account", accountId },
         {
           keyId: String(row.title_key_id),
           nonce: Buffer.from(row.title_nonce),
           ciphertext: Buffer.from(row.title_ciphertext),
         },
         chatFolderTitleAAD(accountId, String(row.folder_id)),
-      ).toString("utf8"),
+      )).toString("utf8"),
       icon: String(row.icon),
       position: n(row.position),
       includeDirect: Boolean(row.include_direct),
@@ -204,7 +209,11 @@ async function loadSnapshot(sql: SQL, accountId: string): Promise<ChatFolderSnap
       })),
       createdAt: iso(row.created_at),
       updatedAt: iso(row.updated_at),
-    })),
+    });
+  }
+  return {
+    collectionRevision: n(state?.revision ?? 0),
+    folders,
   };
 }
 
@@ -212,11 +221,15 @@ export async function getChatFolders(sql: SQL, accountId: string): Promise<ChatF
   return await loadSnapshot(sql, accountId);
 }
 
-function fingerprint(operation: string, folderId: string, payload: unknown): Buffer {
-  return requestFingerprintHMAC(
+function fingerprint(operation: string, folderId: string, payload: unknown): {
+  canonical: string; digest: Buffer; keyId: string;
+} {
+  const canonical = JSON.stringify({ operation, folderId, payload });
+  const index = requestFingerprintIndex(
     "chat-folder-mutation",
-    JSON.stringify({ operation, folderId, payload }),
+    canonical,
   );
+  return { canonical, digest: index.digest, keyId: index.keyId };
 }
 
 function sameBuffer(left: unknown, right: Buffer): boolean {
@@ -290,28 +303,44 @@ async function mutate(
 
     const claim = await tx`
       INSERT INTO chat_folder_mutation_requests (
-        account_id, client_mutation_id, folder_id, operation, fingerprint
+        account_id, client_mutation_id, folder_id, operation, fingerprint, fingerprint_key_id
       ) VALUES (
-        ${input.accountId}, ${mutationId}, ${folderId}, ${input.operation}, ${digest}
+        ${input.accountId}, ${mutationId}, ${folderId}, ${input.operation},
+        ${digest.digest}, ${digest.keyId}
       )
       ON CONFLICT (account_id, client_mutation_id) DO NOTHING
       RETURNING status`;
     if (claim.length === 0) {
       const receipt = (await tx`
-        SELECT folder_id, operation, fingerprint, status
+        SELECT folder_id, operation, fingerprint, fingerprint_key_id, status
         FROM chat_folder_mutation_requests
         WHERE account_id = ${input.accountId} AND client_mutation_id = ${mutationId}
         FOR UPDATE`)[0];
+      if (receipt.fingerprint_key_id === EXPIRED_BLIND_INDEX_KEY_ID) {
+        throw new ChatFolderError(
+          "folder mutation result has expired", "mutation_result_expired", 409,
+        );
+      }
       if (
         String(receipt.folder_id) !== folderId
         || receipt.operation !== input.operation
-        || !sameBuffer(receipt.fingerprint, digest)
+        || !sameBuffer(receipt.fingerprint, requestFingerprintIndex(
+          "chat-folder-mutation",
+          digest.canonical,
+          receipt.fingerprint_key_id ?? "legacy-v1",
+        ).digest)
       ) {
         throw new ChatFolderError(
           "mutation id was reused with different input",
           "idempotency_conflict",
           409,
         );
+      }
+      if (String(receipt.fingerprint_key_id ?? "legacy-v1") !== digest.keyId) {
+        await tx`UPDATE chat_folder_mutation_requests
+          SET fingerprint = ${digest.digest}, request_fingerprint = ${digest.digest},
+              fingerprint_key_id = ${digest.keyId}
+          WHERE account_id = ${input.accountId} AND client_mutation_id = ${mutationId}`;
       }
       if (receipt.status !== "completed") {
         throw new ChatFolderError("folder mutation is already in progress", "mutation_in_progress", 409);
@@ -365,7 +394,12 @@ async function mutate(
         throw new ChatFolderError("account folder rule limit reached", "chat_folder_limit", 409);
       }
       const nextRevision = current.collectionRevision + 1;
-      const title = seal(definition.title, chatFolderTitleAAD(input.accountId, folderId));
+      const title = await sealForScope(
+        tx,
+        { kind: "account", accountId: input.accountId },
+        definition.title,
+        chatFolderTitleAAD(input.accountId, folderId),
+      );
       await tx`
         INSERT INTO chat_folders (
           account_id, folder_id, title_key_id, title_nonce, title_ciphertext, icon, position,
@@ -397,7 +431,12 @@ async function mutate(
         throw new ChatFolderError("account folder rule limit reached", "chat_folder_limit", 409);
       }
       const nextRevision = current.collectionRevision + 1;
-      const title = seal(definition.title, chatFolderTitleAAD(input.accountId, folderId));
+      const title = await sealForScope(
+        tx,
+        { kind: "account", accountId: input.accountId },
+        definition.title,
+        chatFolderTitleAAD(input.accountId, folderId),
+      );
       await tx`
         UPDATE chat_folders SET
           title_key_id = ${title.keyId}, title_nonce = ${title.nonce},

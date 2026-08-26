@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { Client } from "pg";
-import { hashToken } from "./crypto";
+import { tokenHashCandidates, tokenHashIndex } from "./crypto";
 import {
   deleteAccount as deleteAuthAccount,
   requireActiveDevice,
@@ -153,7 +153,7 @@ export type CallHint = {
 
 export type CallWakeup = { callId: string; latestEventSeq: number };
 
-type CallRow = Record<string, any>;
+export type CallRow = Record<string, any>;
 type MutationResult = { call: CallSnapshot; hints: CallHint[]; syncPushes?: Push[] };
 
 const iso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
@@ -697,6 +697,19 @@ async function flushCallHistory(sql: SQL, rows: CallRow[]): Promise<Push[]> {
   return pushes;
 }
 
+/** Used by cross-domain account lifecycle transactions such as moderation bans. */
+export async function terminateCallsForAccountTx(
+  sql: SQL,
+  accountId: string,
+  reason = "account_deleted",
+): Promise<CallRow[]> {
+  return await terminateMatchingCallsTx(sql, "account", accountId, undefined, reason);
+}
+
+export async function flushTerminatedCallHistory(sql: SQL, rows: CallRow[]): Promise<Push[]> {
+  return await flushCallHistory(sql, rows);
+}
+
 export async function createCall(sql: SQL, p: {
   callerAccountId: string;
   callerDeviceId: string;
@@ -815,11 +828,16 @@ export async function createCall(sql: SQL, p: {
       throw new CallError("recipient must have replied before calls are allowed", "ineligible", 403);
     }
 
-    const networkHash = p.networkKey ? hashToken(`call-network|${p.networkKey}`) : null;
+    const networkInput = p.networkKey ? `call-network|${p.networkKey}` : null;
+    const networkIndex = networkInput ? tokenHashIndex(networkInput) : null;
+    const networkHash = networkIndex?.digest ?? null;
+    const networkHashes = networkInput
+      ? tokenHashCandidates(networkInput).map((candidate) => candidate.digest)
+      : [];
     await lockMutationKeys(tx, [
       `call-rate-caller:${p.callerAccountId}`,
       `call-rate-callee:${calleeAccountId}`,
-      ...(networkHash ? [`call-rate-network:${networkHash.toString("hex")}`] : []),
+      ...networkHashes.map((hash) => `call-rate-network:${hash.toString("hex")}`),
     ]);
     const rates = (await tx`
       SELECT
@@ -828,15 +846,21 @@ export async function createCall(sql: SQL, p: {
         (SELECT count(*) FROM call_invite_attempts
           WHERE callee_account_id = ${calleeAccountId} AND created_at > now() - interval '1 minute') AS callee_count,
         (SELECT count(*) FROM call_invite_attempts
-          WHERE ${networkHash}::bytea IS NOT NULL AND network_hash = ${networkHash}
+          WHERE ${networkHash}::bytea IS NOT NULL
+            AND network_hash IN (
+              SELECT decode(value, 'hex') FROM unnest(
+                ${tx.array(networkHashes.map((hash) => hash.toString("hex")), "text")}::text[]
+              ) AS candidate(value)
+            )
             AND created_at > now() - interval '10 minutes') AS network_count`)[0];
     if (Number(rates.caller_count) >= 10 || Number(rates.callee_count) >= 5 || Number(rates.network_count) >= 30) {
       throw new CallError("too many call attempts", "rate_limited", 429, {}, 60);
     }
     await tx`
       INSERT INTO call_invite_attempts
-        (caller_account_id, callee_account_id, caller_device_id, network_hash)
-      VALUES (${p.callerAccountId}, ${calleeAccountId}, ${p.callerDeviceId}, ${networkHash})`;
+        (caller_account_id, callee_account_id, caller_device_id, network_hash, network_key_id)
+      VALUES (${p.callerAccountId}, ${calleeAccountId}, ${p.callerDeviceId},
+              ${networkHash}, ${networkIndex?.keyId ?? null})`;
 
     await tx`DELETE FROM call_participant_leases WHERE expires_at <= now()`;
     const busy = (await tx`
@@ -1422,7 +1446,7 @@ export const endCall = (sql: SQL, p: Omit<Parameters<typeof terminalAction>[1], 
   terminalAction(sql, { ...p, action: "end" });
 
 async function terminateMatchingCallsTx(sql: SQL, where: "device" | "account", accountId: string,
-  deviceId?: string): Promise<CallRow[]> {
+  deviceId?: string, accountReason = "account_deleted"): Promise<CallRow[]> {
   const rows = where === "device"
     ? await sql`
         SELECT * FROM calls
@@ -1436,7 +1460,7 @@ async function terminateMatchingCallsTx(sql: SQL, where: "device" | "account", a
         WHERE state <> 'ended' AND (caller_account_id = ${accountId} OR callee_account_id = ${accountId})
         ORDER BY id FOR UPDATE`;
   const result: CallRow[] = [];
-  const reason = where === "device" ? "device_revoked" : "account_deleted";
+  const reason = where === "device" ? "device_revoked" : accountReason;
   for (const row of rows) result.push(await finishCallTx(sql, row, reason, null, null));
   return result;
 }

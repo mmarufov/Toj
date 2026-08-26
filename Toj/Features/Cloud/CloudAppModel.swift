@@ -682,7 +682,7 @@ final class CloudAppModel {
                 .subtracting([
                     .videoCalls, .savedMessages,
                     .groupCalls, .groupVideoCalls, .screenSharing,
-                    .chatFolders, .scheduledDelivery, .linkPreviews,
+                    .chatFolders, .scheduledDelivery, .linkPreviews, .abuseReports,
                     .presence, .profilePhotos,
                 ])
         } ?? [.replies]
@@ -4280,6 +4280,121 @@ final class CloudAppModel {
         }
     }
 
+    func submitAccountReport(
+        dialogId: String,
+        reason: AbuseReportReason,
+        details: String?,
+        clientReportId: UUID
+    ) async -> AbuseReportSubmissionResult {
+        guard capabilities.contains(.abuseReports) else {
+            return .failed(String(localized: "Reporting is not available on this server yet."))
+        }
+        guard canShowAccountReport(dialogId: dialogId) else {
+            return .failed(String(localized: "The account could not be verified."))
+        }
+        guard
+            let session = storedSession?.session,
+            let peer = try? await localStore?.peerAccountId(
+                dialogId: dialogId,
+                excluding: session.accountId
+            )
+        else {
+            return .failed(String(localized: "The account could not be verified."))
+        }
+        return await submitAbuseReport(
+            dialogId: dialogId,
+            subject: .account(peer),
+            reason: reason,
+            details: details,
+            clientReportId: clientReportId
+        )
+    }
+
+    func submitMessageReport(
+        _ line: Line,
+        reason: AbuseReportReason,
+        details: String?,
+        clientReportId: UUID
+    ) async -> AbuseReportSubmissionResult {
+        guard
+            Self.isReportable(line, capabilities: capabilities),
+            let dialogId = line.dialogId,
+            let msgId = line.msgId,
+            let dialogType = dialogs.first(where: { $0.id == dialogId })?.type,
+            dialogType == "direct" || dialogType == "group"
+        else {
+            return .failed(String(localized: "This message can no longer be reported."))
+        }
+        return await submitAbuseReport(
+            dialogId: dialogId,
+            subject: .message(msgId),
+            reason: reason,
+            details: details,
+            clientReportId: clientReportId
+        )
+    }
+
+    private func submitAbuseReport(
+        dialogId: String,
+        subject: CloudAbuseReportSubject,
+        reason: AbuseReportReason,
+        details: String?,
+        clientReportId: UUID
+    ) async -> AbuseReportSubmissionResult {
+        guard capabilities.contains(.abuseReports) else {
+            return .failed(String(localized: "Reporting is not available on this server yet."))
+        }
+        guard !isSessionTeardownInProgress, let session = storedSession?.session else {
+            return .cancelled
+        }
+        let generation = accountSessionGeneration
+        let accountId = session.accountId
+        let token = session.token
+        do {
+            _ = try await api.submitAbuseReport(
+                clientReportId: clientReportId,
+                dialogId: dialogId,
+                subject: subject,
+                reason: reason,
+                details: details,
+                token: token
+            )
+            guard
+                !Task.isCancelled,
+                !isSessionTeardownInProgress,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId,
+                storedSession?.session.token == token
+            else {
+                return .cancelled
+            }
+            return .submitted
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            guard
+                !isSessionTeardownInProgress,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId,
+                storedSession?.session.token == token
+            else {
+                return .cancelled
+            }
+            if let apiError = error as? CloudAPIError,
+               Self.shouldWithdrawAbuseReportCapability(after: apiError) {
+                negotiatedCapabilities.remove(.abuseReports)
+            }
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    nonisolated static func shouldWithdrawAbuseReportCapability(
+        after error: CloudAPIError
+    ) -> Bool {
+        error.code == "capability_unavailable"
+            || (error.status == 404 && error.code == nil)
+    }
+
     func sendDraft(silent: Bool = false, deliverAfter: Date? = nil) async {
         if let activeDialogId {
             await presenceCoordinator.stopLocalTyping(dialogId: activeDialogId)
@@ -4941,9 +5056,10 @@ final class CloudAppModel {
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
         if line.mine, line.media == nil, capabilities.contains(.editing) { actions.append(.edit) }
-        let sourceIsSaved = line.dialogId.flatMap { sourceId in
+        let sourceType = line.dialogId.flatMap { sourceId in
             dialogs.first(where: { $0.id == sourceId })?.type
-        } == "saved"
+        }
+        let sourceIsSaved = sourceType == "saved"
         if line.msgId != nil,
            !sourceIsSaved,
            savedMessagesDialogId != nil || capabilities.contains(.savedMessages) {
@@ -4951,12 +5067,50 @@ final class CloudAppModel {
         }
         if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
         if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
+        if (sourceType == "direct" || sourceType == "group"),
+           Self.isReportable(line, capabilities: capabilities) {
+            actions.append(.report)
+        }
         if case .failed = line.delivery {
             actions.append(.retry)
             actions.append(.remove)
         }
         actions.append(.inspect)
         return actions
+    }
+
+    func canShowAccountReport(dialogId: String) -> Bool {
+        Self.canReportAccount(
+            dialogType: dialogs.first(where: { $0.id == dialogId })?.type,
+            capabilities: capabilities
+        )
+    }
+
+    nonisolated static func canReportAccount(
+        dialogType: String?,
+        capabilities: MessagingCapabilities
+    ) -> Bool {
+        capabilities.contains(.abuseReports) && dialogType == "direct"
+    }
+
+    nonisolated static func isReportable(
+        _ line: Line,
+        capabilities: MessagingCapabilities
+    ) -> Bool {
+        let serverAcknowledged: Bool
+        switch line.delivery {
+        case .sent, .seen:
+            serverAcknowledged = true
+        case .sending, .failed:
+            serverAcknowledged = false
+        }
+        return capabilities.contains(.abuseReports)
+            && !line.mine
+            && line.kind != "service"
+            && line.msgId != nil
+            && serverAcknowledged
+            && !line.isDeleted
+            && line.pendingMutation == nil
     }
 
     func retryFailedMessage(_ line: Line) {
@@ -7234,6 +7388,7 @@ final class CloudAppModel {
             if advertised.contains("chat_folders_v1") { resolved.insert(.chatFolders) }
             if advertised.contains("scheduled_delivery_v1") { resolved.insert(.scheduledDelivery) }
             if advertised.contains("link_previews_v1") { resolved.insert(.linkPreviews) }
+            if advertised.contains("abuse_reports_v1") { resolved.insert(.abuseReports) }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -7287,6 +7442,7 @@ final class CloudAppModel {
             capabilityDefaults.set(
                 Int(resolved.subtracting([
                     .videoCalls, .savedMessages, .chatFolders, .scheduledDelivery, .linkPreviews,
+                    .abuseReports,
                     .presence, .profilePhotos,
                 ]).rawValue),
                 forKey: capabilityCacheKey

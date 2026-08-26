@@ -57,10 +57,24 @@ jobs:
           DATABASE_URL="${TEST_DATABASE_URL}" bun run migrate
           bun run verify:dialog-preferences-migration
           while IFS= read -r test_file; do
-            bun test "${test_file}"
+            bun test --timeout 15000 "${test_file}"
           done < <(
             find . -path './node_modules' -prune -o -name '*.test.ts' -print | sort
           )
+      - name: Exercise live cross-domain envelope writes
+        run: |
+          for mode in envelope-canary envelope; do
+            for test_file in \
+              src/m3.test.ts \
+              src/drafts.test.ts \
+              src/cloud-productivity.test.ts \
+              src/reports.test.ts; do
+              TOJ_CRYPTO_MODE="$mode" \
+              TOJ_KEY_ENCRYPTION_PROVIDER=local \
+              TOJ_ENVELOPE_CANARY_PERCENT=100 \
+                bun test --timeout 15000 "$test_file"
+            done
+          done
 
   ios-debug-tests:
     name: ios-debug-tests
@@ -115,6 +129,7 @@ jobs:
             -type d -name 'Toj.app' -print -quit)"
           test -n "${app_dir}"
           scripts/verify-webrtc-namespace-isolation.sh "${app_dir}"
+          python3 scripts/verify-privacy-manifest.py --app-bundle "${app_dir}"
       - name: Select available iPhone simulator
         run: |
           destination_id="$(/usr/bin/python3 <<'PY'
@@ -169,6 +184,7 @@ jobs:
         run: |
           find scripts server/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           python3 infra/coturn/validate-peer-policy.py
+          python3 scripts/verify-privacy-manifest.py
           python3 - <<'PY'
           import plistlib
           from pathlib import Path

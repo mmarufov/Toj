@@ -83,6 +83,160 @@ CallKit answering, weak-network rotation response loss, and remote-device socket
 Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
 a device retrying after days can recover the canonical `client_msg_id`.
 
+## Abuse-reporting rollout and response
+
+`abuse_reports_v1` is hidden unless the additive schema and every operational gate is present:
+
+- `TOJ_ABUSE_REPORTS_ENABLED=1`
+- `TOJ_ABUSE_REPORTS_OPERATOR_READY=1`, set only while a named moderator is on call
+- `TOJ_MODERATION_OPERATOR_ID`, identifying that on-call moderator in the audit trail
+- `TOJ_ABUSE_REPORTS_ALERTING_READY=1`, set only after urgent/standard age alerts are live
+- `TOJ_ABUSE_REPORTS_ESCALATION_CONTACT`, containing the private escalation route in the secret store
+
+Migrate with the feature disabled, configure alerts for `toj_abuse_reports_open` and
+`toj_abuse_reports_oldest_seconds`, rehearse the operator workflow, and then enable it universally.
+Page at four hours for urgent child-safety/violence reports and 24 hours for standard reports. Do not
+percentage-roll out a safety mechanism or advertise the capability without an active response owner.
+
+Use `TOJ_MODERATION_OPERATOR_ID` to identify every read and mutation. Operator notes are accepted
+only on stdin, encrypted at rest, and never passed as process arguments. Examples:
+
+```bash
+bun run moderation:reports -- list 50
+bun run moderation:reports -- view REPORT_UUID
+printf '%s' 'triage note' | bun run moderation:reports -- claim REPORT_UUID
+printf '%s' 'resolution note' | bun run moderation:reports -- resolve REPORT_UUID
+```
+
+`list` returns the unresolved queue in stable priority/age order. `view` refuses to emit decrypted
+evidence when stdout is redirected; `--redacted-json` emits only metadata and omits sensitive notes.
+`remove` and `ban` additionally require `TOJ_MODERATION_DESTRUCTIVE_CONFIRM` to equal the report UUID.
+Those commands respectively replace the live message with the normal deletion tombstone, or ban the
+reported account, end its active direct calls, revoke its group-call participation, hand off groups
+it owns, and revoke its sessions and push registrations. A commit-scoped account-security event
+closes sessions on every connected server; a five-second database reconciliation pass closes any
+session whose notification was missed. Workflow mutations are appended to
+`abuse_report_actions`; every list/view access is appended to the separate, immutable
+`content_access_audit` log, including whether evidence was decrypted.
+
+Production uses separate PostgreSQL roles. The migration owner owns the audit tables and the bounded
+`toj_cleanup_abuse_reports_v1(integer)` security-definer function. The application/operator role is
+granted `SELECT`/`INSERT`/`UPDATE` on `abuse_reports`, `SELECT`/`INSERT` on submission budgets and
+actions, `INSERT` on `content_access_audit`, and `EXECUTE` on the cleanup function. It is never
+granted direct `DELETE` or `TRUNCATE` on moderation tables, or `UPDATE` on budgets/actions/access
+audit, and it must not own either append-only table. The schema revokes public function execution.
+`abuse_reports_v1` remains hidden when production readiness detects missing required rights, unsafe
+extra rights, role ownership, or cleanup execution. Caller-set session variables cannot bypass the
+owner-checked append-only triggers.
+
+Unresolved encrypted evidence is retained until resolution. The bounded maintenance worker clears
+evidence 90 days after resolution, retains non-content report/audit metadata for 365 days, and removes
+submission-budget rows after 24 hours.
+
+## Envelope encryption and blind-index rotation
+
+`TOJ_CRYPTO_MODE` has three explicit states: `legacy`, `envelope-canary`, and `envelope`. Legacy
+continues to read and write `dev-v1`. Canary dual-reads every format but writes wrapped per-account
+DEKs only for `TOJ_ENVELOPE_CANARY_ACCOUNTS` and the deterministic
+`TOJ_ENVELOPE_CANARY_PERCENT`; service scopes always use envelope writes in canary mode. Envelope
+writes every new payload through a wrapped DEK while retaining legacy reads for migration.
+
+`TOJ_KEY_ENCRYPTION_PROVIDER=local` is test/development-only and the process rejects it in
+production. A production provider must implement the `KeyEncryptionProvider` contract and be
+registered in the deployment build. Provider credentials, KEK identifiers, and IAM policy stay in
+the secret store. `/ready` remains `503` in production while the server is in legacy mode or a real
+provider is unhealthy, and `/metrics` exports `toj_envelope_crypto_launch_blocking`.
+
+The separate blind-index keyring protects cross-account deterministic lookup and must never use an
+account DEK. `TOJ_BLIND_INDEX_KEYRING` is a JSON object of version IDs to base64 32-byte keys;
+`TOJ_BLIND_INDEX_ACTIVE_KEY_ID` selects new phone, OTP/rate-limit, token, media-digest, and
+idempotency writes. The legacy HMAC key remains readable during migration. Production readiness is
+blocked while only `legacy-v1` is active. Remove a historical key only after all rows carrying its
+key ID have expired or been backfilled and every application node has stopped writing it.
+Media-group fallback message IDs are durable protocol state and use a separate, immutable
+`TOJ_PROTOCOL_ID_KEY`. Before disabling `legacy-v1`, set that value to the current `TOJ_HMAC_KEY`
+on every node; it is not a rotating database blind-index key.
+
+Rotate in two deployments: first add the new key as readable on every node while the old key remains
+active, then verify every node reports the same readable set before switching the active key. Mixed
+active-key nodes are safe only when all of them know both versions, because identity and rate-limit
+mutations lock every candidate digest. Backfill recoverable phone rows after the active-key switch;
+keep old keys readable until the database audit reaches zero for opaque tokens, call-attempt/network
+budgets, media digests, URL/cache keys, and idempotency receipts that expire or rotate on use.
+
+Inspect state and perform bounded operations with:
+
+```bash
+bun run crypto:keys -- status
+bun run crypto:keys -- rotate account ACCOUNT_UUID
+bun run crypto:keys -- rotate service moderation-evidence
+bun run crypto:keys -- migrate all --from=dev-v1 --batch=100
+TOJ_CONFIRM_CRYPTO_WRITE_MODE=envelope-canary \
+  bun run crypto:keys -- activate-mode envelope-canary
+TOJ_CONFIRM_CRYPTO_WRITE_MODE=envelope \
+  bun run crypto:keys -- activate-mode envelope
+TOJ_BLIND_INDEX_KEYRING='{"lookup-v2":"BASE64_32_BYTE_KEY"}' \
+TOJ_BLIND_INDEX_ACTIVE_KEY_ID=lookup-v2 \
+  bun run crypto:keys -- migrate-blind phones --from=legacy-v1 --batch=100
+TOJ_ALLOW_CRYPTO_BENCHMARK=1 bun run benchmark:envelope-migration -- \
+  messages --from=dev-v1 --batch=500 --max-batches=1000
+bun run crypto:keys -- audit DATA_KEY_UUID
+bun run crypto:keys -- rewrap DATA_KEY_UUID
+TOJ_CONFIRM_RETIRE_KEY=DATA_KEY_UUID bun run crypto:keys -- retire DATA_KEY_UUID
+```
+
+DEK rotation switches new writes immediately. Re-encryption then claims bounded `SKIP LOCKED`
+batches for phone identity, messages and service messages, drafts and cached responses, push/VoIP
+tokens, media metadata/chunks, moderation evidence/notes, chat-folder titles, scheduled payloads,
+and link-preview URLs/metadata/assets. Each update compares the old key ID,
+so a concurrent edit wins rather than being overwritten. A worker that encounters a writer-held
+scope fence yields the locked row and automatically retries after committing the bounded batch;
+it never waits in the inverse row/key lock order. Durable cursors make restarts observable, and a
+failed batch is transactional, so the next invocation safely resumes without partial-batch state.
+`rotate` changes the DEK. `rewrap` changes only the provider KEK wrapping. `retire` refuses until the
+configured rollback/backup window has elapsed and the database-wide ciphertext reference audit is
+zero. Retirement is deliberately two-phase across processes: the first confirmed invocation writes
+a durable revocation marker, fences all new unwraps, and reports `state: "draining"`. Rerun it only
+after the returned `finalizeAfter`; the second invocation then erases the wrapped key and reports
+`state: "retired"`. The drain exceeds the enforced five-minute plaintext-cache TTL, and every cache
+entry zeroizes itself on expiry, so a worker that cached the key before revocation cannot retain or
+use it after destructive retirement. Never bypass or shorten this drain. The unused private-beta
+`user_reports` scaffold is included in the reference audit; any historical
+snapshot there must be reviewed and removed under the retention policy because it has no safe
+automatic AAD migration. Deleted-account tombstones and their wrapped keys remain while retained
+messages or media still reference them.
+
+Final cutover is two-dimensional: every application process must run the matching mode and the
+database mode must be advanced with `activate-mode`. The final command takes a short writer fence,
+and flips a non-downgradable database epoch even while historical `dev-v1` rows remain. Triggers then
+reject any inserted or changed legacy ciphertext tuple, including writes from an old process, while
+dual-read migration continues. Production readiness remains launch-blocking until the reference
+audit reaches zero; do not retire the legacy key or represent migration as complete before then. Do
+not change `crypto_write_state` manually. Phone blind indexes can be recomputed in bounded batches;
+opaque session and OTP inputs rotate on successful use or disappear through normal retention.
+Upload-only media digests stop being dependencies once completion succeeds. Durable idempotency
+operation IDs remain consumed, while their canonical keyed fingerprints are cryptographically
+tombstoned after a 90-day retry horizon so dormant receipts cannot pin an old key forever. Keep
+every historical blind-index key configured until the exact `crypto:keys status` operator audit
+reports zero references across all domains. `/ready` and `/metrics` share that exact audit through a
+short, single-flight cache to prevent health probes from repeatedly scanning retained data.
+
+Only after `crypto:keys status` reports zero `legacy-v1` references, deploy
+`TOJ_BLIND_INDEX_LEGACY_DISABLED=1` together with the versioned keyring and remove `TOJ_HMAC_KEY`.
+Also retain the matching `TOJ_PROTOCOL_ID_KEY` described above. The process refuses the switch
+without both a versioned active key and that protocol key, and readiness fails closed if any
+persisted legacy label reappears. Likewise, final envelope mode loads `TOJ_MESSAGE_KEY` only when an
+actual `dev-v1` ciphertext is read; remove that secret only after the legacy ciphertext audit is
+zero and the rollback/backup window has expired. Legacy and canary modes still require it at startup.
+
+During a provider outage, cached DEKs can continue reads until their bounded TTL expires. Cache
+misses, new scope keys, rotation, and uncached writes return retryable `crypto_unavailable`; unknown
+or corrupt key IDs fail closed. After envelope activation there is no fallback write to the
+environment key. Before production enablement, complete a staging provider-outage and rotation
+drill, measure migration runtime/WAL on production-sized data, validate backups across the full
+retirement window, and canary selected internal accounts. Repository support is not evidence that a
+live KMS/HSM or its IAM policy has been deployed.
+
 ## Encrypted group-call rollout and drain
 
 Group calls are dark by default. Production requires managed LiveKit Cloud because this version

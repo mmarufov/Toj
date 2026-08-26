@@ -184,23 +184,28 @@ CREATE TABLE IF NOT EXISTS messaging_feature_mutations (
   dialog_id        UUID,
   msg_id           BIGINT,
   payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   response         JSONB,
   completed_at     TIMESTAMPTZ,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (actor_account_id, operation_id),
   CHECK ((completed_at IS NULL AND response IS NULL) OR completed_at IS NOT NULL)
 );
+ALTER TABLE messaging_feature_mutations ADD COLUMN IF NOT EXISTS fingerprint_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- One APNs/VoIP endpoint per installation, with up to three account/device bindings. Payloads use
 -- routing_handle; neither phone numbers nor account UUIDs need to leave APNs.
 CREATE TABLE IF NOT EXISTS push_installations (
   installation_id       UUID PRIMARY KEY,
   normal_token_hash     BYTEA,
+  normal_token_hash_key_id TEXT DEFAULT 'legacy-v1',
   normal_token_ciphertext BYTEA,
   normal_token_nonce    BYTEA,
   normal_token_key_id   TEXT,
   normal_environment    TEXT CHECK (normal_environment IN ('sandbox','production')),
   voip_token_hash       BYTEA,
+  voip_token_hash_key_id TEXT DEFAULT 'legacy-v1',
   voip_token_ciphertext BYTEA,
   voip_token_nonce      BYTEA,
   voip_token_key_id     TEXT,
@@ -222,6 +227,20 @@ CREATE TABLE IF NOT EXISTS push_installations (
       AND voip_token_key_id IS NOT NULL AND voip_environment IS NOT NULL)
   )
 );
+ALTER TABLE push_installations ADD COLUMN IF NOT EXISTS normal_token_hash_key_id
+  TEXT DEFAULT 'legacy-v1';
+ALTER TABLE push_installations ADD COLUMN IF NOT EXISTS voip_token_hash_key_id
+  TEXT DEFAULT 'legacy-v1';
+DO $$ BEGIN
+  ALTER TABLE push_installations ADD CONSTRAINT push_installations_normal_hash_key_check
+    CHECK (normal_token_hash IS NULL OR normal_token_hash_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE push_installations ADD CONSTRAINT push_installations_voip_hash_key_check
+    CHECK (voip_token_hash IS NULL OR voip_token_hash_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS push_account_bindings (
   installation_id UUID NOT NULL REFERENCES push_installations(installation_id) ON DELETE CASCADE,

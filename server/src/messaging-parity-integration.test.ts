@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { checkVerification, startVerification } from "./auth";
+import { checkVerification, revokeDevice, startVerification } from "./auth";
 import { makeSql } from "./db";
 import { expireAcceptedMessages } from "./message-expiry";
 import {
@@ -588,5 +588,43 @@ describe("messaging parity integration", () => {
       WHERE installation.installation_id = ${bobInstallationId}
         AND binding.account_id = ${bob.accountId}`)[0])
       .toEqual(expect.objectContaining({ token_present: true, active: true, normal_enabled: true }));
+  });
+
+  test("revoking a device removes only its shared installation binding and frees the account slot", async () => {
+    const accounts = [];
+    for (let index = 0; index < 4; index += 1) {
+      accounts.push(await account(`+1650555621${index}`, `Binding ${index}`));
+    }
+    const installationId = crypto.randomUUID();
+    const token = "ef".repeat(32);
+    for (const value of accounts.slice(0, 3)) {
+      await registerInstallationPushToken(db, {
+        accountId: value.accountId,
+        deviceId: value.deviceId,
+        installationId,
+        token,
+        environment: "sandbox",
+        kind: "normal",
+      });
+    }
+
+    await revokeDevice(db, accounts[0].accountId, accounts[0].deviceId);
+    await registerInstallationPushToken(db, {
+      accountId: accounts[3].accountId,
+      deviceId: accounts[3].deviceId,
+      installationId,
+      token,
+      environment: "sandbox",
+      kind: "normal",
+    });
+
+    const bindings = await db`SELECT account_id, active, normal_enabled
+      FROM push_account_bindings WHERE installation_id = ${installationId}
+      ORDER BY account_id`;
+    expect(bindings).toHaveLength(3);
+    expect(bindings.some((row: any) => String(row.account_id) === accounts[0].accountId)).toBe(false);
+    expect(bindings.every((row: any) => row.active && row.normal_enabled)).toBe(true);
+    expect((await db`SELECT normal_token_hash IS NOT NULL AS token_present
+      FROM push_installations WHERE installation_id = ${installationId}`)[0].token_present).toBe(true);
   });
 });

@@ -28,9 +28,30 @@ WHERE namespace.nspname = 'public'
     'media_group_send_tombstones_dialog_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx',
-    'accounts_profile_photo_media_idx'
+    'accounts_profile_photo_media_idx',
+    'accounts_phone_blind_key_migration_idx',
+    'devices_push_hash_key_backfill_idx',
+    'devices_voip_hash_key_backfill_idx',
+    'otp_network_hash_key_backfill_idx',
+    'call_invite_network_hash_key_backfill_idx',
+    'accounts_phone_key_migration_idx',
+    'messages_body_key_migration_idx',
+    'drafts_body_key_migration_idx',
+    'draft_responses_key_migration_idx',
+    'devices_push_key_migration_idx',
+    'devices_voip_key_migration_idx',
+    'media_file_name_key_migration_idx',
+    'media_thumbnail_key_migration_idx',
+    'media_chunks_key_migration_idx',
+    'abuse_reports_evidence_key_migration_idx',
+    'abuse_report_notes_key_migration_idx',
+    'messages_report_evidence_idx',
+    'abuse_report_budgets_retention_idx',
+    'abuse_reports_open_queue_idx',
+    'content_access_audit_abuse_retention_idx',
+    'session_rotation_receipts_key_migration_idx'
   )
-  AND NOT idx.indisvalid
+  AND (NOT idx.indisvalid OR NOT idx.indisready)
 \gexec
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS devices_voip_push_token_active_idx
@@ -107,3 +128,52 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS accounts_username_active_unique_i
 CREATE INDEX CONCURRENTLY IF NOT EXISTS accounts_profile_photo_media_idx
   ON accounts(profile_photo_media_id)
   WHERE profile_photo_media_id IS NOT NULL;
+
+-- Temporary-compatible key selectors keep bounded SKIP LOCKED re-encryption batches index driven.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS accounts_phone_key_migration_idx
+  ON accounts(phone_key_id, id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS accounts_phone_blind_key_migration_idx
+  ON accounts(phone_lookup_key_id, id) WHERE status <> 'deleted';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_push_hash_key_backfill_idx
+  ON devices(id) WHERE push_token_hash IS NOT NULL AND push_token_hash_key_id IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_voip_hash_key_backfill_idx
+  ON devices(id) WHERE voip_push_token_hash IS NOT NULL AND voip_push_token_hash_key_id IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS otp_network_hash_key_backfill_idx
+  ON otp_challenges(id) WHERE network_hash IS NOT NULL AND network_key_id IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS call_invite_network_hash_key_backfill_idx
+  ON call_invite_attempts(id) WHERE network_hash IS NOT NULL AND network_key_id IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_body_key_migration_idx
+  ON messages(body_key_id, dialog_id, msg_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS drafts_body_key_migration_idx
+  ON account_dialog_drafts(body_key_id, account_id, dialog_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_responses_key_migration_idx
+  ON draft_mutation_requests(response_key_id, account_id, operation_id)
+  WHERE response_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_push_key_migration_idx
+  ON devices(push_token_key_id, id) WHERE push_token_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_voip_key_migration_idx
+  ON devices(voip_push_token_key_id, id) WHERE voip_push_token_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_file_name_key_migration_idx
+  ON media_objects(file_name_key_id, id) WHERE file_name_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_thumbnail_key_migration_idx
+  ON media_objects(thumbnail_key_id, id) WHERE thumbnail_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_chunks_key_migration_idx
+  ON media_chunks(key_id, media_id, chunk_offset);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS abuse_reports_evidence_key_migration_idx
+  ON abuse_reports(evidence_key_id, id) WHERE evidence_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS abuse_report_notes_key_migration_idx
+  ON abuse_report_actions(note_key_id, id) WHERE note_key_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS session_rotation_receipts_key_migration_idx
+  ON session_rotation_receipts(response_key_id, session_id, rotation_id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_report_evidence_idx
+  ON messages(dialog_id, sender_account_id, msg_id DESC)
+  WHERE state = 'visible' AND kind <> 'service';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS abuse_report_budgets_retention_idx
+  ON abuse_report_submission_budgets(accepted_at, id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS abuse_reports_open_queue_idx
+  ON abuse_reports((priority = 'urgent') DESC, created_at, id)
+  WHERE status <> 'resolved';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS content_access_audit_abuse_retention_idx
+  ON content_access_audit(created_at, id)
+  WHERE reason LIKE 'abuse_report.%';

@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
-import { bodyAAD, seal } from "./crypto";
+import { bodyAAD } from "./crypto";
+import { sealForScope } from "./envelope-crypto";
 import { fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { notifySyncWakeups } from "./sync-wakeup";
 
@@ -44,7 +45,12 @@ export async function expireAcceptedMessages(
       const dialogId = String(candidate.dialog_id);
       const msgId = Number(candidate.msg_id);
       const senderAccountId = String(message.sender_account_id);
-      const sealed = seal("", bodyAAD(dialogId, msgId, senderAccountId));
+      const sealed = await sealForScope(
+        tx,
+        { kind: "account", accountId: senderAccountId },
+        "",
+        bodyAAD(dialogId, msgId, senderAccountId),
+      );
 
       // Delete all derived live data before publishing the tombstone. Poll votes cascade from the
       // encrypted poll row; pins and reactions disappear atomically with visibility.

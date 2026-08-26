@@ -1,4 +1,17 @@
 -- Run outside a transaction after schema-messaging-parity-expand.sql.
+SELECT format('DROP INDEX CONCURRENTLY IF EXISTS %I.%I', namespace.nspname, class.relname)
+FROM pg_index AS idx
+JOIN pg_class AS class ON class.oid = idx.indexrelid
+JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace
+WHERE namespace.nspname = 'public'
+  AND class.relname IN (
+    'message_polls_payload_key_migration_idx',
+    'push_installations_normal_key_migration_idx',
+    'push_installations_voip_key_migration_idx'
+  )
+  AND (NOT idx.indisvalid OR NOT idx.indisready)
+\gexec
+
 CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_visible_expiry_idx
   ON messages(expires_at, dialog_id, msg_id)
   WHERE expires_at IS NOT NULL AND state = 'visible';
@@ -22,6 +35,17 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS push_installations_normal_token_a
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS push_installations_voip_token_active_idx
   ON push_installations(voip_environment, voip_token_hash)
   WHERE voip_token_hash IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS message_polls_payload_key_migration_idx
+  ON message_polls(payload_key_id, dialog_id, msg_id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS push_installations_normal_key_migration_idx
+  ON push_installations(normal_token_key_id, installation_id)
+  WHERE normal_token_key_id IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS push_installations_voip_key_migration_idx
+  ON push_installations(voip_token_key_id, installation_id)
+  WHERE voip_token_key_id IS NOT NULL;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS push_account_bindings_account_active_idx
   ON push_account_bindings(account_id, installation_id)

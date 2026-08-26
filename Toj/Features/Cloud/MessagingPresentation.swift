@@ -53,8 +53,9 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let chatFolders = Self(rawValue: 1 << 22)
     static let scheduledDelivery = Self(rawValue: 1 << 23)
     static let linkPreviews = Self(rawValue: 1 << 24)
-    static let presence = Self(rawValue: 1 << 25)
-    static let profilePhotos = Self(rawValue: 1 << 26)
+    static let abuseReports = Self(rawValue: 1 << 25)
+    static let presence = Self(rawValue: 1 << 26)
+    static let profilePhotos = Self(rawValue: 1 << 27)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
@@ -64,6 +65,73 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
         .cloudDrafts, .mediaGroups, .chatFolders, .scheduledDelivery, .linkPreviews,
         .presence, .profilePhotos,
     ]
+}
+
+nonisolated enum AbuseReportReason: String, CaseIterable, Identifiable, Sendable {
+    case spam
+    case scam
+    case harassment
+    case violence
+    case sexualContent = "sexual_content"
+    case childSafety = "child_safety"
+    case other
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .spam: String(localized: "Spam")
+        case .scam: String(localized: "Scam or fraud")
+        case .harassment: String(localized: "Harassment")
+        case .violence: String(localized: "Violence or threats")
+        case .sexualContent: String(localized: "Sexual content")
+        case .childSafety: String(localized: "Child safety")
+        case .other: String(localized: "Other")
+        }
+    }
+}
+
+nonisolated struct AbuseReportDraft: Equatable, Sendable {
+    var reason: AbuseReportReason = .spam
+    var details = ""
+
+    var normalizedDetails: String? {
+        let value = details.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    var validationMessage: String? {
+        if details.unicodeScalars.count > 500 {
+            return String(localized: "Details must be 500 characters or fewer.")
+        }
+        if reason == .other && (normalizedDetails?.unicodeScalars.count ?? 0) < 10 {
+            return String(localized: "Add at least 10 characters of detail for Other.")
+        }
+        return nil
+    }
+}
+
+nonisolated enum AbuseReportSubmissionResult: Equatable, Sendable {
+    case submitted
+    case failed(String)
+    case cancelled
+}
+
+/// The single source of truth for how ordinary server-decryptable chats are described in UI.
+/// Calls have a separate E2E security model and must not reuse this presentation.
+nonisolated enum CloudChatPrivacyPresentation {
+    static let systemImage = "cloud.fill"
+    static var title: String { String(localized: "Cloud chat") }
+    static var detail: String { String(localized: "Cloud encrypted") }
+    static var disclosure: String {
+        String(localized: "Messages use encrypted connections and are stored encrypted on Toj’s servers. They are not end-to-end encrypted, so Toj can access them to deliver and sync messages and review safety reports.")
+    }
+    static var accessibilityLabel: String {
+        String(localized: "Cloud chat. Messages are not end-to-end encrypted.")
+    }
+    static var savedMessagesAccessibilityLabel: String {
+        String(localized: "Saved Messages. Cloud chat. Messages are not end-to-end encrypted.")
+    }
 }
 
 nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
@@ -76,6 +144,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     case delete
     case retry
     case remove
+    case report
     case inspect
 
     var id: String { rawValue }
@@ -91,6 +160,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .delete: String(localized: "Delete")
         case .retry: String(localized: "Retry")
         case .remove: String(localized: "Remove")
+        case .report: String(localized: "Report")
         case .inspect: String(localized: "Details")
         }
     }
@@ -106,6 +176,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .delete: "trash"
         case .retry: "arrow.clockwise"
         case .remove: "trash"
+        case .report: "exclamationmark.bubble"
         case .inspect: "info.circle"
         }
     }
@@ -128,7 +199,7 @@ nonisolated enum ReplicaConnectionState: Equatable, Sendable {
 
     var title: String {
         switch self {
-        case .live: String(localized: "Protected")
+        case .live: String(localized: "Connected")
         case .connecting: String(localized: "Connecting…")
         case .offline: String(localized: "Waiting for network")
         }
@@ -136,7 +207,7 @@ nonisolated enum ReplicaConnectionState: Equatable, Sendable {
 
     var systemImage: String {
         switch self {
-        case .live: "lock.fill"
+        case .live: "network"
         case .connecting: "arrow.triangle.2.circlepath"
         case .offline: "wifi.slash"
         }

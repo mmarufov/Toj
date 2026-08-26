@@ -221,6 +221,20 @@ struct GroupProfileView: View {
                 }
             }
 
+            Section("Message privacy") {
+                Label(
+                    CloudChatPrivacyPresentation.detail,
+                    systemImage: CloudChatPrivacyPresentation.systemImage
+                )
+                    .foregroundStyle(TojTheme.secondaryText)
+                Text(CloudChatPrivacyPresentation.disclosure)
+                    .font(.footnote)
+                    .foregroundStyle(TojTheme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(CloudChatPrivacyPresentation.accessibilityLabel)
+
             Section("Members") {
                 if dialog?.selfRole == "owner" || dialog?.selfRole == "admin" {
                     Button {

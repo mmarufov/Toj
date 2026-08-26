@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS chat_folder_mutation_requests (
   operation TEXT NOT NULL CHECK (operation IN ('create','update','move','delete')),
   fingerprint BYTEA NOT NULL CHECK (octet_length(fingerprint) = 32),
   request_fingerprint BYTEA,
+  fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
   result_revision BIGINT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS chat_folder_mutation_requests (
     OR (status = 'completed' AND result_revision IS NOT NULL)
   )
 );
+
 CREATE TABLE IF NOT EXISTS chat_folder_action_budgets (
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   bucket_started TIMESTAMPTZ NOT NULL,
@@ -133,6 +135,7 @@ CREATE TABLE IF NOT EXISTS scheduled_delivery_mutation_requests (
   expected_revision BIGINT,
   fingerprint BYTEA NOT NULL CHECK (octet_length(fingerprint) = 32),
   request_fingerprint BYTEA,
+  fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
   result_revision BIGINT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -183,6 +186,7 @@ CREATE TABLE IF NOT EXISTS link_preview_assets (
   width INT NOT NULL CHECK (width BETWEEN 1 AND 1200),
   height INT NOT NULL CHECK (height BETWEEN 1 AND 630),
   digest_hmac BYTEA NOT NULL CHECK (octet_length(digest_hmac) = 32),
+  digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -201,6 +205,7 @@ CREATE TABLE IF NOT EXISTS link_preview_snapshots (
 
 CREATE TABLE IF NOT EXISTS link_preview_cache_entries (
   url_lookup_hmac BYTEA PRIMARY KEY CHECK (octet_length(url_lookup_hmac) = 32),
+  url_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   url_key_id TEXT NOT NULL,
   url_nonce BYTEA NOT NULL CHECK (octet_length(url_nonce) = 12),
   url_ciphertext BYTEA NOT NULL,
@@ -231,6 +236,7 @@ CREATE TABLE IF NOT EXISTS message_link_previews (
   url_lookup_hmac BYTEA CHECK (
     url_lookup_hmac IS NULL OR octet_length(url_lookup_hmac) = 32
   ),
+  url_lookup_key_id TEXT DEFAULT 'legacy-v1',
   original_url_key_id TEXT,
   original_url_nonce BYTEA,
   original_url_ciphertext BYTEA,
@@ -252,6 +258,7 @@ CREATE TABLE IF NOT EXISTS message_link_previews (
 CREATE TABLE IF NOT EXISTS link_preview_waiters (
   url_lookup_hmac BYTEA NOT NULL REFERENCES link_preview_cache_entries(url_lookup_hmac)
     ON DELETE CASCADE,
+  url_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   dialog_id UUID NOT NULL,
   msg_id BIGINT NOT NULL,
   expected_edit_version INT NOT NULL,
@@ -260,6 +267,30 @@ CREATE TABLE IF NOT EXISTS link_preview_waiters (
   FOREIGN KEY (dialog_id, msg_id)
     REFERENCES message_link_previews(dialog_id, msg_id) ON DELETE CASCADE
 );
+
+-- Expand deployed v1 tables without rewriting existing rows. Legacy digests retain an
+-- explicit key label so retries and cache lookups survive blind-index activation.
+ALTER TABLE chat_folder_mutation_requests
+  ADD COLUMN IF NOT EXISTS request_fingerprint BYTEA;
+ALTER TABLE chat_folder_mutation_requests
+  ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE scheduled_delivery_mutation_requests
+  ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE link_preview_assets
+  ADD COLUMN IF NOT EXISTS digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE link_preview_cache_entries
+  ADD COLUMN IF NOT EXISTS url_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE message_link_previews
+  ADD COLUMN IF NOT EXISTS url_lookup_key_id TEXT DEFAULT 'legacy-v1';
+ALTER TABLE message_link_previews
+  ALTER COLUMN url_lookup_key_id SET DEFAULT 'legacy-v1';
+DO $$ BEGIN
+  ALTER TABLE message_link_previews ADD CONSTRAINT message_link_previews_url_hash_key_check
+    CHECK (url_lookup_hmac IS NULL OR url_lookup_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ALTER TABLE link_preview_waiters
+  ADD COLUMN IF NOT EXISTS url_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 
 CREATE TABLE IF NOT EXISTS link_preview_action_budgets (
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -331,6 +362,8 @@ END;
 $$;
 
 INSERT INTO schema_migrations(name) VALUES ('cloud-productivity-expand-v1')
+ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(name) VALUES ('cloud-productivity-encryption-expand-v2')
 ON CONFLICT DO NOTHING;
 
 COMMIT;

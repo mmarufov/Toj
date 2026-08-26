@@ -10,8 +10,11 @@
     "migrate": "bun run src/migrate.ts",
     "test:migration:forward": "bun run scripts/test-message-forward-migration.ts",
     "benchmark:sync-lifecycle": "bun run scripts/benchmark-sync-lifecycle-index.ts",
+    "benchmark:envelope-migration": "bun run scripts/benchmark-envelope-migration.ts",
     "backfill:saved-messages": "bun run scripts/backfill-saved-messages.ts",
     "verify:dialog-preferences-migration": "bun run scripts/verify-dialog-preferences-migration.ts",
+    "moderation:reports": "bun run scripts/moderation-reports.ts",
+    "crypto:keys": "bun run scripts/envelope-keys.ts",
     "backup": "bash scripts/backup-postgres.sh",
     "restore-drill": "bash scripts/restore-drill.sh",
     "test": "bun test"

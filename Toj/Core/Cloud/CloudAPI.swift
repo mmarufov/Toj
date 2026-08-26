@@ -923,6 +923,38 @@ nonisolated struct AccountDeletionResponse: Codable, Sendable {
     let deleted: Bool
 }
 
+nonisolated struct CloudAbuseReportSubject: Encodable, Equatable, Sendable {
+    let type: String
+    let accountId: String?
+    let msgId: Int64?
+
+    static func account(_ accountId: String) -> Self {
+        Self(type: "account", accountId: accountId, msgId: nil)
+    }
+
+    static func message(_ msgId: Int64) -> Self {
+        Self(type: "message", accountId: nil, msgId: msgId)
+    }
+}
+
+private struct CloudAbuseReportRequest: Encodable, Sendable {
+    let clientReportId: String
+    let dialogId: String
+    let subject: CloudAbuseReportSubject
+    let reason: String
+    let details: String?
+}
+
+nonisolated struct CloudAbuseReportResponse: Decodable, Equatable, Sendable {
+    let reportId: String
+    let status: String
+    let duplicate: Bool
+
+    var isAcknowledged: Bool {
+        status == "received" && UUID(uuidString: reportId) != nil
+    }
+}
+
 nonisolated struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let platform: String
@@ -2251,6 +2283,36 @@ struct CloudAPI: Sendable {
 
     func unblockAccount(id: String, token: String) async throws -> CloudBlockResponse {
         try await delete("v1/blocks/\(id)", token: token)
+    }
+
+    func submitAbuseReport(
+        clientReportId: UUID,
+        dialogId: String,
+        subject: CloudAbuseReportSubject,
+        reason: AbuseReportReason,
+        details: String?,
+        token: String
+    ) async throws -> CloudAbuseReportResponse {
+        let response: CloudAbuseReportResponse = try await post(
+            "v1/reports",
+            body: CloudAbuseReportRequest(
+                clientReportId: clientReportId.uuidString.lowercased(),
+                dialogId: dialogId,
+                subject: subject,
+                reason: reason.rawValue,
+                details: details
+            ),
+            token: token
+        )
+        guard response.isAcknowledged else {
+            throw CloudAPIError(
+                status: 502,
+                message: String(localized: "The server returned an invalid report acknowledgement."),
+                retryAfter: nil,
+                code: "invalid_report_acknowledgement"
+            )
+        }
+        return response
     }
 
     func revokeSession(token: String) async throws -> SessionRevocationResponse {

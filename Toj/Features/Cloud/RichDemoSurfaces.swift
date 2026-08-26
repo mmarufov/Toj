@@ -6,6 +6,7 @@ struct TojPeerProfileView: View {
     @State private var notificationsEnabled = true
     @State private var showingClearMedia = false
     @State private var showingBlockConfirmation = false
+    @State private var showingReport = false
 
     let dialogId: String
     let onCall: () -> Void
@@ -14,6 +15,7 @@ struct TojPeerProfileView: View {
 
     private var title: String { model.dialogTitle(dialogId) }
     private var dialog: CloudAppModel.Dialog? { model.dialogs.first(where: { $0.id == dialogId }) }
+    private var canReportAccount: Bool { model.canShowAccountReport(dialogId: dialogId) }
 
     private var birthdayText: LocalizedStringKey? {
         guard let value = dialog?.peerBirthday else { return nil }
@@ -53,9 +55,13 @@ struct TojPeerProfileView: View {
                                 .foregroundStyle(TojTheme.secondaryText)
                                 .multilineTextAlignment(.center)
                         }
-                        Label("Private conversation", systemImage: "lock.fill")
+                        Label(
+                            CloudChatPrivacyPresentation.title,
+                            systemImage: CloudChatPrivacyPresentation.systemImage
+                        )
                             .font(.caption)
-                            .foregroundStyle(TojTheme.secure)
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .accessibilityLabel(CloudChatPrivacyPresentation.accessibilityLabel)
                     }
                     .padding(.top, 12)
 
@@ -77,8 +83,20 @@ struct TojPeerProfileView: View {
                         if let birthdayText {
                             profileRow("Birthday", detail: birthdayText, icon: "birthday.cake.fill")
                         }
-                        profileRow("Connection", detail: "Protected", icon: "lock.fill", iconTint: TojTheme.secure, detailColor: TojTheme.secure)
+                        profileRow(
+                            "Message privacy",
+                            detail: LocalizedStringKey(CloudChatPrivacyPresentation.detail),
+                            icon: CloudChatPrivacyPresentation.systemImage
+                        )
+                        Text(CloudChatPrivacyPresentation.disclosure)
+                            .font(.footnote)
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 15)
+                            .padding(.vertical, 12)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(CloudChatPrivacyPresentation.accessibilityLabel)
 
                     profileSection("Conversation") {
                         Toggle(isOn: $notificationsEnabled) {
@@ -110,7 +128,12 @@ struct TojPeerProfileView: View {
                         Divider().overlay(TojTheme.hairline).padding(.leading, 58)
 
                         Button(role: .destructive) { showingBlockConfirmation = true } label: {
-                            Label("Block or report", systemImage: "hand.raised.fill")
+                            Label(
+                                canReportAccount
+                                    ? String(localized: "Block or report")
+                                    : String(localized: "Block"),
+                                systemImage: "hand.raised.fill"
+                            )
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .frame(minHeight: 54)
                         }
@@ -140,7 +163,9 @@ struct TojPeerProfileView: View {
                 Text("Messages stay in the chat. Cloud media downloads again when you open it.")
             }
             .confirmationDialog(
-                "Block or report this contact?",
+                canReportAccount
+                    ? String(localized: "Block or report this contact?")
+                    : String(localized: "Block this contact?"),
                 isPresented: $showingBlockConfirmation,
                 titleVisibility: .visible
             ) {
@@ -149,10 +174,30 @@ struct TojPeerProfileView: View {
                         if await model.blockPeer(dialogId: dialogId) { dismiss() }
                     }
                 }
-                Button("Report", role: .destructive) {}
+                if canReportAccount {
+                    Button("Report", role: .destructive) { showingReport = true }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Blocking prevents new messages and voice calls in both directions.")
+            }
+            .sheet(isPresented: $showingReport) {
+                AbuseReportSheet(
+                    subjectKind: .account,
+                    submit: { reason, details, clientReportId in
+                        await model.submitAccountReport(
+                            dialogId: dialogId,
+                            reason: reason,
+                            details: details,
+                            clientReportId: clientReportId
+                        )
+                    },
+                    blockAccount: {
+                        await model.blockPeer(dialogId: dialogId)
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
         }
     }
@@ -503,7 +548,7 @@ struct PresentationStateGallery: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 gallerySection("Connection") {
-                    stateRow("Protected", detail: "Connected", icon: "lock.fill", color: TojTheme.secure)
+                    stateRow("Connected", detail: "Live sync", icon: "network", color: TojTheme.secure)
                     stateRow("Connecting…", detail: "Syncing", icon: "arrow.triangle.2.circlepath", color: TojTheme.secondaryText)
                     stateRow("Waiting for network", detail: "Messages are queued", icon: "wifi.slash", color: .orange)
                 }

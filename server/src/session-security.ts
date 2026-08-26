@@ -2,7 +2,9 @@ import type { SQL } from "bun";
 import { randomBytes } from "node:crypto";
 import { Client } from "pg";
 import { AuthError } from "./auth-error";
-import { hashToken, open, seal, sessionRotationAAD } from "./crypto";
+import { sessionRotationAAD, tokenHashCandidates, tokenHashIndex } from "./crypto";
+import { openForScope, sealForScope } from "./envelope-crypto";
+import { revokePushBindingsForDevice } from "./push";
 
 export const ACCESS_TOKEN_TTL_MS = 15 * 60_000;
 export const SESSION_IDLE_TTL_MS = 30 * 24 * 60 * 60_000;
@@ -62,11 +64,18 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
   const refreshToken = token(REFRESH_TOKEN_PREFIX);
   const accessExpiresAt = new Date(now.getTime() + ACCESS_TOKEN_TTL_MS);
   const absoluteExpiresAt = new Date(now.getTime() + SESSION_ABSOLUTE_TTL_MS);
+  const accessIndex = tokenHashIndex(accessToken);
+  const refreshIndex = tokenHashIndex(refreshToken);
   let deviceId = registration.existingDeviceId;
   if (deviceId) {
+    // v2 devices authenticate through session_access_tokens, so the legacy column keeps an
+    // unusable random digest. It still records the active blind-index key so rotation audits
+    // do not see it as an unmigrated 'legacy-v1' row.
+    const placeholder = tokenHashIndex(token(ACCESS_TOKEN_PREFIX));
     const updated = await sql`
       UPDATE devices SET auth_scheme = 'v2',
-        auth_token_hash = ${hashToken(token(ACCESS_TOKEN_PREFIX))}, last_seen_at = ${now}
+        auth_token_hash = ${placeholder.digest}, auth_token_key_id = ${placeholder.keyId},
+        last_seen_at = ${now}
       WHERE id = ${deviceId} AND account_id = ${registration.accountId} AND revoked_at IS NULL
       RETURNING id`;
     if (!updated.length) throw new AuthError("device is no longer active", 401, undefined, "device_revoked");
@@ -76,33 +85,41 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
     // old refresh token appears later, retaining its digest in history turns it into an explicit
     // replay instead of an ambiguous "invalid token" response.
     const prior = (await sql`
-      SELECT id, refresh_token_hash
+      SELECT id, refresh_token_hash, refresh_token_hash_key_id
       FROM device_sessions
       WHERE device_id = ${deviceId}
       FOR UPDATE`)[0];
     if (prior) {
       await sql`
-        INSERT INTO session_refresh_token_history (token_digest, session_id)
-        VALUES (${prior.refresh_token_hash}, ${prior.id})
+        INSERT INTO session_refresh_token_history (token_digest, token_digest_key_id, session_id)
+        VALUES (${prior.refresh_token_hash}, ${prior.refresh_token_hash_key_id}, ${prior.id})
         ON CONFLICT (token_digest) DO NOTHING`;
       await sql`DELETE FROM session_access_tokens WHERE session_id = ${prior.id}`;
       await sql`DELETE FROM session_rotation_receipts WHERE session_id = ${prior.id}`;
     }
   } else {
+    const placeholder = tokenHashIndex(token(ACCESS_TOKEN_PREFIX));
     const inserted = await sql`
-      INSERT INTO devices (account_id, platform, device_name, auth_token_hash, auth_scheme, last_seen_at)
+      INSERT INTO devices (
+        account_id, platform, device_name, auth_token_hash, auth_token_key_id,
+        auth_scheme, last_seen_at
+      )
       VALUES (
         ${registration.accountId}, ${registration.platform}, ${registration.deviceName ?? null},
-        ${hashToken(token(ACCESS_TOKEN_PREFIX))}, 'v2', ${now}
+        ${placeholder.digest}, ${placeholder.keyId}, 'v2', ${now}
       ) RETURNING id`;
     deviceId = String(inserted[0].id);
   }
 
   const session = (await sql`
-    INSERT INTO device_sessions (device_id, refresh_token_hash, last_activity_at, absolute_expires_at)
-    VALUES (${deviceId}, ${hashToken(refreshToken)}, ${now}, ${absoluteExpiresAt})
+    INSERT INTO device_sessions (
+      device_id, refresh_token_hash, refresh_token_hash_key_id,
+      last_activity_at, absolute_expires_at
+    )
+    VALUES (${deviceId}, ${refreshIndex.digest}, ${refreshIndex.keyId}, ${now}, ${absoluteExpiresAt})
     ON CONFLICT (device_id) DO UPDATE SET
       refresh_token_hash = EXCLUDED.refresh_token_hash,
+      refresh_token_hash_key_id = EXCLUDED.refresh_token_hash_key_id,
       rotation_generation = device_sessions.rotation_generation + 1,
       last_activity_at = EXCLUDED.last_activity_at,
       absolute_expires_at = EXCLUDED.absolute_expires_at,
@@ -110,8 +127,8 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
       revocation_reason = NULL
     RETURNING id, device_id, absolute_expires_at`)[0];
   await sql`
-    INSERT INTO session_access_tokens (token_digest, session_id, expires_at)
-    VALUES (${hashToken(accessToken)}, ${session.id}, ${accessExpiresAt})`;
+    INSERT INTO session_access_tokens (token_digest, token_digest_key_id, session_id, expires_at)
+    VALUES (${accessIndex.digest}, ${accessIndex.keyId}, ${session.id}, ${accessExpiresAt})`;
   return responseFromRow({
     account_id: registration.accountId,
     device_id: deviceId,
@@ -135,10 +152,11 @@ export async function resolveV2Access(
   accessToken: string,
   now = new Date(),
 ): Promise<{ accountId: string; deviceId: string; accessExpiresAt: Date } | null> {
-  const digest = hashToken(accessToken);
+  const candidates = tokenHashCandidates(accessToken);
   const result = await sql.begin(async (tx) => {
-    const row = (await tx`
-      SELECT access.expires_at AS access_expires_at,
+    const rows = await tx`
+      SELECT access.id AS access_id, access.token_digest, access.token_digest_key_id,
+             access.expires_at AS access_expires_at,
              session.id AS session_id, session.last_activity_at,
              session.absolute_expires_at, session.revoked_at, session.revocation_reason,
              device.id AS device_id, device.account_id, device.revoked_at AS device_revoked_at,
@@ -147,8 +165,16 @@ export async function resolveV2Access(
       JOIN device_sessions session ON session.id = access.session_id
       JOIN devices device ON device.id = session.device_id
       JOIN accounts account ON account.id = device.account_id
-      WHERE access.token_digest = ${digest}
-      FOR UPDATE OF session, device`)[0];
+      WHERE access.token_digest IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(candidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+      FOR UPDATE OF access, session, device`;
+    if (rows.length > 1) {
+      return new AuthError("invalid access token", 401, undefined, "device_revoked");
+    }
+    const row = rows[0];
     if (!row) return null;
     if (row.revoked_at || row.device_revoked_at) {
       throw new AuthError(
@@ -170,6 +196,12 @@ export async function resolveV2Access(
     }
     await tx`UPDATE device_sessions SET last_activity_at = ${now} WHERE id = ${row.session_id}`;
     await tx`UPDATE devices SET last_seen_at = ${now} WHERE id = ${row.device_id}`;
+    const active = tokenHashIndex(accessToken);
+    if (String(row.token_digest_key_id) !== active.keyId) {
+      await tx`UPDATE session_access_tokens
+        SET token_digest = ${active.digest}, token_digest_key_id = ${active.keyId}
+        WHERE id = ${row.access_id} AND token_digest = ${row.token_digest}`;
+    }
     return {
       accountId: String(row.account_id),
       deviceId: String(row.device_id),
@@ -189,27 +221,47 @@ export async function refreshV2Session(
   if (!UUID_PATTERN.test(rotationId)) {
     throw new AuthError("valid rotationId required", 400, undefined, "invalid_rotation_id");
   }
-  const requestDigest = hashToken(refreshToken);
+  const requestCandidates = tokenHashCandidates(refreshToken);
   const outcome = await sql.begin(async (tx) => {
-    const current = (await tx`
+    const currentRows = await tx`
       SELECT session.*, device.account_id, device.id AS device_id, device.revoked_at AS device_revoked_at
       FROM device_sessions session
       JOIN devices device ON device.id = session.device_id
-      WHERE session.refresh_token_hash = ${requestDigest}
-      FOR UPDATE OF session, device`)[0];
+      WHERE session.refresh_token_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(requestCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+      FOR UPDATE OF session, device`;
+    if (currentRows.length > 1) {
+      return new AuthError("invalid refresh token", 401, undefined, "device_revoked");
+    }
+    const current = currentRows[0];
     if (!current) {
-      const used = (await tx`
-        SELECT history.session_id
+      const usedRows = await tx`
+        SELECT history.session_id, history.token_digest, history.token_digest_key_id
         FROM session_refresh_token_history history
-        WHERE history.token_digest = ${requestDigest}`)[0];
+        WHERE history.token_digest IN (
+          SELECT decode(value, 'hex') FROM unnest(
+            ${tx.array(requestCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+          ) AS candidate(value)
+        )`;
+      if (usedRows.length > 1) {
+        return new AuthError("invalid refresh token", 401, undefined, "device_revoked");
+      }
+      const used = usedRows[0];
       if (!used) return new AuthError("invalid refresh token", 401, undefined, "device_revoked");
       const receipt = (await tx`
         SELECT receipt.response_ciphertext, receipt.response_nonce, receipt.response_key_id,
-               receipt.response_generation, session.rotation_generation AS current_generation
+               receipt.response_generation, session.rotation_generation AS current_generation,
+               device.account_id
         FROM session_rotation_receipts receipt
         JOIN device_sessions session ON session.id = receipt.session_id
+        JOIN devices device ON device.id = session.device_id
         WHERE receipt.session_id = ${used.session_id} AND receipt.rotation_id = ${rotationId}
-          AND receipt.request_token_digest = ${requestDigest} AND receipt.expires_at > ${now}`)[0];
+          AND receipt.request_token_digest = ${used.token_digest}
+          AND receipt.request_token_digest_key_id = ${used.token_digest_key_id}
+          AND receipt.expires_at > ${now}`)[0];
       if (receipt) {
         if (Number(receipt.response_generation) !== Number(receipt.current_generation)) {
           return new AuthError(
@@ -219,12 +271,18 @@ export async function refreshV2Session(
             "rotation_superseded",
           );
         }
-        const plaintext = open({
+        const plaintext = await openForScope(tx, {
+          kind: "account", accountId: String(receipt.account_id),
+        }, {
           ciphertext: Buffer.from(receipt.response_ciphertext),
           nonce: Buffer.from(receipt.response_nonce),
           keyId: String(receipt.response_key_id),
         }, sessionRotationAAD(String(used.session_id), rotationId));
-        return JSON.parse(plaintext.toString("utf8")) as AuthV2Session;
+        try {
+          return JSON.parse(plaintext.toString("utf8")) as AuthV2Session;
+        } finally {
+          plaintext.fill(0);
+        }
       }
       const session = (await tx`SELECT device_id FROM device_sessions WHERE id = ${used.session_id} FOR UPDATE`)[0];
       if (session) {
@@ -260,32 +318,41 @@ export async function refreshV2Session(
 
     const nextAccess = token(ACCESS_TOKEN_PREFIX);
     const nextRefresh = token(REFRESH_TOKEN_PREFIX);
+    const nextAccessIndex = tokenHashIndex(nextAccess);
+    const nextRefreshIndex = tokenHashIndex(nextRefresh);
     const accessExpiresAt = new Date(now.getTime() + ACCESS_TOKEN_TTL_MS);
     await tx`
-      INSERT INTO session_refresh_token_history (token_digest, session_id)
-      VALUES (${requestDigest}, ${current.id})`;
+      INSERT INTO session_refresh_token_history (token_digest, token_digest_key_id, session_id)
+      VALUES (${current.refresh_token_hash}, ${current.refresh_token_hash_key_id}, ${current.id})`;
     await tx`
       UPDATE device_sessions SET
-        refresh_token_hash = ${hashToken(nextRefresh)},
+        refresh_token_hash = ${nextRefreshIndex.digest},
+        refresh_token_hash_key_id = ${nextRefreshIndex.keyId},
         rotation_generation = rotation_generation + 1,
         last_activity_at = ${now}
       WHERE id = ${current.id}`;
     await tx`
-      INSERT INTO session_access_tokens (token_digest, session_id, expires_at)
-      VALUES (${hashToken(nextAccess)}, ${current.id}, ${accessExpiresAt})`;
+      INSERT INTO session_access_tokens (token_digest, token_digest_key_id, session_id, expires_at)
+      VALUES (${nextAccessIndex.digest}, ${nextAccessIndex.keyId}, ${current.id}, ${accessExpiresAt})`;
     const response = responseFromRow({
       account_id: current.account_id,
       device_id: current.device_id,
       access_expires_at: accessExpiresAt,
       absolute_expires_at: current.absolute_expires_at,
     }, nextAccess, nextRefresh);
-    const sealed = seal(JSON.stringify(response), sessionRotationAAD(String(current.id), rotationId));
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId: String(current.account_id) },
+      JSON.stringify(response),
+      sessionRotationAAD(String(current.id), rotationId),
+    );
     await tx`
       INSERT INTO session_rotation_receipts
-        (session_id, rotation_id, request_token_digest, response_ciphertext,
+        (session_id, rotation_id, request_token_digest, request_token_digest_key_id, response_ciphertext,
          response_nonce, response_key_id, response_generation, expires_at)
       VALUES (
-        ${current.id}, ${rotationId}, ${requestDigest}, ${sealed.ciphertext},
+        ${current.id}, ${rotationId}, ${current.refresh_token_hash},
+        ${current.refresh_token_hash_key_id}, ${sealed.ciphertext},
         ${sealed.nonce}, ${sealed.keyId}, ${Number(current.rotation_generation) + 1},
         ${new Date(now.getTime() + ROTATION_RECEIPT_TTL_MS)}
       )`;
@@ -302,6 +369,7 @@ export async function revokeV2SessionForDevice(
   reason = "device_revoked",
 ): Promise<void> {
   await sql.begin(async (tx) => {
+    await tx`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
     const row = (await tx`
       SELECT session.id
       FROM device_sessions session
@@ -325,13 +393,16 @@ async function revokeSessionRows(
   const devices = await sql`
     UPDATE devices SET
       revoked_at = COALESCE(revoked_at, ${now}),
-      push_token_hash = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+      push_token_hash = NULL, push_token_hash_key_id = NULL,
+      push_token_ciphertext = NULL, push_token_nonce = NULL,
       push_token_key_id = NULL, push_environment = NULL, push_updated_at = ${now},
-      voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+      voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
+      voip_push_token_ciphertext = NULL,
       voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
       voip_push_environment = NULL, voip_push_updated_at = ${now}
     WHERE id = ${deviceId}
     RETURNING account_id`;
+  await revokePushBindingsForDevice(sql, deviceId);
   if (devices[0]?.account_id) await notifySessionRevocation(
     sql,
     String(devices[0].account_id),

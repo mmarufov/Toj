@@ -36,6 +36,7 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_color INT NOT NULL DEFAULT
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_photo_media_id UUID;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_photo_revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS phone_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 DO $$ BEGIN
   ALTER TABLE accounts ADD CONSTRAINT accounts_profile_color_check
     CHECK (profile_color BETWEEN 0 AND 7);
@@ -44,6 +45,78 @@ END $$;
 UPDATE accounts
 SET first_name = display_name
 WHERE first_name = '' AND last_name = '' AND display_name <> '';
+
+-- ============ provider-neutral envelope encryption ============
+-- KMS/HSM providers wrap small random data-encryption keys (DEKs); message/media payloads never
+-- cross the provider boundary. Account rows are retained as deleted tombstones, so these foreign
+-- keys also remain available for ciphertext that other conversation members still retain.
+CREATE TABLE IF NOT EXISTS account_data_keys (
+  id                     UUID PRIMARY KEY,
+  account_id             UUID NOT NULL REFERENCES accounts(id),
+  version                INT NOT NULL CHECK (version > 0),
+  state                  TEXT NOT NULL CHECK (state IN ('active','retiring','retired')),
+  provider_id            TEXT NOT NULL,
+  provider_key_reference TEXT NOT NULL,
+  wrapped_key            BYTEA NOT NULL,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retiring_at            TIMESTAMPTZ,
+  revocation_started_at  TIMESTAMPTZ,
+  retired_at             TIMESTAMPTZ,
+  UNIQUE (account_id, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS account_data_keys_one_active_idx
+  ON account_data_keys(account_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS account_data_keys_retirement_idx
+  ON account_data_keys(retiring_at) WHERE state = 'retiring';
+
+CREATE TABLE IF NOT EXISTS service_data_keys (
+  id                     UUID PRIMARY KEY,
+  service_name           TEXT NOT NULL,
+  version                INT NOT NULL CHECK (version > 0),
+  state                  TEXT NOT NULL CHECK (state IN ('active','retiring','retired')),
+  provider_id            TEXT NOT NULL,
+  provider_key_reference TEXT NOT NULL,
+  wrapped_key            BYTEA NOT NULL,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retiring_at            TIMESTAMPTZ,
+  revocation_started_at  TIMESTAMPTZ,
+  retired_at             TIMESTAMPTZ,
+  UNIQUE (service_name, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS service_data_keys_one_active_idx
+  ON service_data_keys(service_name) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS service_data_keys_retirement_idx
+  ON service_data_keys(retiring_at) WHERE state = 'retiring';
+
+-- Existing installations gain a durable two-phase revocation marker. The first retirement pass
+-- blocks new unwraps; the final pass erases wrapped material only after every bounded cache entry
+-- created before that marker must have expired and zeroized itself.
+ALTER TABLE account_data_keys
+  ADD COLUMN IF NOT EXISTS revocation_started_at TIMESTAMPTZ;
+ALTER TABLE service_data_keys
+  ADD COLUMN IF NOT EXISTS revocation_started_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS crypto_migration_cursors (
+  domain       TEXT PRIMARY KEY,
+  cursor       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  state        TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','running','complete')),
+  rows_migrated BIGINT NOT NULL DEFAULT 0 CHECK (rows_migrated >= 0),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The database is the final writer fence. Once envelope mode is activated, triggers installed
+-- after every ciphertext domain exists reject legacy writes even from a stale application node.
+CREATE TABLE IF NOT EXISTS crypto_write_state (
+  singleton  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  write_mode TEXT NOT NULL CHECK (write_mode IN ('legacy','envelope-canary','envelope')),
+  epoch      BIGINT NOT NULL CHECK (epoch > 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO crypto_write_state(singleton, write_mode, epoch)
+VALUES (TRUE, 'legacy', 1)
+ON CONFLICT (singleton) DO NOTHING;
 
 -- The sync cursor per account. NO `seq` (I1: redundant with pts). pruned_through_pts (B3) is the
 -- floor below which events are gone -> get_difference must answer difference_too_long.
@@ -82,6 +155,9 @@ END $$;
 -- Existing M3 deployments already have devices.push_token_ciphertext, so M4 adds the remaining
 -- token metadata with idempotent ALTERs. The token itself is never stored as plaintext.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_hash BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS auth_token_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_hash_key_id TEXT DEFAULT 'legacy-v1';
+ALTER TABLE devices ALTER COLUMN push_token_hash_key_id SET DEFAULT 'legacy-v1';
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_nonce BYTEA;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_key_id TEXT;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_environment TEXT;
@@ -89,6 +165,8 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_updated_at TIMESTAMPTZ;
 -- PushKit uses a different APNs token and topic from ordinary notifications. Keep the
 -- registrations separate so an Unregistered response for one topic cannot erase the other.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_hash BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_hash_key_id TEXT DEFAULT 'legacy-v1';
+ALTER TABLE devices ALTER COLUMN voip_push_token_hash_key_id SET DEFAULT 'legacy-v1';
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_ciphertext BYTEA;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_nonce BYTEA;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_key_id TEXT;
@@ -109,6 +187,16 @@ END $$;
 DO $$ BEGIN
   ALTER TABLE devices ADD CONSTRAINT devices_voip_push_environment_check
     CHECK (voip_push_environment IN ('sandbox','production')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE devices ADD CONSTRAINT devices_push_hash_key_check
+    CHECK (push_token_hash IS NULL OR push_token_hash_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE devices ADD CONSTRAINT devices_voip_push_hash_key_check
+    CHECK (voip_push_token_hash IS NULL OR voip_push_token_hash_key_id IS NOT NULL) NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS devices_account_active_idx ON devices(account_id) WHERE revoked_at IS NULL;
@@ -132,12 +220,21 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_salt BYTEA;
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS phone_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS network_key_id TEXT DEFAULT 'legacy-v1';
+ALTER TABLE otp_challenges ALTER COLUMN network_key_id SET DEFAULT 'legacy-v1';
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS network_hash BYTEA;
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'login';
 ALTER TABLE otp_challenges DROP CONSTRAINT IF EXISTS otp_challenges_purpose_check;
 DO $$ BEGIN
   ALTER TABLE otp_challenges ADD CONSTRAINT otp_challenges_purpose_check
     CHECK (purpose IN ('login','account_deletion','security_change'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE otp_challenges ADD CONSTRAINT otp_challenges_network_hash_key_check
+    CHECK (network_hash IS NULL OR network_key_id IS NOT NULL) NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS otp_active_idx ON otp_challenges(phone_lookup_hash, expires_at) WHERE consumed_at IS NULL;
@@ -152,6 +249,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   device_id           UUID NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
   refresh_token_hash  BYTEA NOT NULL UNIQUE,
+  refresh_token_hash_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   rotation_generation BIGINT NOT NULL DEFAULT 0,
   last_activity_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   absolute_expires_at TIMESTAMPTZ NOT NULL,
@@ -159,29 +257,38 @@ CREATE TABLE IF NOT EXISTS device_sessions (
   revocation_reason   TEXT,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS refresh_token_hash_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS device_sessions_active_idx
   ON device_sessions(last_activity_at, absolute_expires_at) WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS session_access_tokens (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   token_digest BYTEA NOT NULL UNIQUE,
+  token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE session_access_tokens ADD COLUMN IF NOT EXISTS token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS session_access_tokens_session_idx
   ON session_access_tokens(session_id, expires_at DESC);
 
 CREATE TABLE IF NOT EXISTS session_refresh_token_history (
   token_digest BYTEA PRIMARY KEY,
+  token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   used_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE session_refresh_token_history ADD COLUMN IF NOT EXISTS token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 
 CREATE TABLE IF NOT EXISTS session_rotation_receipts (
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   rotation_id UUID NOT NULL,
   request_token_digest BYTEA NOT NULL,
+  request_token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   response_ciphertext BYTEA NOT NULL,
   response_nonce BYTEA NOT NULL,
   response_key_id TEXT NOT NULL,
@@ -191,6 +298,8 @@ CREATE TABLE IF NOT EXISTS session_rotation_receipts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (session_id, rotation_id)
 );
+ALTER TABLE session_rotation_receipts ADD COLUMN IF NOT EXISTS request_token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 ALTER TABLE session_rotation_receipts
   ADD COLUMN IF NOT EXISTS response_generation BIGINT;
 -- Rotation receipts live for only five minutes. Receipts written by the pre-generation binary
@@ -228,10 +337,13 @@ CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   code_hash BYTEA NOT NULL,
+  code_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (account_id, code_hash)
 );
+ALTER TABLE two_factor_recovery_codes ADD COLUMN IF NOT EXISTS code_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS two_factor_recovery_active_idx
   ON two_factor_recovery_codes(account_id) WHERE consumed_at IS NULL;
 
@@ -253,8 +365,16 @@ CREATE TABLE IF NOT EXISTS two_factor_attempt_budgets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   network_hash BYTEA,
+  network_key_id TEXT DEFAULT 'legacy-v1',
   accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE two_factor_attempt_budgets ADD COLUMN IF NOT EXISTS network_key_id
+  TEXT DEFAULT 'legacy-v1';
+DO $$ BEGIN
+  ALTER TABLE two_factor_attempt_budgets ADD CONSTRAINT two_factor_attempt_network_key_check
+    CHECK (network_hash IS NULL OR network_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS two_factor_attempt_account_idx
   ON two_factor_attempt_budgets(account_id, accepted_at DESC);
 CREATE INDEX IF NOT EXISTS two_factor_attempt_network_idx
@@ -264,12 +384,15 @@ CREATE TABLE IF NOT EXISTS security_step_up_tickets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash BYTEA NOT NULL UNIQUE,
+  token_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   attempts INT NOT NULL DEFAULT 0,
   expires_at TIMESTAMPTZ NOT NULL,
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS token_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- Persisted, per-account discovery budget. This makes phone enumeration expensive even across
 -- server restarts and multiple app processes; repeated lookups of the same contact are idempotent
@@ -281,6 +404,7 @@ CREATE TABLE IF NOT EXISTS contact_lookup_attempts (
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE contact_lookup_attempts DROP COLUMN IF EXISTS found;
+ALTER TABLE contact_lookup_attempts ADD COLUMN IF NOT EXISTS target_phone_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS contact_lookup_attempts_requester_idx
   ON contact_lookup_attempts(requester_account_id, created_at DESC);
 
@@ -381,6 +505,7 @@ ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS upload_protocol TEXT NOT NULL
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS part_size INT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS total_parts INT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'message';
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS expected_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'media-constraints-v2')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'media_objects_upload_protocol_check_v2') THEN
@@ -477,6 +602,7 @@ CREATE TABLE IF NOT EXISTS media_chunks (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (media_id, chunk_offset)
 );
+ALTER TABLE media_chunks ADD COLUMN IF NOT EXISTS plain_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- ============ messages (encrypted-at-rest) ============
 CREATE TABLE IF NOT EXISTS messages (
@@ -499,6 +625,7 @@ CREATE TABLE IF NOT EXISTS messages (
   media_group_index SMALLINT,
   media_group_count SMALLINT,
   send_fingerprint  BYTEA,
+  send_fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   service_type      TEXT,
   service_data      JSONB,
   edit_version      INT NOT NULL DEFAULT 0,
@@ -520,6 +647,7 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_index SMALLINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_count SMALLINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS send_fingerprint BYTEA;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS send_fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -668,12 +796,14 @@ CREATE TABLE IF NOT EXISTS send_requests (
   draft_consume_operation_id UUID,
   cleared_draft_revision BIGINT,
   fingerprint       BYTEA,
+  fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
 ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS draft_consume_operation_id UUID;
 ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS cleared_draft_revision BIGINT;
 ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS fingerprint BYTEA;
+ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -682,6 +812,11 @@ BEGIN
     ALTER TABLE send_requests ADD CONSTRAINT send_requests_fingerprint_size_check
       CHECK (fingerprint IS NULL OR octet_length(fingerprint) = 32) NOT VALID;
   END IF;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE send_requests ADD CONSTRAINT send_requests_fingerprint_key_check
+    CHECK (fingerprint IS NULL OR fingerprint_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
 -- ============ account-private cloud drafts ============
@@ -754,6 +889,8 @@ CREATE TABLE IF NOT EXISTS draft_mutation_tombstones (
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, operation_id)
 );
+ALTER TABLE draft_mutation_requests ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE draft_mutation_tombstones ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- One immutable row per accepted mutation makes the 120/minute device budget a true rolling window.
 CREATE TABLE IF NOT EXISTS draft_mutation_budgets (
@@ -801,6 +938,8 @@ CREATE TABLE IF NOT EXISTS media_group_send_tombstones (
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_group_id)
 );
+ALTER TABLE media_group_send_requests ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
+ALTER TABLE media_group_send_tombstones ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- Counts album items rather than requests so ten-item groups cannot multiply mutation ingress.
 CREATE TABLE IF NOT EXISTS media_group_send_budgets (
@@ -1442,6 +1581,13 @@ CREATE INDEX IF NOT EXISTS call_invite_attempts_callee_idx
   ON call_invite_attempts(callee_account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS call_invite_attempts_network_idx
   ON call_invite_attempts(network_hash, created_at DESC) WHERE network_hash IS NOT NULL;
+ALTER TABLE call_invite_attempts ADD COLUMN IF NOT EXISTS network_key_id TEXT DEFAULT 'legacy-v1';
+ALTER TABLE call_invite_attempts ALTER COLUMN network_key_id SET DEFAULT 'legacy-v1';
+DO $$ BEGIN
+  ALTER TABLE call_invite_attempts ADD CONSTRAINT call_invite_attempts_network_hash_key_check
+    CHECK (network_hash IS NULL OR network_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS call_invite_attempts_retention_idx ON call_invite_attempts(created_at);
 
 CREATE TABLE IF NOT EXISTS voip_push_deliveries (
@@ -1522,6 +1668,28 @@ CREATE TABLE IF NOT EXISTS content_access_audit (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE OR REPLACE FUNCTION public.toj_content_access_audit_append_only_v1()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  retention_owner NAME;
+BEGIN
+  SELECT pg_get_userbyid(proowner) INTO retention_owner
+  FROM pg_proc WHERE oid = 'public.toj_cleanup_abuse_reports_v1(integer)'::regprocedure;
+  IF TG_OP = 'DELETE'
+     AND current_user = retention_owner
+     AND current_setting('toj.allow_content_access_retention_delete', TRUE) = '1' THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'content_access_audit is append-only';
+END;
+$$;
+DROP TRIGGER IF EXISTS content_access_audit_append_only ON content_access_audit;
+CREATE TRIGGER content_access_audit_append_only
+  BEFORE UPDATE OR DELETE ON content_access_audit
+  FOR EACH ROW EXECUTE FUNCTION public.toj_content_access_audit_append_only_v1();
+
+-- The private-beta scaffold remains untouched. It was never exposed by a route and its loose
+-- contract cannot safely be upgraded into the strict, idempotent moderation workflow in place.
 CREATE TABLE IF NOT EXISTS user_reports (
   id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   reporter_account_id         UUID NOT NULL REFERENCES accounts(id),
@@ -1531,7 +1699,190 @@ CREATE TABLE IF NOT EXISTS user_reports (
   reason                      TEXT NOT NULL,
   message_snapshot_key_id     TEXT,
   message_snapshot_nonce      BYTEA,
-  message_snapshot_ciphertext BYTEA,                  -- copy of reported msg so moderation needs no inbox access
+  message_snapshot_ciphertext BYTEA,
   created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
   resolved_at                 TIMESTAMPTZ
 );
+
+CREATE TABLE IF NOT EXISTS abuse_reports (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reporter_account_id UUID NOT NULL REFERENCES accounts(id),
+  client_report_id    UUID NOT NULL,
+  request_fingerprint BYTEA NOT NULL CHECK (octet_length(request_fingerprint) = 32),
+  fingerprint_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
+  dialog_id           UUID NOT NULL,
+  subject_type        TEXT NOT NULL CHECK (subject_type IN ('account','message')),
+  reported_account_id UUID NOT NULL REFERENCES accounts(id),
+  msg_id              BIGINT,
+  reason              TEXT NOT NULL CHECK (reason IN (
+                        'spam','scam','harassment','violence','sexual_content',
+                        'child_safety','other'
+                      )),
+  priority            TEXT NOT NULL CHECK (priority IN ('urgent','standard')),
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_review','resolved')),
+  evidence_key_id     TEXT,
+  evidence_nonce      BYTEA,
+  evidence_ciphertext BYTEA,
+  evidence_plain_size INT CHECK (evidence_plain_size IS NULL OR evidence_plain_size BETWEEN 1 AND 262144),
+  claimed_by          TEXT,
+  claimed_at          TIMESTAMPTZ,
+  resolution          TEXT CHECK (resolution IS NULL OR resolution IN (
+                        'resolved','dismissed','content_removed','account_banned'
+                      )),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at         TIMESTAMPTZ,
+  evidence_expires_at TIMESTAMPTZ,
+  audit_expires_at    TIMESTAMPTZ,
+  UNIQUE (reporter_account_id, client_report_id),
+  CHECK (
+    (subject_type = 'account' AND reported_account_id IS NOT NULL AND msg_id IS NULL)
+    OR (subject_type = 'message' AND reported_account_id IS NOT NULL AND msg_id IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'resolved' AND resolved_at IS NOT NULL AND resolution IS NOT NULL
+      AND evidence_expires_at IS NOT NULL AND audit_expires_at IS NOT NULL)
+    OR (status <> 'resolved' AND resolved_at IS NULL AND resolution IS NULL)
+  )
+);
+ALTER TABLE abuse_reports ALTER COLUMN reported_account_id SET NOT NULL;
+ALTER TABLE abuse_reports ALTER COLUMN client_report_id SET NOT NULL;
+ALTER TABLE abuse_reports ALTER COLUMN request_fingerprint SET NOT NULL;
+ALTER TABLE abuse_reports ALTER COLUMN dialog_id SET NOT NULL;
+ALTER TABLE abuse_reports ALTER COLUMN subject_type SET NOT NULL;
+ALTER TABLE abuse_reports ALTER COLUMN priority SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS abuse_reports_idempotency_idx
+  ON abuse_reports(reporter_account_id, client_report_id);
+CREATE INDEX IF NOT EXISTS abuse_reports_open_priority_idx
+  ON abuse_reports(priority, created_at) WHERE status <> 'resolved';
+CREATE INDEX IF NOT EXISTS abuse_reports_target_history_idx
+  ON abuse_reports(reported_account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS abuse_reports_evidence_retention_idx
+  ON abuse_reports(evidence_expires_at) WHERE evidence_ciphertext IS NOT NULL;
+CREATE INDEX IF NOT EXISTS abuse_reports_audit_retention_idx
+  ON abuse_reports(audit_expires_at) WHERE status = 'resolved';
+
+CREATE TABLE IF NOT EXISTS abuse_report_submission_budgets (
+  id                  BIGSERIAL PRIMARY KEY,
+  reporter_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  accepted_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS abuse_report_submission_budgets_account_idx
+  ON abuse_report_submission_budgets(reporter_account_id, accepted_at DESC);
+
+CREATE TABLE IF NOT EXISTS abuse_report_actions (
+  id              BIGSERIAL PRIMARY KEY,
+  report_id       UUID NOT NULL REFERENCES abuse_reports(id) ON DELETE CASCADE,
+  actor_kind      TEXT NOT NULL CHECK (actor_kind IN ('system','moderation')),
+  actor_id        TEXT,
+  action          TEXT NOT NULL CHECK (action IN (
+                    'created','claimed','resolved','dismissed','content_removed',
+                    'account_banned','escalated'
+                  )),
+  note_key_id     TEXT,
+  note_nonce      BYTEA,
+  note_ciphertext BYTEA,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (
+    (note_key_id IS NULL AND note_nonce IS NULL AND note_ciphertext IS NULL)
+    OR (note_key_id IS NOT NULL AND note_nonce IS NOT NULL AND note_ciphertext IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS abuse_report_actions_report_idx
+  ON abuse_report_actions(report_id, created_at, id);
+
+CREATE OR REPLACE FUNCTION public.toj_abuse_report_actions_append_only_v1()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  table_owner NAME;
+  retention_owner NAME;
+BEGIN
+  SELECT pg_get_userbyid(relowner) INTO table_owner FROM pg_class WHERE oid = TG_RELID;
+  SELECT pg_get_userbyid(proowner) INTO retention_owner
+  FROM pg_proc WHERE oid = 'public.toj_cleanup_abuse_reports_v1(integer)'::regprocedure;
+  IF TG_OP = 'UPDATE'
+     AND current_user = table_owner
+     AND current_setting('toj.allow_abuse_report_crypto_migration', TRUE) = '1'
+     AND ROW(NEW.id, NEW.report_id, NEW.actor_kind, NEW.actor_id, NEW.action, NEW.created_at)
+         IS NOT DISTINCT FROM
+         ROW(OLD.id, OLD.report_id, OLD.actor_kind, OLD.actor_id, OLD.action, OLD.created_at) THEN
+    -- Key rotation may replace only the encrypted-note tuple. The audit identity,
+    -- actor, action, ordering, and timestamp remain immutable.
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'DELETE'
+     AND current_user = retention_owner
+     AND current_setting('toj.allow_abuse_report_retention_delete', TRUE) = '1' THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'abuse_report_actions is append-only';
+END;
+$$;
+DROP TRIGGER IF EXISTS abuse_report_actions_append_only ON abuse_report_actions;
+CREATE TRIGGER abuse_report_actions_append_only
+  BEFORE UPDATE OR DELETE ON abuse_report_actions
+  FOR EACH ROW EXECUTE FUNCTION public.toj_abuse_report_actions_append_only_v1();
+
+-- Runtime roles receive EXECUTE on this bounded SECURITY DEFINER function, never direct mutation
+-- rights on either audit table. The effective-owner checks above make caller-set GUCs insufficient.
+CREATE OR REPLACE FUNCTION public.toj_cleanup_abuse_reports_v1(requested_batch_size INTEGER)
+RETURNS TABLE(evidence INTEGER, reports INTEGER, budgets INTEGER, access_audits INTEGER)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  bounded_batch INTEGER := GREATEST(1, LEAST(10000, requested_batch_size));
+  evidence_count INTEGER := 0;
+  report_count INTEGER := 0;
+  budget_count INTEGER := 0;
+  access_count INTEGER := 0;
+BEGIN
+  WITH doomed AS (
+    SELECT id FROM public.abuse_reports
+    WHERE evidence_ciphertext IS NOT NULL AND evidence_expires_at <= now()
+    ORDER BY evidence_expires_at LIMIT bounded_batch FOR UPDATE SKIP LOCKED
+  )
+  UPDATE public.abuse_reports report
+  SET evidence_key_id = NULL, evidence_nonce = NULL,
+      evidence_ciphertext = NULL, evidence_plain_size = NULL
+  FROM doomed WHERE report.id = doomed.id;
+  GET DIAGNOSTICS evidence_count = ROW_COUNT;
+
+  PERFORM set_config('toj.allow_content_access_retention_delete', '1', TRUE);
+  WITH doomed AS (
+    SELECT audit.id FROM public.content_access_audit audit
+    WHERE audit.reason LIKE 'abuse_report.%'
+      AND audit.created_at < now() - interval '365 days'
+      AND NOT EXISTS (
+        SELECT 1 FROM public.abuse_reports report
+        WHERE report.id::text = audit.request_id
+          AND (report.status <> 'resolved' OR report.audit_expires_at > now())
+      )
+    ORDER BY audit.created_at, audit.id LIMIT bounded_batch FOR UPDATE SKIP LOCKED
+  )
+  DELETE FROM public.content_access_audit audit USING doomed WHERE audit.id = doomed.id;
+  GET DIAGNOSTICS access_count = ROW_COUNT;
+
+  PERFORM set_config('toj.allow_abuse_report_retention_delete', '1', TRUE);
+  WITH doomed AS (
+    SELECT id FROM public.abuse_reports
+    WHERE status = 'resolved' AND audit_expires_at <= now()
+    ORDER BY audit_expires_at, id LIMIT bounded_batch FOR UPDATE SKIP LOCKED
+  )
+  DELETE FROM public.abuse_reports report USING doomed WHERE report.id = doomed.id;
+  GET DIAGNOSTICS report_count = ROW_COUNT;
+
+  WITH doomed AS (
+    SELECT id FROM public.abuse_report_submission_budgets
+    WHERE accepted_at < now() - interval '24 hours'
+    ORDER BY accepted_at, id LIMIT bounded_batch FOR UPDATE SKIP LOCKED
+  )
+  DELETE FROM public.abuse_report_submission_budgets budget
+  USING doomed WHERE budget.id = doomed.id;
+  GET DIAGNOSTICS budget_count = ROW_COUNT;
+
+  RETURN QUERY SELECT evidence_count, report_count, budget_count, access_count;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.toj_cleanup_abuse_reports_v1(INTEGER) FROM PUBLIC;

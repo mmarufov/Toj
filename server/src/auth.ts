@@ -1,10 +1,13 @@
 import type { SQL } from "bun";
 import { randomBytes, randomInt } from "node:crypto";
 import {
-  seal, open, PHONE_AAD, phoneLookupHash, codeHash, hashToken, normalizePhone, constantTimeEqual,
+  PHONE_AAD, phoneLookupCandidates, phoneLookupIndex,
+  codeHashIndex, tokenHashCandidates, tokenHashIndex,
+  normalizePhone, constantTimeEqual,
 } from "./crypto";
 import { loadMediaDTO, type MediaDTO } from "./media";
-import { enqueuePushDeliveries } from "./push";
+import { CryptoUnavailableError, openForScope, sealForScope } from "./envelope-crypto";
+import { enqueuePushDeliveries, revokePushBindingsForDevice } from "./push";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
@@ -129,8 +132,15 @@ export async function startVerification(
 ): Promise<{ code?: string; retryAfter?: number }> {
   const normalizedPhone = validPhone(phone);
   const purpose = options.purpose ?? "login";
-  const lookup = phoneLookupHash(normalizedPhone);
-  const networkHash = options.networkKey ? hashToken(`otp-network|${options.networkKey}`) : null;
+  const lookupIndex = phoneLookupIndex(normalizedPhone);
+  const lookup = lookupIndex.digest;
+  const lookupCandidates = phoneLookupCandidates(normalizedPhone).map((candidate) => candidate.digest);
+  const networkInput = options.networkKey ? `otp-network|${options.networkKey}` : null;
+  const networkIndex = networkInput ? tokenHashIndex(networkInput) : null;
+  const networkHash = networkIndex?.digest ?? null;
+  const networkCandidates = networkInput
+    ? tokenHashCandidates(networkInput).map((candidate) => candidate.digest)
+    : [];
   const production = process.env.NODE_ENV === "production";
   const returnOTP = !production || privateBetaOTPAllowed(normalizedPhone);
   const delivery = options.delivery ?? null;
@@ -141,17 +151,22 @@ export async function startVerification(
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const salt = randomBytes(16);
   const expires = new Date(Date.now() + OTP_TTL_MS);
-  const phoneLock = lookup.readBigInt64BE(0);
-  const networkLock = networkHash?.readBigInt64BE(0);
+  const phoneLocks = lookupCandidates.map((candidate) => candidate.readBigInt64BE(0));
+  const networkLocks = networkCandidates.map((candidate) => candidate.readBigInt64BE(0));
 
   const challengeId: string = await sql.begin(async (tx) => {
-    const locks = [phoneLock, networkLock].filter((value): value is bigint => value !== undefined)
+    const locks = [...phoneLocks, ...networkLocks]
       .sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
     for (const lock of locks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
 
     const latest = (await tx`
       SELECT created_at FROM otp_challenges
-      WHERE phone_lookup_hash = ${lookup} AND purpose = ${purpose}
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND purpose = ${purpose}
       ORDER BY created_at DESC LIMIT 1`)[0];
     if (latest) {
       const ageSeconds = Math.floor((Date.now() - new Date(latest.created_at).getTime()) / 1000);
@@ -166,7 +181,11 @@ export async function startVerification(
 
     const phoneCount = Number((await tx`
       SELECT count(*) AS count FROM otp_challenges
-      WHERE phone_lookup_hash = ${lookup}
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
         AND created_at > now() - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
     if (phoneCount >= OTP_PHONE_WINDOW_LIMIT) {
       throw new AuthError("too many verification requests; try again later", 429, OTP_WINDOW_MINUTES * 60);
@@ -175,7 +194,11 @@ export async function startVerification(
     if (networkHash) {
       const networkCount = Number((await tx`
         SELECT count(*) AS count FROM otp_challenges
-        WHERE network_hash = ${networkHash}
+        WHERE network_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(
+            ${tx.array(networkCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+          ) AS candidate(value)
+        )
           AND created_at > now() - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
       if (networkCount >= OTP_NETWORK_WINDOW_LIMIT) {
         throw new AuthError("too many verification requests; try again later", 429, OTP_WINDOW_MINUTES * 60);
@@ -184,11 +207,19 @@ export async function startVerification(
 
     await tx`
       UPDATE otp_challenges SET consumed_at = now()
-      WHERE phone_lookup_hash = ${lookup} AND consumed_at IS NULL`;
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND consumed_at IS NULL`;
+    const codeIndex = codeHashIndex(code, salt);
     return (await tx`
       INSERT INTO otp_challenges
-        (phone_lookup_hash, code_hash, code_salt, network_hash, purpose, expires_at)
-      VALUES (${lookup}, ${codeHash(code, salt)}, ${salt}, ${networkHash}, ${purpose}, ${expires})
+        (phone_lookup_hash, phone_lookup_key_id, code_hash, code_key_id, code_salt,
+         network_hash, network_key_id, purpose, expires_at)
+      VALUES (${lookup}, ${lookupIndex.keyId}, ${codeIndex.digest}, ${codeIndex.keyId}, ${salt},
+              ${networkHash}, ${networkIndex?.keyId ?? null}, ${purpose}, ${expires})
       RETURNING id`)[0].id;
   });
 
@@ -285,9 +316,13 @@ export async function checkVerification(
         "update Toj to sign in with two-step verification", 426, undefined, "two_factor_client_required",
       );
     }
+    const authToken = tokenHashIndex(token);
     const device = await tx`
-      INSERT INTO devices (account_id, platform, device_name, auth_token_hash, last_seen_at)
-      VALUES (${accountId}, ${platform}, ${cleanLabel(deviceName, 120)}, ${hashToken(token)}, now())
+      INSERT INTO devices (
+        account_id, platform, device_name, auth_token_hash, auth_token_key_id, last_seen_at
+      )
+      VALUES (${accountId}, ${platform}, ${cleanLabel(deviceName, 120)},
+              ${authToken.digest}, ${authToken.keyId}, now())
       RETURNING id`;
     return { accountId, deviceId: String(device[0].id), token };
   }, platform);
@@ -342,18 +377,29 @@ async function completePhoneVerification<T>(
   const normalizedPhone = validPhone(phone);
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   if (!ALLOWED_PLATFORMS.has(platform)) throw new AuthError("unsupported device platform", 400);
-  const lookup = phoneLookupHash(normalizedPhone);
+  const lookupIndex = phoneLookupIndex(normalizedPhone);
+  const lookup = lookupIndex.digest;
+  const lookupCandidates = phoneLookupCandidates(normalizedPhone).map((candidate) => candidate.digest);
   const result: T | AuthError = await sql.begin(async (tx) => {
     const rows = await tx`
-      SELECT id, code_hash, code_salt, attempts FROM otp_challenges
-      WHERE phone_lookup_hash = ${lookup} AND purpose = 'login'
+      SELECT id, code_hash, code_key_id, code_salt, attempts FROM otp_challenges
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND purpose = 'login'
         AND consumed_at IS NULL AND expires_at > now()
       ORDER BY created_at DESC LIMIT 1
       FOR UPDATE`;
     if (rows.length === 0) throw new AuthError("no active verification code");
     const challenge = rows[0];
     if (challenge.attempts >= OTP_MAX_ATTEMPTS) throw new AuthError("too many attempts; request a new code", 429);
-    const expected = codeHash(code, challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined);
+    const expected = codeHashIndex(
+      code,
+      challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined,
+      challenge.code_key_id ?? "legacy-v1",
+    ).digest;
     if (!constantTimeEqual(Buffer.from(challenge.code_hash), expected)) {
       await tx`UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ${challenge.id}`;
       return new AuthError("incorrect code");
@@ -364,29 +410,59 @@ async function completePhoneVerification<T>(
       RETURNING id`;
     if (claimed.length === 0) throw new AuthError("verification code already used");
 
-    const sealed = seal(normalizedPhone, PHONE_AAD);
     const name = cleanLabel(displayName, 80) ?? "";
-    const created = await tx`
-      INSERT INTO accounts (phone_lookup_hash, phone_e164_ciphertext, phone_nonce, phone_key_id, first_name, display_name)
-      VALUES (${lookup}, ${sealed.ciphertext}, ${sealed.nonce}, ${sealed.keyId}, ${name}, ${name})
-      ON CONFLICT (phone_lookup_hash) DO NOTHING
-      RETURNING id`;
     let accountId: string;
-    if (created.length) {
-      accountId = created[0].id;
+    const existing = (await tx`
+      SELECT id, status FROM accounts
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+      FOR UPDATE`)[0];
+    if (!existing) {
+      accountId = crypto.randomUUID();
+      // Establish the account row before creating its FK-bound DEK. Envelope modes use a
+      // service-scoped bootstrap key; the value is replaced in this transaction and never visible.
+      const temporary = await sealForScope(
+        tx,
+        { kind: "service", serviceName: "account-bootstrap" },
+        normalizedPhone,
+        PHONE_AAD,
+      );
+      await tx`
+        INSERT INTO accounts (
+          id, phone_lookup_hash, phone_lookup_key_id,
+          phone_e164_ciphertext, phone_nonce, phone_key_id,
+          first_name, display_name
+        ) VALUES (
+          ${accountId}, ${lookup}, ${lookupIndex.keyId},
+          ${temporary.ciphertext}, ${temporary.nonce}, ${temporary.keyId},
+          ${name}, ${name}
+        )`;
+      const sealed = await sealForScope(
+        tx,
+        { kind: "account", accountId },
+        normalizedPhone,
+        PHONE_AAD,
+      );
+      await tx`
+        UPDATE accounts SET phone_e164_ciphertext = ${sealed.ciphertext},
+          phone_nonce = ${sealed.nonce}, phone_key_id = ${sealed.keyId}
+        WHERE id = ${accountId}`;
       await tx`INSERT INTO account_sync_states (account_id) VALUES (${accountId}) ON CONFLICT DO NOTHING`;
     } else {
-      const existing = (await tx`
-        SELECT id, status FROM accounts WHERE phone_lookup_hash = ${lookup}
-        FOR UPDATE`)[0];
-      if (!existing || existing.status === "banned" || existing.status === "deleted") {
+      if (existing.status === "banned" || existing.status === "deleted") {
         return new AuthError("account unavailable", 403);
       }
       accountId = existing.id;
-      if (name) await tx`
+      await tx`
         UPDATE accounts
-        SET first_name = CASE WHEN first_name = '' AND last_name = '' THEN ${name} ELSE first_name END,
-            display_name = CASE WHEN first_name = '' AND last_name = '' THEN ${name} ELSE display_name END,
+        SET phone_lookup_hash = ${lookup}, phone_lookup_key_id = ${lookupIndex.keyId},
+            first_name = CASE WHEN ${name} <> '' AND first_name = '' AND last_name = ''
+              THEN ${name} ELSE first_name END,
+            display_name = CASE WHEN ${name} <> '' AND first_name = '' AND last_name = ''
+              THEN ${name} ELSE display_name END,
             updated_at = now()
         WHERE id = ${accountId}`;
     }
@@ -448,28 +524,32 @@ function normalizedRecoveryCode(value: unknown): string {
   return value.toUpperCase().replace(/[^2-9A-HJ-NP-Z]/g, "");
 }
 
-function recoveryCodeHash(accountId: string, value: string): Buffer {
-  return hashToken(`toj/recovery/v1|${accountId}|${value}`);
+function recoveryCodeInput(accountId: string, value: string): string {
+  return `toj/recovery/v1|${accountId}|${value}`;
 }
 
 async function replaceRecoveryCodes(sql: SQL, accountId: string): Promise<string[]> {
   const codes = Array.from({ length: 10 }, recoveryCode);
   await sql`DELETE FROM two_factor_recovery_codes WHERE account_id = ${accountId}`;
   for (const code of codes) {
+    const index = tokenHashIndex(recoveryCodeInput(accountId, normalizedRecoveryCode(code)));
     await sql`
-      INSERT INTO two_factor_recovery_codes (account_id, code_hash)
-      VALUES (${accountId}, ${recoveryCodeHash(accountId, normalizedRecoveryCode(code))})`;
+      INSERT INTO two_factor_recovery_codes (account_id, code_hash, code_key_id)
+      VALUES (${accountId}, ${index.digest}, ${index.keyId})`;
   }
   return codes;
 }
 
 async function revokeOtherAccountDevices(sql: SQL, accountId: string, keepDeviceId?: string): Promise<string[]> {
+  await sql`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
   const rows = await sql`
     UPDATE devices SET
       revoked_at = COALESCE(revoked_at, now()),
-      push_token_hash = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+      push_token_hash = NULL, push_token_hash_key_id = NULL,
+      push_token_ciphertext = NULL, push_token_nonce = NULL,
       push_token_key_id = NULL, push_environment = NULL, push_updated_at = now(),
-      voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+      voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
+      voip_push_token_ciphertext = NULL,
       voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
       voip_push_environment = NULL, voip_push_updated_at = now()
     WHERE account_id = ${accountId} AND revoked_at IS NULL
@@ -479,6 +559,7 @@ async function revokeOtherAccountDevices(sql: SQL, accountId: string, keepDevice
     UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'security_change'
     WHERE device_id IN ${sql(rows.map((row) => String(row.id)))}`;
   for (const row of rows) {
+    await revokePushBindingsForDevice(sql, String(row.id));
     await notifySessionRevocation(sql, accountId, String(row.id), "security_change");
   }
   return rows.map((row) => String(row.id));
@@ -504,29 +585,38 @@ export async function completeTwoFactorLogin(
       return new AuthError("too many attempts; request a new SMS code", 429, undefined, "challenge_locked");
     }
     const accountId = String(challenge.account_id);
-    const accountBudgetHash = hashToken(`two-factor-account|${accountId}`);
-    await tx`SELECT pg_advisory_xact_lock(${accountBudgetHash.readBigInt64BE(0)})`;
-    const networkHash = input.networkKey
-      ? hashToken(`two-factor-network|${input.networkKey}`)
-      : null;
-    if (networkHash) await tx`SELECT pg_advisory_xact_lock(${networkHash.readBigInt64BE(0)})`;
+    const accountBudgetLocks = tokenHashCandidates(`two-factor-account|${accountId}`)
+      .map((candidate) => candidate.digest.readBigInt64BE(0))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    for (const lock of accountBudgetLocks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
+    const networkInput = input.networkKey ? `two-factor-network|${input.networkKey}` : null;
+    const networkCandidates = networkInput ? tokenHashCandidates(networkInput) : [];
+    const networkIndex = networkInput ? tokenHashIndex(networkInput) : null;
+    const networkLocks = networkCandidates
+      .map((candidate) => candidate.digest.readBigInt64BE(0))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    for (const lock of networkLocks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
     const accountAttempts = Number((await tx`
       SELECT count(*) AS count FROM two_factor_attempt_budgets
       WHERE account_id = ${accountId} AND accepted_at > now() - interval '15 minutes'`)[0].count);
     if (accountAttempts >= TWO_FACTOR_ACCOUNT_WINDOW_LIMIT) {
       return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
     }
-    if (networkHash) {
+    if (networkCandidates.length) {
       const networkAttempts = Number((await tx`
         SELECT count(*) AS count FROM two_factor_attempt_budgets
-        WHERE network_hash = ${networkHash} AND accepted_at > now() - interval '15 minutes'`)[0].count);
+        WHERE network_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(
+            ${tx.array(networkCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+          ) AS candidate(value)
+        ) AND accepted_at > now() - interval '15 minutes'`)[0].count);
       if (networkAttempts >= TWO_FACTOR_NETWORK_WINDOW_LIMIT) {
         return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
       }
     }
     await tx`
-      INSERT INTO two_factor_attempt_budgets (account_id, network_hash)
-      VALUES (${accountId}, ${networkHash})`;
+      INSERT INTO two_factor_attempt_budgets (account_id, network_hash, network_key_id)
+      VALUES (${accountId}, ${networkIndex?.digest ?? null}, ${networkIndex?.keyId ?? null})`;
     const factor = (await tx`
       SELECT password_hash FROM account_two_factor WHERE account_id = ${accountId} FOR UPDATE`)[0];
     if (!factor) return new AuthError("two-step verification is no longer enabled", 409, undefined, "factor_changed");
@@ -537,10 +627,17 @@ export async function completeTwoFactorLogin(
       accepted = await Bun.password.verify(input.password, String(factor.password_hash));
     } else {
       const normalized = normalizedRecoveryCode(input.recoveryCode);
+      const recoveryCandidates = normalized.length === 16
+        ? tokenHashCandidates(recoveryCodeInput(accountId, normalized))
+        : [];
       const recovery = normalized.length === 16 ? (await tx`
         SELECT id FROM two_factor_recovery_codes
         WHERE account_id = ${accountId}
-          AND code_hash = ${recoveryCodeHash(accountId, normalized)}
+          AND code_hash IN (
+            SELECT decode(value, 'hex') FROM unnest(
+              ${tx.array(recoveryCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+            ) AS candidate(value)
+          )
           AND consumed_at IS NULL
         FOR UPDATE`)[0] : null;
       if (recovery) {
@@ -601,11 +698,11 @@ export async function startSecurityChange(
   if (!account || !["active", "limited"].includes(String(account.status))) {
     throw new AuthError("account unavailable", 403);
   }
-  const phone = open({
+  const phone = (await openForScope(sql, { kind: "account", accountId }, {
     ciphertext: Buffer.from(account.phone_e164_ciphertext),
     nonce: Buffer.from(account.phone_nonce),
     keyId: String(account.phone_key_id),
-  }, PHONE_AAD).toString("utf8");
+  }, PHONE_AAD)).toString("utf8");
   return await startVerification(sql, phone, { ...options, purpose: "security_change" });
 }
 
@@ -619,17 +716,22 @@ export async function completeSecurityStepUp(
     SELECT phone_e164_ciphertext, phone_nonce, phone_key_id
     FROM accounts WHERE id = ${accountId}`)[0];
   if (!account) throw new AuthError("account unavailable", 403);
-  const phone = open({
+  const phone = (await openForScope(sql, { kind: "account", accountId }, {
     ciphertext: Buffer.from(account.phone_e164_ciphertext), nonce: Buffer.from(account.phone_nonce),
     keyId: String(account.phone_key_id),
-  }, PHONE_AAD).toString("utf8");
-  const lookup = phoneLookupHash(phone);
+  }, PHONE_AAD)).toString("utf8");
+  const lookupCandidates = phoneLookupCandidates(phone).map((candidate) => candidate.digest);
   const ticket = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 10 * 60_000);
   const result = await sql.begin(async (tx) => {
     const challenge = (await tx`
-      SELECT id, code_hash, code_salt, attempts FROM otp_challenges
-      WHERE phone_lookup_hash = ${lookup} AND purpose = 'security_change'
+      SELECT id, code_hash, code_key_id, code_salt, attempts FROM otp_challenges
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND purpose = 'security_change'
         AND consumed_at IS NULL AND expires_at > now()
       ORDER BY created_at DESC LIMIT 1 FOR UPDATE`)[0];
     if (!challenge) return new AuthError("no active security code", 401);
@@ -641,7 +743,11 @@ export async function completeSecurityStepUp(
         "challenge_locked",
       );
     }
-    const expected = codeHash(code, challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined);
+    const expected = codeHashIndex(
+      code,
+      challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined,
+      challenge.code_key_id ?? "legacy-v1",
+    ).digest;
     if (!constantTimeEqual(Buffer.from(challenge.code_hash), expected)) {
       await tx`UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ${challenge.id}`;
       if (Number(challenge.attempts) + 1 >= TWO_FACTOR_MAX_ATTEMPTS) {
@@ -655,9 +761,10 @@ export async function completeSecurityStepUp(
       return new AuthError("incorrect code", 401);
     }
     await tx`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challenge.id}`;
+    const ticketIndex = tokenHashIndex(ticket);
     await tx`
-      INSERT INTO security_step_up_tickets (account_id, token_hash, expires_at)
-      VALUES (${accountId}, ${hashToken(ticket)}, ${expiresAt})`;
+      INSERT INTO security_step_up_tickets (account_id, token_hash, token_key_id, expires_at)
+      VALUES (${accountId}, ${ticketIndex.digest}, ${ticketIndex.keyId}, ${expiresAt})`;
     return { stepUpToken: ticket, expiresAt: expiresAt.toISOString() };
   });
   if (result instanceof AuthError) throw result;
@@ -672,9 +779,14 @@ async function requireStepUp(
   if (typeof tokenValue !== "string") {
     return new AuthError("security verification required", 401, undefined, "step_up_expired");
   }
+  const candidates = tokenHashCandidates(tokenValue);
   const ticket = (await sql`
     SELECT id, attempts FROM security_step_up_tickets
-    WHERE account_id = ${accountId} AND token_hash = ${hashToken(tokenValue)}
+    WHERE account_id = ${accountId} AND token_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(candidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+      ) AS candidate(value)
+    )
       AND consumed_at IS NULL AND expires_at > now()
     FOR UPDATE`)[0];
   if (!ticket) return new AuthError("security verification expired", 401, undefined, "step_up_expired");
@@ -696,9 +808,16 @@ async function verifyCurrentFactor(
     return true;
   }
   const normalized = normalizedRecoveryCode(credential);
+  const recoveryCandidates = normalized.length === 16
+    ? tokenHashCandidates(recoveryCodeInput(accountId, normalized))
+    : [];
   const recovered = normalized.length === 16 ? await sql`
     UPDATE two_factor_recovery_codes SET consumed_at = now()
-    WHERE account_id = ${accountId} AND code_hash = ${recoveryCodeHash(accountId, normalized)}
+    WHERE account_id = ${accountId} AND code_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(recoveryCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+      ) AS candidate(value)
+    )
       AND consumed_at IS NULL RETURNING id` : [];
   return recovered.length > 0;
 }
@@ -850,11 +969,11 @@ export async function sendSecurityChangeAlert(
       SELECT phone_e164_ciphertext, phone_nonce, phone_key_id
       FROM accounts WHERE id = ${accountId}`)[0];
     if (!account) return;
-    const phone = open({
+    const phone = (await openForScope(sql, { kind: "account", accountId }, {
       ciphertext: Buffer.from(account.phone_e164_ciphertext),
       nonce: Buffer.from(account.phone_nonce),
       keyId: String(account.phone_key_id),
-    }, PHONE_AAD).toString("utf8");
+    }, PHONE_AAD)).toString("utf8");
     await delivery.sendSecurityAlert(phone, event);
   } catch (error) {
     console.error(new Date().toISOString(), "auth.security_alert.sms_failed",
@@ -867,7 +986,9 @@ export async function lookupAccountByPhone(
   sql: SQL, requesterAccountId: string, phone: string,
 ): Promise<ProfileDTO | null> {
   const normalizedPhone = validPhone(phone);
-  const targetHash = phoneLookupHash(normalizedPhone);
+  const targetIndex = phoneLookupIndex(normalizedPhone);
+  const targetHash = targetIndex.digest;
+  const targetHashes = phoneLookupCandidates(normalizedPhone).map((candidate) => candidate.digest);
   return await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`contact-lookup:${requesterAccountId}`}, 0))`;
     const requester = await tx`
@@ -877,7 +998,12 @@ export async function lookupAccountByPhone(
     // Network retries and reopening the same contact do not burn more discovery budget.
     const repeated = await tx`
       SELECT 1 FROM contact_lookup_attempts
-      WHERE requester_account_id = ${requesterAccountId} AND target_phone_hash = ${targetHash}
+      WHERE requester_account_id = ${requesterAccountId}
+        AND target_phone_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(
+            ${tx.array(targetHashes.map((hash) => hash.toString("hex")), "text")}::text[]
+          ) AS candidate(value)
+        )
         AND created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute')
       LIMIT 1`;
     if (!repeated.length) {
@@ -893,11 +1019,17 @@ export async function lookupAccountByPhone(
 
     const row = (await tx`
       SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at FROM accounts
-      WHERE phone_lookup_hash = ${targetHash} AND status IN ('active','limited')`)[0];
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(targetHashes.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND status IN ('active','limited')`)[0];
     if (!repeated.length) {
       await tx`
-        INSERT INTO contact_lookup_attempts (requester_account_id, target_phone_hash)
-        VALUES (${requesterAccountId}, ${targetHash})`;
+        INSERT INTO contact_lookup_attempts (
+          requester_account_id, target_phone_hash, target_phone_key_id
+        ) VALUES (${requesterAccountId}, ${targetHash}, ${targetIndex.keyId})`;
     }
     return row ? profileDTO(row) : null;
   });
@@ -1091,12 +1223,17 @@ export async function lookupAccountByUsername(
 ): Promise<UsernameLookupDTO | null> {
   const username = typeof value === "string" ? value.trim().toLowerCase().replace(/^@/, "") : "";
   if (!/^[a-z][a-z0-9_]{4,31}$/.test(username)) return null;
-  const targetHash = hashToken(`username:${username}`);
+  const target = tokenHashIndex(`username:${username}`);
+  const targetCandidates = tokenHashCandidates(`username:${username}`).map((entry) => entry.digest);
   return await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`contact-lookup:${requesterAccountId}`}, 0))`;
     const repeated = await tx`
       SELECT 1 FROM contact_lookup_attempts
-      WHERE requester_account_id = ${requesterAccountId} AND target_phone_hash = ${targetHash}
+      WHERE requester_account_id = ${requesterAccountId} AND target_phone_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(targetCandidates.map((digest) => digest.toString("hex")), "text")}::text[]
+        ) candidate(value)
+      )
         AND created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute') LIMIT 1`;
     if (!repeated.length) {
       const counts = (await tx`
@@ -1106,8 +1243,9 @@ export async function lookupAccountByUsername(
       if (Number(counts.recent) >= CONTACT_LOOKUP_WINDOW_LIMIT || Number(counts.daily) >= CONTACT_LOOKUP_DAILY_LIMIT) {
         throw new AuthError("contact discovery limit reached; try again later", 429, CONTACT_LOOKUP_WINDOW_MINUTES * 60);
       }
-      await tx`INSERT INTO contact_lookup_attempts (requester_account_id, target_phone_hash)
-        VALUES (${requesterAccountId}, ${targetHash})`;
+      await tx`INSERT INTO contact_lookup_attempts (
+        requester_account_id, target_phone_hash, target_phone_key_id
+      ) VALUES (${requesterAccountId}, ${target.digest}, ${target.keyId})`;
     }
     const row = (await tx`
       SELECT id, username, first_name, last_name, display_name, profile_color, updated_at
@@ -1138,14 +1276,24 @@ export async function resolveDevice(
       accessExpiresAt: v2.accessExpiresAt.toISOString(),
     };
   }
+  const tokenHashes = tokenHashCandidates(token).map((candidate) => candidate.digest);
   const rows = await sql`
-    SELECT d.id, d.account_id FROM devices d
+    SELECT d.id, d.account_id, d.auth_token_hash, d.auth_token_key_id FROM devices d
     JOIN accounts a ON a.id = d.account_id
-    WHERE d.auth_token_hash = ${hashToken(token)}
+    WHERE d.auth_token_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(tokenHashes.map((hash) => hash.toString("hex")), "text")}::text[]
+      ) AS candidate(value)
+    )
       AND d.revoked_at IS NULL
       AND a.status IN ('active','limited')`;
-  if (rows.length === 0) throw new AuthError("invalid device token", 401, undefined, "device_revoked");
-  await sql`UPDATE devices SET last_seen_at = now() WHERE id = ${rows[0].id}`;
+  // An ambiguous match across rotation candidates is rejected rather than resolved arbitrarily.
+  if (rows.length !== 1) throw new AuthError("invalid device token", 401, undefined, "device_revoked");
+  // Re-key the stored digest on use so legacy-keyed rows drain onto the active blind-index key.
+  const active = tokenHashIndex(token);
+  await sql`UPDATE devices SET auth_token_hash = ${active.digest},
+    auth_token_key_id = ${active.keyId}, last_seen_at = now()
+    WHERE id = ${rows[0].id} AND auth_token_hash = ${rows[0].auth_token_hash}`;
   return { accountId: rows[0].account_id, deviceId: rows[0].id };
 }
 
@@ -1181,16 +1329,22 @@ export async function revokeDevice(
   options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
 ): Promise<{ revoked: true }> {
   return await sql.begin(async (tx) => {
+    const account = await tx`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
+    if (!account.length) throw new AuthError("device not found", 404);
     const rows = await tx`
       UPDATE devices SET
         revoked_at = COALESCE(revoked_at, now()),
+        auth_token_hash = digest(id::text || gen_random_uuid()::text, 'sha256'),
+        auth_token_key_id = 'random-deleted',
         push_token_hash = NULL,
+        push_token_hash_key_id = NULL,
         push_token_ciphertext = NULL,
         push_token_nonce = NULL,
         push_token_key_id = NULL,
         push_environment = NULL,
         push_updated_at = now(),
         voip_push_token_hash = NULL,
+        voip_push_token_hash_key_id = NULL,
         voip_push_token_ciphertext = NULL,
         voip_push_token_nonce = NULL,
         voip_push_token_key_id = NULL,
@@ -1199,6 +1353,7 @@ export async function revokeDevice(
       WHERE id = ${deviceId} AND account_id = ${accountId}
       RETURNING id`;
     if (rows.length === 0) throw new AuthError("device not found", 404);
+    await revokePushBindingsForDevice(tx, deviceId);
     await tx`
       UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'device_revoked'
       WHERE device_id = ${deviceId}`;
@@ -1226,12 +1381,13 @@ export async function startAccountDeletion(
   }
   let phone: string;
   try {
-    phone = open({
+    phone = (await openForScope(sql, { kind: "account", accountId }, {
       keyId: account.phone_key_id,
       nonce: Buffer.from(account.phone_nonce),
       ciphertext: Buffer.from(account.phone_e164_ciphertext),
-    }, PHONE_AAD).toString("utf8");
-  } catch {
+    }, PHONE_AAD)).toString("utf8");
+  } catch (error) {
+    if (error instanceof CryptoUnavailableError) throw error;
     throw new AuthError("account unavailable", 403);
   }
   return await startVerification(sql, phone, {
@@ -1253,16 +1409,31 @@ export async function deleteAccount(
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   const result: { deleted: true } | AuthError = await sql.begin(async (tx) => {
     const identity = (await tx`
-      SELECT phone_lookup_hash FROM accounts
+      SELECT phone_e164_ciphertext, phone_nonce, phone_key_id FROM accounts
       WHERE id = ${accountId} AND status IN ('active','limited')`)[0];
     if (!identity) return new AuthError("account unavailable", 403);
-    const originalLookup = Buffer.from(identity.phone_lookup_hash);
+    let phone: string;
+    try {
+      phone = (await openForScope(tx, { kind: "account", accountId }, {
+        keyId: String(identity.phone_key_id),
+        nonce: Buffer.from(identity.phone_nonce),
+        ciphertext: Buffer.from(identity.phone_e164_ciphertext),
+      }, PHONE_AAD)).toString("utf8");
+    } catch (error) {
+      if (error instanceof CryptoUnavailableError) throw error;
+      return new AuthError("account unavailable", 403);
+    }
+    const lookupCandidates = phoneLookupCandidates(phone).map((candidate) => candidate.digest);
 
     // OTP challenge is locked before the account row, matching login verification order.
     const challenge = (await tx`
-      SELECT id, code_hash, code_salt, attempts
+      SELECT id, code_hash, code_key_id, code_salt, attempts
       FROM otp_challenges
-      WHERE phone_lookup_hash = ${originalLookup} AND purpose = 'account_deletion'
+      WHERE phone_lookup_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${tx.array(lookupCandidates.map((digest) => digest.toString("hex")), "text")}::text[]
+        ) candidate(value)
+      ) AND purpose = 'account_deletion'
         AND consumed_at IS NULL AND expires_at > now()
       ORDER BY created_at DESC LIMIT 1
       FOR UPDATE`)[0];
@@ -1270,7 +1441,11 @@ export async function deleteAccount(
     if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
       return new AuthError("too many attempts; request a new code", 429);
     }
-    const expected = codeHash(code, challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined);
+    const expected = codeHashIndex(
+      code,
+      challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined,
+      challenge.code_key_id ?? "legacy-v1",
+    ).digest;
     if (!constantTimeEqual(Buffer.from(challenge.code_hash), expected)) {
       await tx`UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ${challenge.id}`;
       return new AuthError("incorrect code", 400);
@@ -1285,12 +1460,18 @@ export async function deleteAccount(
     // This database-boundary function is also called by the account-status trigger used by old
     // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
     await tx`SELECT public.toj_cleanup_account_private_state_v1(${accountId})`;
-    const anonymizedPhone = seal(`deleted:${accountId}`, PHONE_AAD);
+    const anonymizedPhone = await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      `deleted:${accountId}`,
+      PHONE_AAD,
+    );
     const anonymizedLookup = randomBytes(32);
     await tx`
       UPDATE accounts SET
         username = NULL,
         phone_lookup_hash = ${anonymizedLookup},
+        phone_lookup_key_id = 'random-deleted',
         phone_e164_ciphertext = ${anonymizedPhone.ciphertext},
         phone_nonce = ${anonymizedPhone.nonce},
         phone_key_id = ${anonymizedPhone.keyId},
@@ -1321,14 +1502,17 @@ export async function deleteAccount(
       UPDATE devices SET
         device_name = NULL,
         auth_token_hash = digest(id::text || gen_random_uuid()::text, 'sha256'),
+        auth_token_key_id = 'random-deleted',
         revoked_at = COALESCE(revoked_at, now()),
         push_token_hash = NULL,
+        push_token_hash_key_id = NULL,
         push_token_ciphertext = NULL,
         push_token_nonce = NULL,
         push_token_key_id = NULL,
         push_environment = NULL,
         push_updated_at = now(),
         voip_push_token_hash = NULL,
+        voip_push_token_hash_key_id = NULL,
         voip_push_token_ciphertext = NULL,
         voip_push_token_nonce = NULL,
         voip_push_token_key_id = NULL,
@@ -1346,7 +1530,11 @@ export async function deleteAccount(
     // The injected call cleanup therefore commits atomically with account deletion without letting
     // an in-flight device mutation recreate state after the termination scan.
     await options.beforeCommit?.(tx);
-    await tx`DELETE FROM otp_challenges WHERE phone_lookup_hash = ${originalLookup}`;
+    await tx`DELETE FROM otp_challenges WHERE phone_lookup_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${tx.array(lookupCandidates.map((digest) => digest.toString("hex")), "text")}::text[]
+      ) candidate(value)
+    )`;
     return { deleted: true };
   });
   if (result instanceof AuthError) throw result;

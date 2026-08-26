@@ -1,9 +1,10 @@
 import type { SQL } from "bun";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
-  mediaChunkAAD, mediaDigestHMAC, mediaFileNameAAD, mediaThumbnailAAD, open, seal,
+  mediaChunkAAD, mediaDigestIndex, mediaFileNameAAD, mediaThumbnailAAD,
 } from "./crypto";
 import { requireActiveDevice } from "./auth";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
 
 export class MediaError extends Error {
   constructor(
@@ -107,15 +108,17 @@ function optionalPositiveInt(value: unknown, name: string): number | null {
   return parsed;
 }
 
-export function mediaDTOFromRow(row: any): MediaDTO {
-  const encryptedFileName = row.file_name_ciphertext == null ? null : open(
+export async function mediaDTOFromRow(sql: SQL, row: any): Promise<MediaDTO> {
+  const encryptedFileName = row.file_name_ciphertext == null ? null : (await openForScope(
+    sql,
+    { kind: "account", accountId: String(row.owner_account_id) },
     {
       keyId: row.file_name_key_id,
       nonce: buf(row.file_name_nonce),
       ciphertext: buf(row.file_name_ciphertext),
     },
     mediaFileNameAAD(row.id),
-  ).toString("utf8");
+  )).toString("utf8");
   return {
     id: row.id,
     kind: row.kind,
@@ -132,10 +135,10 @@ export function mediaDTOFromRow(row: any): MediaDTO {
 export async function loadMediaDTO(sql: SQL, mediaId: string | null): Promise<MediaDTO | null> {
   if (!mediaId) return null;
   const row = (await sql`
-    SELECT id, kind, content_type, file_name, file_name_key_id, file_name_nonce,
+    SELECT id, owner_account_id, kind, content_type, file_name, file_name_key_id, file_name_nonce,
            file_name_ciphertext, byte_size, duration_ms, width, height, thumbnail_ciphertext
     FROM media_objects WHERE id = ${mediaId} AND status = 'ready'`)[0];
-  return row ? mediaDTOFromRow(row) : null;
+  return row ? await mediaDTOFromRow(sql, row) : null;
 }
 
 export async function createMediaUpload(sql: SQL, accountId: string, deviceId: string, input: {
@@ -245,16 +248,23 @@ export async function createMediaUpload(sql: SQL, accountId: string, deviceId: s
     }
     await tx`INSERT INTO media_upload_attempts (account_id) VALUES (${accountId})`;
     const mediaId = randomUUID();
-    const sealedFileName = fileName == null ? null : seal(fileName, mediaFileNameAAD(mediaId));
+    const expectedDigest = mediaDigestIndex(Buffer.from(sha256, "hex"));
+    const sealedFileName = fileName == null ? null : await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      fileName,
+      mediaFileNameAAD(mediaId),
+    );
     const row = (await tx`
       INSERT INTO media_objects
         (id, owner_account_id, kind, content_type, file_name, file_name_key_id,
          file_name_nonce, file_name_ciphertext, byte_size, expected_sha256,
-         duration_ms, width, height, upload_protocol, part_size, total_parts, purpose)
+         expected_digest_key_id, duration_ms, width, height,
+         upload_protocol, part_size, total_parts, purpose)
       VALUES (${mediaId}, ${accountId}, ${kind}, ${contentType}, NULL,
               ${sealedFileName?.keyId ?? null}, ${sealedFileName?.nonce ?? null},
               ${sealedFileName?.ciphertext ?? null}, ${byteSize},
-              ${mediaDigestHMAC(Buffer.from(sha256, "hex"))}, ${durationMs}, ${width}, ${height},
+              ${expectedDigest.digest}, ${expectedDigest.keyId}, ${durationMs}, ${width}, ${height},
               ${uploadProtocol}, ${partSize}, ${totalParts}, ${purpose})
       RETURNING id, uploaded_bytes, expires_at`)[0];
     return {
@@ -304,7 +314,8 @@ export async function uploadMediaPart(
   if (bytes.length === 0 || bytes.length > LARGE_MEDIA_PART_SIZE) {
     throw new MediaError("invalid media part size", 413, "invalid_media_part_size");
   }
-  const digest = mediaDigestHMAC(createHash("sha256").update(bytes).digest());
+  const rawDigest = createHash("sha256").update(bytes).digest();
+  const digest = mediaDigestIndex(rawDigest);
   return await sql.begin(async (tx) => {
     await requireActiveMediaAccount(tx, accountId);
     await requireActiveDevice(tx, accountId, deviceId);
@@ -335,10 +346,11 @@ export async function uploadMediaPart(
       throw new MediaError("invalid media part size", 413, "invalid_media_part_size");
     }
     const existing = (await tx`
-      SELECT plain_size, plain_sha256 FROM media_chunks
+      SELECT plain_size, plain_sha256, plain_digest_key_id FROM media_chunks
       WHERE media_id = ${mediaId} AND chunk_offset = ${offset}`)[0];
     if (existing) {
-      if (n(existing.plain_size) === bytes.length && timingSafeEqual(buf(existing.plain_sha256), digest)) {
+      const expected = mediaDigestIndex(rawDigest, existing.plain_digest_key_id ?? "legacy-v1").digest;
+      if (n(existing.plain_size) === bytes.length && timingSafeEqual(buf(existing.plain_sha256), expected)) {
         return {
           mediaId, partIndex, receivedBytes: n(row.uploaded_bytes),
           complete: n(row.uploaded_bytes) === n(row.byte_size), duplicate: true,
@@ -346,11 +358,17 @@ export async function uploadMediaPart(
       }
       throw new MediaError("media part conflict", 409, "media_part_conflict");
     }
-    const sealed = seal(bytes, mediaChunkAAD(mediaId, offset));
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      bytes,
+      mediaChunkAAD(mediaId, offset),
+    );
     await tx`
       INSERT INTO media_chunks
-        (media_id, chunk_offset, plain_size, plain_sha256, key_id, nonce, ciphertext)
-      VALUES (${mediaId}, ${offset}, ${bytes.length}, ${digest}, ${sealed.keyId},
+        (media_id, chunk_offset, plain_size, plain_sha256, plain_digest_key_id,
+         key_id, nonce, ciphertext)
+      VALUES (${mediaId}, ${offset}, ${bytes.length}, ${digest.digest}, ${digest.keyId}, ${sealed.keyId},
               ${sealed.nonce}, ${sealed.ciphertext})`;
     const uploadedBytes = n(row.uploaded_bytes) + bytes.length;
     await tx`UPDATE media_objects SET uploaded_bytes = ${uploadedBytes} WHERE id = ${mediaId}`;
@@ -367,7 +385,8 @@ export async function uploadMediaChunk(
   const { chunkBytes } = mediaLimits();
   if (!Number.isSafeInteger(offset) || offset < 0) throw new MediaError("invalid upload offset");
   if (bytes.length === 0 || bytes.length > chunkBytes) throw new MediaError("invalid media chunk size", 413);
-  const digest = mediaDigestHMAC(createHash("sha256").update(bytes).digest());
+  const rawDigest = createHash("sha256").update(bytes).digest();
+  const digest = mediaDigestIndex(rawDigest);
   return await sql.begin(async (tx) => {
     await requireActiveMediaAccount(tx, accountId);
     await requireActiveDevice(tx, accountId, deviceId);
@@ -385,21 +404,30 @@ export async function uploadMediaChunk(
     const uploaded = n(row.uploaded_bytes);
     if (offset < uploaded) {
       const existing = (await tx`
-        SELECT plain_size, plain_sha256 FROM media_chunks
+        SELECT plain_size, plain_sha256, plain_digest_key_id FROM media_chunks
         WHERE media_id = ${mediaId} AND chunk_offset = ${offset}`)[0];
-      if (existing && n(existing.plain_size) === bytes.length &&
-          timingSafeEqual(buf(existing.plain_sha256), digest)) {
+      const expected = existing
+        ? mediaDigestIndex(rawDigest, existing.plain_digest_key_id ?? "legacy-v1").digest
+        : null;
+      if (existing && n(existing.plain_size) === bytes.length && expected &&
+          timingSafeEqual(buf(existing.plain_sha256), expected)) {
         return { mediaId, uploadOffset: uploaded, complete: uploaded === n(row.byte_size), duplicate: true };
       }
       throw new MediaError("upload offset conflict", 409);
     }
     if (offset !== uploaded) throw new MediaError("upload offset conflict", 409);
     if (offset + bytes.length > n(row.byte_size)) throw new MediaError("chunk exceeds declared media size", 413);
-    const sealed = seal(bytes, mediaChunkAAD(mediaId, offset));
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      bytes,
+      mediaChunkAAD(mediaId, offset),
+    );
     await tx`
       INSERT INTO media_chunks
-        (media_id, chunk_offset, plain_size, plain_sha256, key_id, nonce, ciphertext)
-      VALUES (${mediaId}, ${offset}, ${bytes.length}, ${digest}, ${sealed.keyId},
+        (media_id, chunk_offset, plain_size, plain_sha256, plain_digest_key_id,
+         key_id, nonce, ciphertext)
+      VALUES (${mediaId}, ${offset}, ${bytes.length}, ${digest.digest}, ${digest.keyId}, ${sealed.keyId},
               ${sealed.nonce}, ${sealed.ciphertext})`;
     const next = offset + bytes.length;
     await tx`UPDATE media_objects SET uploaded_bytes = ${next} WHERE id = ${mediaId}`;
@@ -413,10 +441,15 @@ export async function uploadMediaThumbnail(
   if (!/^image\/(jpeg|png|webp)$/i.test(contentType)) throw new MediaError("unsupported thumbnail type");
   if (bytes.length === 0 || bytes.length > MAX_THUMBNAIL_BYTES) throw new MediaError("thumbnail too large", 413);
   validateImage(bytes, contentType, MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_PIXELS);
-  const sealed = seal(bytes, mediaThumbnailAAD(mediaId));
   await sql.begin(async (tx) => {
     await requireActiveMediaAccount(tx, accountId);
     await requireActiveDevice(tx, accountId, deviceId);
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      bytes,
+      mediaThumbnailAAD(mediaId),
+    );
     const rows = await tx`
       UPDATE media_objects
       SET thumbnail_key_id = ${sealed.keyId}, thumbnail_nonce = ${sealed.nonce},
@@ -444,6 +477,7 @@ export async function completeMediaUpload(sql: SQL, accountId: string, deviceId:
     await requireActiveDevice(tx, accountId, deviceId);
     const row = (await tx`
       SELECT owner_account_id, kind, content_type, byte_size, uploaded_bytes, expected_sha256,
+             expected_digest_key_id,
              width, height, status, expires_at, upload_protocol, part_size, total_parts
       FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
     if (!row || row.owner_account_id !== accountId) throw new MediaError("upload not found", 404);
@@ -458,6 +492,7 @@ export async function completeMediaUpload(sql: SQL, accountId: string, deviceId:
     const chunks = await tx`
       SELECT chunk_offset, plain_size, key_id, nonce, ciphertext
       FROM media_chunks WHERE media_id = ${mediaId} ORDER BY chunk_offset`;
+    await preloadEnvelopeKeys(tx, chunks.map((chunk: any) => String(chunk.key_id)));
     const hash = createHash("sha256");
     let header = Buffer.alloc(0);
     let expectedOffset = 0;
@@ -474,7 +509,9 @@ export async function completeMediaUpload(sql: SQL, accountId: string, deviceId:
           throw new MediaError("upload has an invalid part layout", 409, "media_part_layout_invalid");
         }
       }
-      const plaintext = open(
+      const plaintext = await openForScope(
+        tx,
+        { kind: "account", accountId },
         { keyId: chunk.key_id, nonce: buf(chunk.nonce), ciphertext: buf(chunk.ciphertext) },
         mediaChunkAAD(mediaId, expectedOffset),
       );
@@ -489,7 +526,10 @@ export async function completeMediaUpload(sql: SQL, accountId: string, deviceId:
     if (row.upload_protocol === "parts_v2" && partIndex !== n(row.total_parts)) {
       throw new MediaError("upload has missing parts", 409, "media_upload_incomplete");
     }
-    const digest = mediaDigestHMAC(hash.digest());
+    const digest = mediaDigestIndex(
+      hash.digest(),
+      row.expected_digest_key_id ?? "legacy-v1",
+    ).digest;
     if (expectedOffset !== n(row.byte_size) || !timingSafeEqual(digest, buf(row.expected_sha256))) {
       await rejectUpload(tx, mediaId);
       return { error: new MediaError("media checksum mismatch", 409, "media_checksum_mismatch") } as const;
@@ -511,7 +551,7 @@ export async function completeMediaUpload(sql: SQL, accountId: string, deviceId:
 
 async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) {
   const row = (await sql`
-    SELECT mo.id, mo.status, mo.byte_size, mo.content_type,
+    SELECT mo.id, mo.owner_account_id, mo.status, mo.byte_size, mo.content_type,
            mo.thumbnail_key_id, mo.thumbnail_nonce, mo.thumbnail_ciphertext,
            mo.thumbnail_content_type
     FROM media_objects mo
@@ -591,7 +631,9 @@ export async function downloadMediaChunk(sql: SQL, accountId: string, mediaId: s
       SELECT chunk_offset, plain_size, key_id, nonce, ciphertext
       FROM media_chunks WHERE media_id = ${mediaId} AND chunk_offset = ${offset}`)[0];
     if (!chunk) throw new MediaError("invalid download offset", 416);
-    const bytes = open(
+    const bytes = await openForScope(
+      tx,
+      { kind: "account", accountId: String(object.owner_account_id) },
       { keyId: chunk.key_id, nonce: buf(chunk.nonce), ciphertext: buf(chunk.ciphertext) },
       mediaChunkAAD(mediaId, offset),
     );
@@ -608,7 +650,9 @@ export async function downloadMediaThumbnail(sql: SQL, accountId: string, mediaI
     const row = await requireMediaAccess(tx, accountId, mediaId);
     if (!row.thumbnail_ciphertext) throw new MediaError("thumbnail not found", 404);
     return {
-      bytes: open(
+      bytes: await openForScope(
+        tx,
+        { kind: "account", accountId: String(row.owner_account_id) },
         { keyId: row.thumbnail_key_id, nonce: buf(row.thumbnail_nonce), ciphertext: buf(row.thumbnail_ciphertext) },
         mediaThumbnailAAD(mediaId),
       ),

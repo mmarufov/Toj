@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { checkVerification, startVerification } from "./auth";
 import {
   ChatFolderError,
@@ -19,6 +19,8 @@ import {
   updateScheduledDelivery,
 } from "./scheduled-deliveries";
 import { editMessage, getDifference, getOrCreateDirectDialog, sendMessage } from "./sync";
+import { linkPreviewLookupCandidates } from "./crypto";
+import { cloudProductivitySchemaState } from "./cloud-productivity-readiness";
 
 // Worker behavior is exercised deterministically through drain functions below. Background loops
 // from HTTP-route tests would otherwise race assertions against the shared integration database.
@@ -28,8 +30,17 @@ const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj
 const db = makeSql(TEST_URL);
 
 async function resetDb() {
-  await db`TRUNCATE accounts, otp_challenges RESTART IDENTITY CASCADE`;
+  delete process.env.TOJ_BLIND_INDEX_KEYRING;
+  delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+  // The URL cache is service-owned rather than account-owned, so account CASCADE cleanup cannot
+  // remove key-rotation fixtures. Clear it explicitly to keep later readiness processes honest.
+  await db`TRUNCATE link_preview_cache_entries, accounts, otp_challenges RESTART IDENTITY CASCADE`;
 }
+
+afterAll(async () => {
+  await resetDb();
+  await db.close();
+});
 
 async function account(phone: string, name: string) {
   const { code } = await startVerification(db, phone);
@@ -47,6 +58,22 @@ async function directPair() {
 
 describe("cloud productivity features", () => {
   beforeEach(resetDb);
+
+  test("schema readiness rejects a prior v1 encryption shape", async () => {
+    expect((await cloudProductivitySchemaState(db, { bypassCache: true })).ready).toBe(true);
+    let incomplete: Awaited<ReturnType<typeof cloudProductivitySchemaState>> | null = null;
+    try {
+      await db.begin(async (tx) => {
+        await tx`ALTER TABLE link_preview_assets DROP COLUMN digest_key_id`;
+        incomplete = await cloudProductivitySchemaState(tx, { bypassCache: true });
+        throw new Error("rollback readiness fixture");
+      });
+    } catch (error) {
+      expect(String(error)).toContain("rollback readiness fixture");
+    }
+    expect(incomplete?.ready).toBe(false);
+    expect(incomplete?.missingColumns).toContain("link_preview_assets.digest_key_id");
+  });
 
   test("chat folders are encrypted, idempotent, revision checked, and sync as snapshots", async () => {
     const { alice, dialogId } = await directPair();
@@ -70,15 +97,24 @@ describe("cloud productivity features", () => {
     const created = await createChatFolder(db, {
       accountId: alice.accountId, deviceId: alice.deviceId, body,
     });
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "receipt-v2": Buffer.alloc(32, 0x66).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "receipt-v2";
     const duplicate = await createChatFolder(db, {
       accountId: alice.accountId, deviceId: alice.deviceId, body,
     });
     expect(created.folders[0].title).toBe("Family");
     expect(duplicate.duplicate).toBe(true);
     const stored = (await db`
-      SELECT title_ciphertext FROM chat_folders
+      SELECT title_key_id, title_ciphertext FROM chat_folders
       WHERE account_id = ${alice.accountId} AND folder_id = ${folderId}`)[0];
     expect(Buffer.from(stored.title_ciphertext).includes(Buffer.from("Family"))).toBe(false);
+    if (process.env.TOJ_CRYPTO_MODE === "envelope"
+      || (process.env.TOJ_CRYPTO_MODE === "envelope-canary"
+        && process.env.TOJ_ENVELOPE_CANARY_PERCENT === "100")) {
+      expect(stored.title_key_id).not.toBe("dev-v1");
+    }
 
     await expect(updateChatFolder(db, {
       accountId: alice.accountId,
@@ -98,18 +134,32 @@ describe("cloud productivity features", () => {
   test("server dispatch survives client disappearance and is exactly once across worker retries", async () => {
     const { alice, bob, dialogId } = await directPair();
     const scheduleId = crypto.randomUUID();
+    const requestBody = {
+      scheduleId,
+      clientMutationId: crypto.randomUUID(),
+      dialogId,
+      deliverAt: new Date(Date.now() + 61_000).toISOString(),
+      items: [{ clientMsgId: crypto.randomUUID(), kind: "text", body: "from server" }],
+    };
     const created = await createScheduledDelivery(db, {
       accountId: alice.accountId,
       deviceId: alice.deviceId,
-      body: {
-        scheduleId,
-        clientMutationId: crypto.randomUUID(),
-        dialogId,
-        deliverAt: new Date(Date.now() + 61_000).toISOString(),
-        items: [{ clientMsgId: crypto.randomUUID(), kind: "text", body: "from server" }],
-      },
+      body: requestBody,
     });
     expect(created.scheduledDelivery.state).toBe("scheduled");
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "schedule-v2": Buffer.alloc(32, 0x68).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "schedule-v2";
+    expect((await createScheduledDelivery(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, body: requestBody,
+    })).duplicate).toBe(true);
+    if (process.env.TOJ_CRYPTO_MODE === "envelope"
+      || (process.env.TOJ_CRYPTO_MODE === "envelope-canary"
+        && process.env.TOJ_ENVELOPE_CANARY_PERCENT === "100")) {
+      expect((await db`SELECT payload_key_id FROM scheduled_delivery_items
+        WHERE delivery_id = ${scheduleId}`)[0].payload_key_id).not.toBe("dev-v1");
+    }
     // No client process participates after creation. Move the test clock by making the row due.
     await db`
       UPDATE scheduled_deliveries SET deliver_at = now(), available_at = now()
@@ -446,6 +496,43 @@ describe("cloud productivity features", () => {
     expect(Number((await db`
       SELECT count(*) AS count FROM link_preview_waiters
       WHERE dialog_id = ${dialogId} AND msg_id = ${sent.msgId}`)[0].count)).toBe(1);
+    if (process.env.TOJ_CRYPTO_MODE === "envelope"
+      || (process.env.TOJ_CRYPTO_MODE === "envelope-canary"
+        && process.env.TOJ_ENVELOPE_CANARY_PERCENT === "100")) {
+      const stored = (await db`
+        SELECT relation.original_url_key_id, cache.url_key_id
+        FROM message_link_previews relation
+        JOIN link_preview_cache_entries cache
+          ON cache.url_lookup_hmac = relation.url_lookup_hmac
+        WHERE relation.dialog_id = ${dialogId} AND relation.msg_id = ${sent.msgId}`)[0];
+      expect(stored.original_url_key_id).not.toBe("dev-v1");
+      expect(stored.url_key_id).not.toBe("dev-v1");
+    }
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "preview-v2": Buffer.alloc(32, 0x67).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "preview-v2";
+    await editMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      body,
+      expectedEditVersion: 0,
+      linkPreviewsEnabled: true,
+      linkPreviewCandidate: {
+        url, utf16Offset: 5, utf16Length: url.length, disabled: false,
+      },
+    });
+    const candidateDigests = linkPreviewLookupCandidates(url).map((entry) => entry.digest.toString("hex"));
+    expect(Number((await db`
+      SELECT count(*) AS count FROM link_preview_cache_entries cache
+      WHERE cache.url_lookup_hmac IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${db.array(candidateDigests, "text")}::text[]
+        ) candidate(value)
+      )`)[0].count)).toBe(1);
     await editMessage(db, {
       actorAccountId: alice.accountId,
       actorDeviceId: alice.deviceId,
@@ -453,7 +540,7 @@ describe("cloud productivity features", () => {
       msgId: sent.msgId,
       clientMutationId: crypto.randomUUID(),
       body: "No link now",
-      expectedEditVersion: 0,
+      expectedEditVersion: 1,
       linkPreviewsEnabled: true,
       linkPreviewCandidate: null,
     });

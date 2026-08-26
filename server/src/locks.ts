@@ -8,6 +8,18 @@ export async function lockMutationKeys(sql: SQL, keys: string[]): Promise<void> 
   }
 }
 
+/**
+ * Hold a transaction-scoped shared fence while cached key material is being populated.
+ * Final key revocation takes the matching exclusive fence, so an unwrap that started before
+ * revocation either finishes before the durable drain begins or observes the revoked row.
+ */
+export async function lockSharedMutationKeys(sql: SQL, keys: string[]): Promise<void> {
+  const ordered = [...new Set(keys)].sort();
+  for (const key of ordered) {
+    await sql`SELECT pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`;
+  }
+}
+
 export function accountMutationKey(accountId: string): string {
   return `account-mutation:${accountId}`;
 }

@@ -2,13 +2,13 @@ import type { SQL } from "bun";
 import sharp from "sharp";
 import {
   linkPreviewAssetAAD,
-  linkPreviewAssetDigestHMAC,
-  linkPreviewLookupHMAC,
+  linkPreviewAssetDigestIndex,
+  linkPreviewLookupCandidates,
+  linkPreviewLookupIndex,
   linkPreviewMetadataAAD,
   linkPreviewURLAAD,
-  open,
-  seal,
 } from "./crypto";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
 import { fanoutDialogEvent } from "./fanout";
 import { fetchPublicResource, SafeHTTPError, validatePublicURL } from "./safe-http-client";
 import { notifySyncWakeups } from "./sync-wakeup";
@@ -129,12 +129,20 @@ export async function enqueueLinkPreview(
     return;
   }
 
-  const lookup = linkPreviewLookupHMAC(candidate.url);
+  const lookupCandidates = linkPreviewLookupCandidates(candidate.url);
+  const activeLookup = linkPreviewLookupIndex(candidate.url);
   const existing = (await sql`
-    SELECT state, current_snapshot_id, expires_at
+    SELECT url_lookup_hmac, url_lookup_key_id, state, current_snapshot_id, expires_at
     FROM link_preview_cache_entries
-    WHERE url_lookup_hmac = ${lookup}
-    FOR UPDATE`)[0];
+    WHERE url_lookup_hmac IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(lookupCandidates.map((entry) => entry.digest.toString("hex")), "text")}::text[]
+      ) candidate(value)
+    )
+    ORDER BY (url_lookup_key_id = ${activeLookup.keyId}) DESC, created_at DESC
+    LIMIT 1 FOR UPDATE`)[0];
+  const lookup = existing ? Buffer.from(existing.url_lookup_hmac) : activeLookup.digest;
+  const lookupKeyId = existing ? String(existing.url_lookup_key_id) : activeLookup.keyId;
   let state: LinkPreviewDTO["state"] = "pending";
   let snapshotId: string | null = null;
   if (existing?.state === "ready" && existing.expires_at && new Date(existing.expires_at) > new Date()) {
@@ -159,12 +167,19 @@ export async function enqueueLinkPreview(
       if (!budget.length) state = "unavailable";
     }
     if (state === "pending") {
-      const cacheURL = seal(candidate.url, linkPreviewURLAAD("cache", lookup.toString("hex")));
+      const cacheURL = await sealForScope(
+        sql,
+        { kind: "service", serviceName: "link-preview" },
+        candidate.url,
+        linkPreviewURLAAD("cache", lookup.toString("hex")),
+      );
       await sql`
         INSERT INTO link_preview_cache_entries(
-          url_lookup_hmac, url_key_id, url_nonce, url_ciphertext, state, available_at
+          url_lookup_hmac, url_lookup_key_id, url_key_id, url_nonce, url_ciphertext,
+          state, available_at
         ) VALUES (
-          ${lookup}, ${cacheURL.keyId}, ${cacheURL.nonce}, ${cacheURL.ciphertext}, 'pending', now()
+          ${lookup}, ${lookupKeyId}, ${cacheURL.keyId}, ${cacheURL.nonce},
+          ${cacheURL.ciphertext}, 'pending', now()
         )
         ON CONFLICT (url_lookup_hmac) DO UPDATE SET
           state = CASE
@@ -185,24 +200,29 @@ export async function enqueueLinkPreview(
     }
   }
 
-  const messageURL = seal(
+  const messageURL = await sealForScope(
+    sql,
+    { kind: "account", accountId: input.accountId },
     candidate.url,
     linkPreviewURLAAD("message", `${input.dialogId}:${input.msgId}:${generation}`),
   );
   await sql`
     INSERT INTO message_link_previews(
       dialog_id, msg_id, generation, expected_edit_version, url_lookup_hmac,
-      original_url_key_id, original_url_nonce, original_url_ciphertext, state, snapshot_id
+      url_lookup_key_id, original_url_key_id, original_url_nonce,
+      original_url_ciphertext, state, snapshot_id
     ) VALUES (
-      ${input.dialogId}, ${input.msgId}, ${generation}, ${input.editVersion}, ${lookup},
+      ${input.dialogId}, ${input.msgId}, ${generation}, ${input.editVersion},
+      ${lookup}, ${lookupKeyId},
       ${messageURL.keyId}, ${messageURL.nonce}, ${messageURL.ciphertext}, ${state}, ${snapshotId}
     )`;
   if (state === "pending") {
     await sql`
       INSERT INTO link_preview_waiters(
-        url_lookup_hmac, dialog_id, msg_id, expected_edit_version, generation
+        url_lookup_hmac, url_lookup_key_id, dialog_id, msg_id, expected_edit_version, generation
       ) VALUES (
-        ${lookup}, ${input.dialogId}, ${input.msgId}, ${input.editVersion}, ${generation}
+        ${lookup}, ${lookupKeyId}, ${input.dialogId}, ${input.msgId},
+        ${input.editVersion}, ${generation}
       )
       ON CONFLICT (url_lookup_hmac, dialog_id, msg_id) DO UPDATE SET
         expected_edit_version = excluded.expected_edit_version,
@@ -399,17 +419,24 @@ async function publishPreview(
   },
 ): Promise<void> {
   const snapshotId = crypto.randomUUID();
-  const sealedURL = seal(
+  // Envelope sealing and image decoding are expensive, so they stay outside the write
+  // transaction; the cache row is only locked for the inserts below.
+  const scope = { kind: "service", serviceName: "link-preview" } as const;
+  const sealedURL = await sealForScope(
+    sql,
+    scope,
     JSON.stringify({ originalURL: result.originalURL, finalURL: result.finalURL }),
     linkPreviewURLAAD("snapshot", snapshotId),
   );
-  const sealedMetadata = seal(
+  const sealedMetadata = await sealForScope(
+    sql,
+    scope,
     JSON.stringify(result.metadata),
     linkPreviewMetadataAAD(snapshotId),
   );
   const preparedAsset = result.image ? await (async () => {
     const id = crypto.randomUUID();
-    const sealed = seal(result.image!, linkPreviewAssetAAD(id));
+    const sealed = await sealForScope(sql, scope, result.image!, linkPreviewAssetAAD(id));
     const imageInfo = await sharp(result.image!).metadata();
     return {
       id,
@@ -417,7 +444,7 @@ async function publishPreview(
       byteSize: result.image!.length,
       width: imageInfo.width ?? 1,
       height: imageInfo.height ?? 1,
-      digest: linkPreviewAssetDigestHMAC(result.image!),
+      digest: linkPreviewAssetDigestIndex(result.image!),
     };
   })() : null;
   await sql.begin(async (tx) => {
@@ -431,11 +458,13 @@ async function publishPreview(
     if (preparedAsset) {
       await tx`
         INSERT INTO link_preview_assets(
-          id, key_id, nonce, ciphertext, content_type, byte_size, width, height, digest_hmac
+          id, key_id, nonce, ciphertext, content_type, byte_size, width, height,
+          digest_hmac, digest_key_id
         ) VALUES (
           ${assetId}, ${preparedAsset.sealed.keyId}, ${preparedAsset.sealed.nonce},
           ${preparedAsset.sealed.ciphertext}, 'image/jpeg', ${preparedAsset.byteSize},
-          ${preparedAsset.width}, ${preparedAsset.height}, ${preparedAsset.digest}
+          ${preparedAsset.width}, ${preparedAsset.height},
+          ${preparedAsset.digest.digest}, ${preparedAsset.digest.keyId}
         )`;
     }
     await tx`
@@ -633,14 +662,16 @@ async function processPreview(
     WHERE url_lookup_hmac = ${claim.lookup}
       AND state = 'fetching' AND lease_token = ${claim.leaseToken}`)[0];
   if (!row) return;
-  const originalURL = open(
+  const originalURL = (await openForScope(
+    sql,
+    { kind: "service", serviceName: "link-preview" },
     {
       keyId: String(row.url_key_id),
       nonce: Buffer.from(row.url_nonce),
       ciphertext: Buffer.from(row.url_ciphertext),
     },
     linkPreviewURLAAD("cache", claim.lookup.toString("hex")),
-  ).toString("utf8");
+  )).toString("utf8");
   try {
     const response = await fetchPublicResource(originalURL, {
       maxBytes: MAX_HTML_BYTES,
@@ -819,6 +850,7 @@ export async function loadLinkPreviews(
       ) key(dialog_id, msg_id)
     )
     SELECT relation.dialog_id, relation.msg_id, relation.generation, relation.state,
+           message.sender_account_id,
            relation.original_url_key_id, relation.original_url_nonce,
            relation.original_url_ciphertext, relation.snapshot_id,
            snapshot.url_key_id AS snapshot_url_key_id,
@@ -829,7 +861,14 @@ export async function loadLinkPreviews(
     FROM wanted
     JOIN message_link_previews relation
       ON relation.dialog_id = wanted.dialog_id AND relation.msg_id = wanted.msg_id
+    JOIN messages message
+      ON message.dialog_id = relation.dialog_id AND message.msg_id = relation.msg_id
     LEFT JOIN link_preview_snapshots snapshot ON snapshot.id = relation.snapshot_id`;
+  await preloadEnvelopeKeys(sql, rows.flatMap((row: any) => [
+    row.original_url_key_id,
+    row.snapshot_url_key_id,
+    row.metadata_key_id,
+  ]).filter(Boolean).map(String));
   const result = new Map<string, LinkPreviewDTO>();
   for (const row of rows) {
     const dialogId = String(row.dialog_id);
@@ -837,35 +876,41 @@ export async function loadLinkPreviews(
     const state = String(row.state) as LinkPreviewDTO["state"];
     let originalUrl: string | null = null;
     if (row.original_url_key_id) {
-      originalUrl = open(
+      originalUrl = (await openForScope(
+        sql,
+        { kind: "account", accountId: String(row.sender_account_id) },
         {
           keyId: String(row.original_url_key_id),
           nonce: Buffer.from(row.original_url_nonce),
           ciphertext: Buffer.from(row.original_url_ciphertext),
         },
         linkPreviewURLAAD("message", `${dialogId}:${msgId}:${n(row.generation)}`),
-      ).toString("utf8");
+      )).toString("utf8");
     }
     let finalUrl: string | null = null;
     let metadata: PreviewMetadata | null = null;
     if (state === "ready" && row.snapshot_id) {
-      const urls = JSON.parse(open(
+      const urls = JSON.parse((await openForScope(
+        sql,
+        { kind: "service", serviceName: "link-preview" },
         {
           keyId: String(row.snapshot_url_key_id),
           nonce: Buffer.from(row.snapshot_url_nonce),
           ciphertext: Buffer.from(row.snapshot_url_ciphertext),
         },
         linkPreviewURLAAD("snapshot", String(row.snapshot_id)),
-      ).toString("utf8"));
+      )).toString("utf8"));
       finalUrl = String(urls.finalURL);
-      metadata = JSON.parse(open(
+      metadata = JSON.parse((await openForScope(
+        sql,
+        { kind: "service", serviceName: "link-preview" },
         {
           keyId: String(row.metadata_key_id),
           nonce: Buffer.from(row.metadata_nonce),
           ciphertext: Buffer.from(row.metadata_ciphertext),
         },
         linkPreviewMetadataAAD(String(row.snapshot_id)),
-      ).toString("utf8"));
+      )).toString("utf8"));
     }
     result.set(`${dialogId}:${msgId}`, {
       state,
@@ -902,6 +947,12 @@ export async function downloadLinkPreviewAsset(
         JOIN dialog_members member ON member.dialog_id = relation.dialog_id
         JOIN dialogs dialog ON dialog.id = relation.dialog_id
         WHERE snapshot.asset_id = asset.id
+          AND EXISTS (
+            SELECT 1 FROM messages message
+            WHERE message.dialog_id = relation.dialog_id
+              AND message.msg_id = relation.msg_id
+              AND message.state = 'visible'
+          )
           AND member.account_id = ${accountId}
           AND message.state = 'visible'
           AND (message.expires_at IS NULL OR message.expires_at > now())
@@ -914,7 +965,9 @@ export async function downloadLinkPreviewAsset(
       )`)[0];
   if (!row) throw new LinkPreviewError("preview asset not found", "preview_asset_not_found", 404);
   return {
-    bytes: open(
+    bytes: await openForScope(
+      sql,
+      { kind: "service", serviceName: "link-preview" },
       {
         keyId: String(row.key_id),
         nonce: Buffer.from(row.nonce),

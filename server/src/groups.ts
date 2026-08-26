@@ -1,7 +1,8 @@
 import type { SQL } from "bun";
 import { scrubDialogFromChatFoldersInTransaction } from "./chat-folders";
 import { createHash } from "node:crypto";
-import { bodyAAD, seal } from "./crypto";
+import { bodyAAD } from "./crypto";
+import { sealForScope } from "./envelope-crypto";
 import {
   DialogAccessError,
   lockDialogForMutation,
@@ -240,7 +241,12 @@ async function insertServiceMessage(
     `a${clientHash.slice(17, 20)}`,
     clientHash.slice(20, 32),
   ].join("-");
-  const sealed = seal("", bodyAAD(dialogId, msgId, actorAccountId));
+  const sealed = await sealForScope(
+    sql,
+    { kind: "account", accountId: actorAccountId },
+    "",
+    bodyAAD(dialogId, msgId, actorAccountId),
+  );
   await sql`
     INSERT INTO messages (
       dialog_id, msg_id, sender_account_id, client_msg_id, kind,

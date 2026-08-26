@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
-import { open, pollAAD, seal } from "./crypto";
+import { pollAAD } from "./crypto";
+import { openForScope, sealForScope } from "./envelope-crypto";
 
 export class MessagingContentError extends Error {
   constructor(
@@ -132,8 +133,10 @@ export async function insertPollContent(
   dialogId: string,
   msgId: number,
   input: NormalizedPollCreation,
+  senderAccountId: string,
 ): Promise<void> {
-  const sealed = seal(JSON.stringify({
+  // Poll payloads follow their message body's key scope so account deletion shreds both.
+  const sealed = await sealForScope(sql, { kind: "account", accountId: senderAccountId }, JSON.stringify({
     question: input.question,
     options: input.options,
     correctOptionIndex: input.correctOptionIndex,
@@ -154,14 +157,24 @@ export async function copyStructuredMessageContent(
   source: MessageKey,
   destination: MessageKey,
   kind: string,
+  destinationSenderAccountId: string,
 ): Promise<void> {
   if (kind === "poll") {
     const row = (await sql`
-      SELECT * FROM message_polls
-      WHERE dialog_id = ${source.dialogId} AND msg_id = ${source.msgId}`)[0];
+      SELECT poll.*, message.sender_account_id AS poll_sender_account_id
+      FROM message_polls poll
+      JOIN messages message
+        ON message.dialog_id = poll.dialog_id AND message.msg_id = poll.msg_id
+      WHERE poll.dialog_id = ${source.dialogId} AND poll.msg_id = ${source.msgId}`)[0];
     if (!row) throw new MessagingContentError("forward source poll is unavailable", 409);
-    const payload = decodePollPayload(row);
-    const sealed = seal(JSON.stringify(payload), pollAAD(destination.dialogId, destination.msgId));
+    const payload = await decodePollPayload(sql, row);
+    // The forwarded copy is re-sealed under the forwarding sender's scope.
+    const sealed = await sealForScope(
+      sql,
+      { kind: "account", accountId: destinationSenderAccountId },
+      JSON.stringify(payload),
+      pollAAD(destination.dialogId, destination.msgId),
+    );
     await sql`
       INSERT INTO message_polls (
         dialog_id, msg_id, payload_key_id, payload_nonce, payload_ciphertext,
@@ -189,17 +202,22 @@ export async function copyStructuredMessageContent(
   }
 }
 
-function decodePollPayload(row: any): {
+async function decodePollPayload(sql: SQL, row: any): Promise<{
   question: string;
   options: string[];
   correctOptionIndex: number | null;
   explanation: string | null;
-} {
-  return JSON.parse(open({
-    keyId: String(row.payload_key_id),
-    nonce: bytes(row.payload_nonce),
-    ciphertext: bytes(row.payload_ciphertext),
-  }, pollAAD(String(row.dialog_id), Number(row.msg_id))).toString("utf8"));
+}> {
+  return JSON.parse((await openForScope(
+    sql,
+    { kind: "account", accountId: String(row.poll_sender_account_id) },
+    {
+      keyId: String(row.payload_key_id),
+      nonce: bytes(row.payload_nonce),
+      ciphertext: bytes(row.payload_ciphertext),
+    },
+    pollAAD(String(row.dialog_id), Number(row.msg_id)),
+  )).toString("utf8"));
 }
 
 export async function loadPollDTO(
@@ -240,7 +258,8 @@ export async function loadPollDTOs(
         ON vote.dialog_id = wanted.dialog_id AND vote.msg_id = wanted.msg_id
       GROUP BY vote.dialog_id, vote.msg_id
     )
-    SELECT poll.*, own.option_indices AS my_option_indices,
+    SELECT poll.*, message.sender_account_id AS poll_sender_account_id,
+           own.option_indices AS my_option_indices,
            COALESCE(summary.total_voters, 0) AS total_voters,
            COALESCE((
              SELECT jsonb_object_agg(option_index::text, votes)
@@ -260,14 +279,14 @@ export async function loadPollDTOs(
     WHERE message.state = 'visible'
       AND (message.expires_at IS NULL OR message.expires_at > now())`;
   for (const row of rows) {
-    result.set(key(String(row.dialog_id), Number(row.msg_id)), pollDTOFromRow(row));
+    result.set(key(String(row.dialog_id), Number(row.msg_id)), await pollDTOFromRow(sql, row));
   }
   return result;
 }
 
 /** Pure row projection shared by the standalone poll loader and the sync metadata batch. */
-export function pollDTOFromRow(row: any): PollDTO {
-  const payload = decodePollPayload(row);
+export async function pollDTOFromRow(sql: SQL, row: any): Promise<PollDTO> {
+  const payload = await decodePollPayload(sql, row);
   const myOptions = (row.my_option_indices ?? []).map(Number);
   const revealResults = row.closed_at != null || myOptions.length > 0;
   const rawCounts = typeof row.option_counts === "string"

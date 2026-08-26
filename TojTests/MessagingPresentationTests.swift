@@ -291,6 +291,17 @@ final class MessagingPresentationTests: XCTestCase {
         ), "status unavailable")
     }
 
+    func testCloudChatPrivacyPresentationNeverClaimsEndToEndEncryption() {
+        XCTAssertEqual(CloudChatPrivacyPresentation.systemImage, "cloud.fill")
+        XCTAssertEqual(CloudChatPrivacyPresentation.title, String(localized: "Cloud chat"))
+        XCTAssertTrue(CloudChatPrivacyPresentation.disclosure.contains("not end-to-end encrypted"))
+        XCTAssertFalse(CloudChatPrivacyPresentation.disclosure.localizedCaseInsensitiveContains("private conversation"))
+        XCTAssertTrue(CloudChatPrivacyPresentation.accessibilityLabel.contains("not end-to-end encrypted"))
+        XCTAssertTrue(CloudChatPrivacyPresentation.savedMessagesAccessibilityLabel.contains("not end-to-end encrypted"))
+        XCTAssertEqual(ReplicaConnectionState.live.title, String(localized: "Connected"))
+        XCTAssertNotEqual(ReplicaConnectionState.live.systemImage, "lock.fill")
+    }
+
     func testCapabilitySetsKeepProductionTruthful() {
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.replies))
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.editing))
@@ -304,18 +315,130 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.demo.contains(.groups))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.calls))
         XCTAssertFalse(MessagingCapabilities.demo.contains(.savedMessages))
-        let dailyUseBits: [MessagingCapabilities] = [
-            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch, .chatFolders,
-            .scheduledDelivery, .linkPreviews, .presence, .profilePhotos,
+        let capabilityBits: [MessagingCapabilities] = [
+            .chatOrganization, .replies, .editing, .deletion, .forwarding, .reactions,
+            .media, .voiceNotes, .groups, .calls, .profiles, .richSearch,
+            .multipartMedia, .videoCalls, .savedMessages, .cloudDrafts,
+            .dialogPreferences, .localSearch, .mediaGroups, .groupCalls,
+            .groupVideoCalls, .screenSharing, .chatFolders, .scheduledDelivery,
+            .linkPreviews, .abuseReports, .presence, .profilePhotos,
         ]
-        XCTAssertEqual(Set(dailyUseBits.map(\.rawValue)).count, dailyUseBits.count)
+        XCTAssertEqual(Set(capabilityBits.map(\.rawValue)).count, capabilityBits.count)
         XCTAssertEqual(MessagingCapabilities.savedMessages.rawValue, 1 << 14)
         XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
         XCTAssertEqual(MessagingCapabilities.chatFolders.rawValue, 1 << 22)
         XCTAssertEqual(MessagingCapabilities.scheduledDelivery.rawValue, 1 << 23)
         XCTAssertEqual(MessagingCapabilities.linkPreviews.rawValue, 1 << 24)
-        XCTAssertEqual(MessagingCapabilities.presence.rawValue, 1 << 25)
-        XCTAssertEqual(MessagingCapabilities.profilePhotos.rawValue, 1 << 26)
+        XCTAssertEqual(MessagingCapabilities.abuseReports.rawValue, 1 << 25)
+        XCTAssertEqual(MessagingCapabilities.presence.rawValue, 1 << 26)
+        XCTAssertEqual(MessagingCapabilities.profilePhotos.rawValue, 1 << 27)
+    }
+
+    func testReportDraftRequiresBoundedDetailsForOther() {
+        var draft = AbuseReportDraft(reason: .other, details: "short")
+        XCTAssertNotNil(draft.validationMessage)
+        draft.details = String(repeating: "a", count: 10)
+        XCTAssertNil(draft.validationMessage)
+        draft.details = String(repeating: "a", count: 501)
+        XCTAssertNotNil(draft.validationMessage)
+        draft.details = String(repeating: "😀", count: 500)
+        XCTAssertNil(draft.validationMessage)
+        draft.details.append("😀")
+        XCTAssertNotNil(draft.validationMessage)
+    }
+
+    func testReportSuccessRequiresAnExactServerAcknowledgement() {
+        XCTAssertTrue(CloudAbuseReportResponse(
+            reportId: UUID().uuidString,
+            status: "received",
+            duplicate: false
+        ).isAcknowledged)
+        XCTAssertFalse(CloudAbuseReportResponse(
+            reportId: UUID().uuidString,
+            status: "queued",
+            duplicate: false
+        ).isAcknowledged)
+        XCTAssertFalse(CloudAbuseReportResponse(
+            reportId: "not-a-uuid",
+            status: "received",
+            duplicate: false
+        ).isAcknowledged)
+    }
+
+    @MainActor
+    func testReportActionRequiresReceivedServerSyncedSupportedMessage() {
+        let capabilities: MessagingCapabilities = [.abuseReports]
+        var line = CloudAppModel.Line(
+            id: "remote-1",
+            msgId: 1,
+            clientMsgId: "client-1",
+            text: "hello",
+            mine: false,
+            delivery: .sent
+        )
+        XCTAssertTrue(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.mine = true
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.mine = false
+        line.msgId = nil
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.msgId = 1
+        line.kind = "service"
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.kind = "text"
+        line.isDeleted = true
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.isDeleted = false
+        line.delivery = .sending
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.delivery = .failed("offline")
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: capabilities))
+        line.delivery = .seen
+        XCTAssertTrue(CloudAppModel.isReportable(line, capabilities: capabilities))
+        XCTAssertFalse(CloudAppModel.isReportable(line, capabilities: []))
+    }
+
+    func testAccountReportActionRequiresDirectDialogAndCapability() {
+        XCTAssertTrue(CloudAppModel.canReportAccount(
+            dialogType: "direct",
+            capabilities: [.abuseReports]
+        ))
+        XCTAssertFalse(CloudAppModel.canReportAccount(
+            dialogType: "group",
+            capabilities: [.abuseReports]
+        ))
+        XCTAssertFalse(CloudAppModel.canReportAccount(
+            dialogType: "saved",
+            capabilities: [.abuseReports]
+        ))
+        XCTAssertFalse(CloudAppModel.canReportAccount(
+            dialogType: nil,
+            capabilities: [.abuseReports]
+        ))
+        XCTAssertFalse(CloudAppModel.canReportAccount(
+            dialogType: "direct",
+            capabilities: []
+        ))
+    }
+
+    func testSubjectNotFoundDoesNotDisableReportingCapability() {
+        XCTAssertFalse(CloudAppModel.shouldWithdrawAbuseReportCapability(after: CloudAPIError(
+            status: 404,
+            message: "report subject not found",
+            retryAfter: nil,
+            code: "report_subject_not_found"
+        )))
+        XCTAssertTrue(CloudAppModel.shouldWithdrawAbuseReportCapability(after: CloudAPIError(
+            status: 404,
+            message: "not found",
+            retryAfter: nil
+        )))
+        XCTAssertTrue(CloudAppModel.shouldWithdrawAbuseReportCapability(after: CloudAPIError(
+            status: 503,
+            message: "capability unavailable",
+            retryAfter: nil,
+            code: "capability_unavailable"
+        )))
     }
 
     func testSavedCapabilityDistinguishesOfflineUnknownSupportAndWithdrawal() {
@@ -923,6 +1046,31 @@ final class MessagingPresentationTests: XCTestCase {
 
         XCTAssertEqual(model.capabilities, .demo)
         await Task.yield()
+    }
+
+    @MainActor
+    func testAbuseReportingIsNeverRestoredFromAStaleCapabilityCache() {
+        let suite = "toj-report-capability-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let config = CloudConfig(baseURL: URL(string: "https://reports-cache.invalid")!)
+        let cached: MessagingCapabilities = [.replies, .abuseReports]
+        defaults.set(
+            Int(cached.rawValue),
+            forKey: "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
+        )
+
+        let model = CloudAppModel(
+            config: config,
+            useDefaultLocalStore: false,
+            capabilityDefaults: defaults
+        )
+
+        XCTAssertTrue(model.capabilities.contains(.replies))
+        XCTAssertFalse(
+            model.capabilities.contains(.abuseReports),
+            "Safety reporting must appear only after a live operational capability response"
+        )
     }
 
     @MainActor

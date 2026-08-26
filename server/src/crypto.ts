@@ -1,27 +1,109 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual,
+} from "node:crypto";
+import {
+  activeBlindIndex,
+  blindIndexCandidates,
+  blindIndexForKey,
+  type VersionedBlindIndex,
+} from "./blind-index";
 
 // Encryption-at-rest for cloud message bodies (Company A: server CAN decrypt, but disk is never
 // plaintext). AES-256-GCM, key_id + random 96-bit nonce + MANDATORY AAD binding the ciphertext to
 // its (dialog, msg, sender) slot so rows can't be relocated (review S1).
-// M3 dev: one key from env; production replaces with a KMS + per-account wrapping.
+// Legacy dev-v1 compatibility only. Production envelope mode rejects this path for new writes.
 
 const KEY_ID = "dev-v1";
 const TAG_LEN = 16;
 
 function requireOrDev(envName: string, devByte: number): Buffer {
   const b64 = process.env[envName];
-  if (b64) return Buffer.from(b64, "base64");
+  if (b64) {
+    const key = Buffer.from(b64, "base64");
+    if (key.length !== 32) {
+      key.fill(0);
+      throw new Error(`${envName} must decode to 32 bytes`);
+    }
+    return key;
+  }
   if (process.env.NODE_ENV === "production") throw new Error(`${envName} required in production`);
   return Buffer.alloc(32, devByte); // deterministic dev-only key; NEVER ships to prod
 }
 
-const MESSAGE_KEYS: Record<string, Buffer> = { [KEY_ID]: requireOrDev("TOJ_MESSAGE_KEY", 0x07) };
-const HMAC_KEY = requireOrDev("TOJ_HMAC_KEY", 0x0b);
+let cachedLegacyKey: { signature: string; key: Buffer } | null = null;
+let cachedProtocolIdentifierKey: { signature: string; key: Buffer } | null = null;
+
+function legacyMessageKey(): Buffer {
+  // Cache invalidation needs an equality token, not another long-lived copy of the raw secret.
+  const signature = createHash("sha256").update(JSON.stringify([
+    process.env.NODE_ENV ?? "",
+    process.env.TOJ_MESSAGE_KEY ?? "",
+  ])).digest("hex");
+  if (cachedLegacyKey?.signature === signature) return cachedLegacyKey.key;
+  const previous = cachedLegacyKey;
+  cachedLegacyKey = null;
+  previous?.key.fill(0);
+  const key = requireOrDev("TOJ_MESSAGE_KEY", 0x07);
+  cachedLegacyKey = { signature, key };
+  return cachedLegacyKey.key;
+}
+
+/** Legacy/canary startup requires this key; final envelope mode loads it only for an actual read. */
+export function assertLegacyMessageKeyConfigured(): void {
+  void legacyMessageKey();
+}
+
+/**
+ * Media-group fallback IDs are durable wire-protocol state. Their derivation key is deliberately
+ * independent from the rotating blind-index keyring. Before disabling legacy-v1 in production,
+ * operators set TOJ_PROTOCOL_ID_KEY to the existing TOJ_HMAC_KEY value to preserve old retry IDs.
+ */
+function protocolIdentifierKey(): Buffer {
+  const signature = createHash("sha256").update(JSON.stringify([
+    process.env.NODE_ENV ?? "",
+    process.env.TOJ_PROTOCOL_ID_KEY ?? "",
+    process.env.TOJ_HMAC_KEY ?? "",
+    process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED ?? "",
+  ])).digest("hex");
+  if (cachedProtocolIdentifierKey?.signature === signature) {
+    return cachedProtocolIdentifierKey.key;
+  }
+  const previous = cachedProtocolIdentifierKey;
+  cachedProtocolIdentifierKey = null;
+  previous?.key.fill(0);
+  const explicit = process.env.TOJ_PROTOCOL_ID_KEY;
+  if (!explicit && process.env.NODE_ENV === "production"
+    && process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED === "1") {
+    throw new Error("TOJ_PROTOCOL_ID_KEY required before disabling the legacy blind-index key");
+  }
+  const configured = explicit ?? process.env.TOJ_HMAC_KEY;
+  const key = configured
+    ? Buffer.from(configured, "base64")
+    : process.env.NODE_ENV === "production"
+      ? (() => { throw new Error("TOJ_HMAC_KEY required in production"); })()
+      : Buffer.alloc(32, 0x0b);
+  if (key.length !== 32) {
+    key.fill(0);
+    throw new Error(`${explicit ? "TOJ_PROTOCOL_ID_KEY" : "TOJ_HMAC_KEY"} must decode to 32 bytes`);
+  }
+  cachedProtocolIdentifierKey = { signature, key };
+  return key;
+}
+
+export function assertProtocolIdentifierConfiguration(): void {
+  void protocolIdentifierKey();
+}
+
+export function mediaGroupClientMessageIdDigest(clientGroupId: string, index: number): Buffer {
+  return createHmac("sha256", protocolIdentifierKey())
+    .update(`toj/request-fingerprint/media-group-client-message-id/v1|${clientGroupId}:${index}`)
+    .digest();
+}
 
 export type Sealed = { keyId: string; nonce: Buffer; ciphertext: Buffer };
 
 export function seal(plaintext: Buffer | string, aad: Buffer): Sealed {
-  const key = MESSAGE_KEYS[KEY_ID];
+  const key = legacyMessageKey();
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, nonce);
   cipher.setAAD(aad);
@@ -31,8 +113,8 @@ export function seal(plaintext: Buffer | string, aad: Buffer): Sealed {
 }
 
 export function open(sealed: Sealed, aad: Buffer): Buffer {
-  const key = MESSAGE_KEYS[sealed.keyId];
-  if (!key) throw new Error(`unknown key_id ${sealed.keyId}`);
+  if (sealed.keyId !== KEY_ID) throw new Error(`unknown key_id ${sealed.keyId}`);
+  const key = legacyMessageKey();
   const { ciphertext, nonce } = sealed;
   const tag = ciphertext.subarray(ciphertext.length - TAG_LEN);
   const enc = ciphertext.subarray(0, ciphertext.length - TAG_LEN);
@@ -132,12 +214,28 @@ export function mediaFileNameAAD(mediaId: string): Buffer {
   return Buffer.from(`toj/media-filename|${mediaId}`, "utf8");
 }
 
+/** Binds a moderation evidence bundle to the report and submitting account. */
+export function reportEvidenceAAD(reportId: string, reporterAccountId: string): Buffer {
+  return Buffer.from(`toj/report-evidence|${reportId}|${reporterAccountId}`, "utf8");
+}
+
+/** Binds an encrypted operator note to one report, action, and operator identity. */
+export function reportActionNoteAAD(reportId: string, action: string, operatorId: string): Buffer {
+  return Buffer.from(`toj/report-action-note|${reportId}|${action}|${operatorId}`, "utf8");
+}
+
 /**
  * Hides raw whole-file and chunk SHA-256 fingerprints from a database-only compromise while
  * preserving constant-time integrity and resumable-upload comparisons.
  */
 export function mediaDigestHMAC(digest: Uint8Array): Buffer {
-  return createHmac("sha256", HMAC_KEY).update("toj/media-digest/v1|").update(digest).digest();
+  return mediaDigestIndex(digest).digest;
+}
+export function mediaDigestIndex(digest: Uint8Array, keyId?: string): VersionedBlindIndex {
+  const legacy = Buffer.concat([Buffer.from("toj/media-digest/v1|"), Buffer.from(digest)]);
+  return keyId
+    ? blindIndexForKey(keyId, "media-digest", digest, legacy)
+    : activeBlindIndex("media-digest", digest, legacy);
 }
 
 /** Opaque, domain-separated idempotency fingerprint. Database readers cannot test plaintext. */
@@ -145,47 +243,100 @@ export function requestFingerprintHMAC(
   domain:
     | "draft-mutation"
     | "message-send"
+    | "message-send-v2"
     | "media-group-send"
-    | "media-group-client-message-id"
     | "chat-folder-mutation"
     | "scheduled-delivery-mutation"
+    | "abuse-report"
     | "messaging-feature",
   canonicalPayload: Uint8Array | string,
 ): Buffer {
-  return createHmac("sha256", HMAC_KEY)
-    .update(`toj/request-fingerprint/${domain}/v1|`)
-    .update(canonicalPayload)
-    .digest();
+  return requestFingerprintIndex(domain, canonicalPayload).digest;
+}
+export function requestFingerprintIndex(
+  domain:
+    | "draft-mutation"
+    | "message-send"
+    | "message-send-v2"
+    | "media-group-send"
+    | "chat-folder-mutation"
+    | "scheduled-delivery-mutation"
+    | "abuse-report"
+    | "messaging-feature",
+  canonicalPayload: Uint8Array | string,
+  keyId?: string,
+): VersionedBlindIndex {
+  const payload = typeof canonicalPayload === "string"
+    ? Buffer.from(canonicalPayload, "utf8") : Buffer.from(canonicalPayload);
+  const legacy = Buffer.concat([
+    Buffer.from(`toj/request-fingerprint/${domain}/v1|`),
+    payload,
+  ]);
+  return keyId
+    ? blindIndexForKey(keyId, domain, payload, legacy)
+    : activeBlindIndex(domain, payload, legacy);
 }
 
 /** A keyed lookup lets the queue coalesce URLs without indexing their plaintext. */
 export function linkPreviewLookupHMAC(normalizedURL: string): Buffer {
-  return createHmac("sha256", HMAC_KEY)
-    .update("toj/link-preview-url/v1|")
-    .update(normalizedURL)
-    .digest();
+  return linkPreviewLookupIndex(normalizedURL).digest;
+}
+export function linkPreviewLookupIndex(normalizedURL: string, keyId?: string): VersionedBlindIndex {
+  const legacy = Buffer.from(`toj/link-preview-url/v1|${normalizedURL}`, "utf8");
+  return keyId
+    ? blindIndexForKey(keyId, "link-preview-url", normalizedURL, legacy)
+    : activeBlindIndex("link-preview-url", normalizedURL, legacy);
+}
+export function linkPreviewLookupCandidates(normalizedURL: string): VersionedBlindIndex[] {
+  const legacy = Buffer.from(`toj/link-preview-url/v1|${normalizedURL}`, "utf8");
+  return blindIndexCandidates("link-preview-url", normalizedURL, legacy);
 }
 
 export function linkPreviewAssetDigestHMAC(bytes: Uint8Array): Buffer {
-  return createHmac("sha256", HMAC_KEY)
-    .update("toj/link-preview-asset/v1|")
-    .update(bytes)
-    .digest();
+  return linkPreviewAssetDigestIndex(bytes).digest;
+}
+export function linkPreviewAssetDigestIndex(bytes: Uint8Array, keyId?: string): VersionedBlindIndex {
+  const input = Buffer.from(bytes);
+  const legacy = Buffer.concat([Buffer.from("toj/link-preview-asset/v1|"), input]);
+  return keyId
+    ? blindIndexForKey(keyId, "link-preview-asset", input, legacy)
+    : activeBlindIndex("link-preview-asset", input, legacy);
 }
 
 export function normalizePhone(p: string): string {
   return p.replace(/[^\d+]/g, "");
 }
 export function phoneLookupHash(e164: string): Buffer {
-  return createHmac("sha256", HMAC_KEY).update(normalizePhone(e164)).digest();
+  return phoneLookupIndex(e164).digest;
+}
+export function phoneLookupIndex(e164: string, keyId?: string): VersionedBlindIndex {
+  const normalized = normalizePhone(e164);
+  return keyId
+    ? blindIndexForKey(keyId, "phone-lookup", normalized)
+    : activeBlindIndex("phone-lookup", normalized);
+}
+export function phoneLookupCandidates(e164: string): VersionedBlindIndex[] {
+  return blindIndexCandidates("phone-lookup", normalizePhone(e164));
 }
 export function codeHash(code: string, salt?: Uint8Array): Buffer {
-  const hmac = createHmac("sha256", HMAC_KEY);
-  if (salt) hmac.update(salt);
-  return hmac.update(code).digest();
+  return codeHashIndex(code, salt).digest;
+}
+export function codeHashIndex(code: string, salt?: Uint8Array, keyId?: string): VersionedBlindIndex {
+  const input = Buffer.concat([salt ? Buffer.from(salt) : Buffer.alloc(0), Buffer.from(code)]);
+  return keyId
+    ? blindIndexForKey(keyId, "otp-code", input)
+    : activeBlindIndex("otp-code", input);
 }
 export function hashToken(token: string): Buffer {
-  return createHmac("sha256", HMAC_KEY).update(token).digest();
+  return tokenHashIndex(token).digest;
+}
+export function tokenHashIndex(token: string, keyId?: string): VersionedBlindIndex {
+  return keyId
+    ? blindIndexForKey(keyId, "opaque-token", token)
+    : activeBlindIndex("opaque-token", token);
+}
+export function tokenHashCandidates(token: string): VersionedBlindIndex[] {
+  return blindIndexCandidates("opaque-token", token);
 }
 export function constantTimeEqual(a: Buffer, b: Buffer): boolean {
   return a.length === b.length && timingSafeEqual(a, b);

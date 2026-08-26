@@ -15,8 +15,9 @@ import {
   AuthError,
   type OTPDelivery,
 } from "./auth";
-import { bodyAAD, hashToken, mediaFileNameAAD, open, pushTokenAAD } from "./crypto";
-import { CLOUD_CAPABILITIES, startCloudServer } from "./cloud";
+import { bodyAAD, hashToken, mediaFileNameAAD, pushTokenAAD } from "./crypto";
+import { openForScope } from "./envelope-crypto";
+import { CLOUD_CAPABILITIES, revalidateSocketSessions, startCloudServer } from "./cloud";
 import { updateDialogPreferences } from "./dialog-preferences";
 import { profilePhotosSchemaReadiness, updateProfilePhoto } from "./profile-photos";
 import {
@@ -31,6 +32,7 @@ import {
   buildAPNsPayload,
   processPushBatch,
   registerPushToken,
+  registerVoIPPushToken,
   type APNsSendRequest,
   type APNsSendResult,
   type PushSender,
@@ -39,6 +41,7 @@ import {
   getBootstrapDialogsPage,
   getDifference,
   getHistory,
+  loadProfiles,
   getOrCreateDirectDialog,
   readHistory,
   sendMessage,
@@ -68,9 +71,13 @@ const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj
 const db = makeSql(TEST_URL);
 
 async function resetDb() {
+  delete process.env.TOJ_BLIND_INDEX_KEYRING;
+  delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
   await db`
     TRUNCATE
-      user_reports,
+      abuse_report_actions,
+      abuse_report_submission_budgets,
+      abuse_reports,
       content_access_audit,
       bootstrap_snapshot_dialogs,
       bootstrap_snapshots,
@@ -156,15 +163,27 @@ class StubPushSender implements PushSender {
   }
 }
 
-class RotatingPushSender implements PushSender {
-  constructor(
-    private readonly rotate: () => Promise<void>,
-    private readonly response: APNsSendResult,
-  ) {}
+class PausedPushSender implements PushSender {
+  requests: APNsSendRequest[] = [];
+  readonly started: Promise<void>;
+  private readonly releasePromise: Promise<void>;
+  private markStarted!: () => void;
+  private releaseSend!: () => void;
 
-  async send(_request: APNsSendRequest): Promise<APNsSendResult> {
-    await this.rotate();
+  constructor(private readonly response: APNsSendResult) {
+    this.started = new Promise((resolve) => { this.markStarted = resolve; });
+    this.releasePromise = new Promise((resolve) => { this.releaseSend = resolve; });
+  }
+
+  async send(request: APNsSendRequest): Promise<APNsSendResult> {
+    this.requests.push(request);
+    this.markStarted();
+    await this.releasePromise;
     return this.response;
+  }
+
+  release(): void {
+    this.releaseSend();
   }
 }
 
@@ -248,7 +267,9 @@ describe("M3 cloud sync", () => {
   test("production refuses to issue an OTP without a delivery adapter", async () => {
     const previous = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
+    const previousHmacKey = process.env.TOJ_HMAC_KEY;
     process.env.NODE_ENV = "production";
+    process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x31).toString("base64");
     delete process.env.TOJ_RETURN_OTP;
     let error: unknown;
     try { await startVerification(db, testPhone(131)); }
@@ -258,6 +279,8 @@ describe("M3 cloud sync", () => {
       else process.env.NODE_ENV = previous;
       if (previousReturnOTP === undefined) delete process.env.TOJ_RETURN_OTP;
       else process.env.TOJ_RETURN_OTP = previousReturnOTP;
+      if (previousHmacKey === undefined) delete process.env.TOJ_HMAC_KEY;
+      else process.env.TOJ_HMAC_KEY = previousHmacKey;
     }
     expect(error).toBeInstanceOf(AuthError);
     expect((error as AuthError).status).toBe(503);
@@ -268,7 +291,9 @@ describe("M3 cloud sync", () => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
     const previousAllowlist = process.env.TOJ_DEV_OTP_ALLOWLIST;
+    const previousHmacKey = process.env.TOJ_HMAC_KEY;
     process.env.NODE_ENV = "production";
+    process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x32).toString("base64");
     process.env.TOJ_RETURN_OTP = "1";
     delete process.env.TOJ_DEV_OTP_ALLOWLIST;
     const phone = testPhone(132);
@@ -285,6 +310,8 @@ describe("M3 cloud sync", () => {
       else process.env.TOJ_RETURN_OTP = previousReturnOTP;
       if (previousAllowlist === undefined) delete process.env.TOJ_DEV_OTP_ALLOWLIST;
       else process.env.TOJ_DEV_OTP_ALLOWLIST = previousAllowlist;
+      if (previousHmacKey === undefined) delete process.env.TOJ_HMAC_KEY;
+      else process.env.TOJ_HMAC_KEY = previousHmacKey;
     }
   });
 
@@ -321,6 +348,7 @@ describe("M3 cloud sync", () => {
     await db`UPDATE accounts SET username = 'alice_delete' WHERE id = ${alice.accountId}`;
     const secondDevice = await addIOSDevice(alice.accountId);
     await registerPushToken(db, secondDevice.deviceId, "88".repeat(32), "sandbox");
+    await registerVoIPPushToken(db, secondDevice.deviceId, "99".repeat(32), "sandbox");
     const dialog = await getOrCreateDirectDialog(db, alice.accountId, bob.accountId);
     await updateDialogPreferences(db, {
       accountId: alice.accountId,
@@ -340,6 +368,10 @@ describe("M3 cloud sync", () => {
 
     const original = (await db`
       SELECT phone_lookup_hash, phone_e164_ciphertext FROM accounts WHERE id = ${alice.accountId}`)[0];
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "identity-v2": Buffer.alloc(32, 0x6a).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "identity-v2";
     const deletion = await startAccountDeletion(db, alice.accountId);
     expect(deletion.code).toMatch(/^\d{6}$/);
     const activeChallenge = (await db`
@@ -380,8 +412,14 @@ describe("M3 cloud sync", () => {
       SELECT id FROM bootstrap_snapshots
       WHERE account_id = ${alice.accountId}`).toHaveLength(0);
     const erasedDevice = (await db`
-      SELECT push_token_hash, device_name FROM devices WHERE id = ${secondDevice.deviceId}`)[0];
+      SELECT auth_token_key_id, push_token_hash, push_token_hash_key_id,
+        voip_push_token_hash, voip_push_token_hash_key_id, device_name
+      FROM devices WHERE id = ${secondDevice.deviceId}`)[0];
     expect(erasedDevice.push_token_hash).toBeNull();
+    expect(erasedDevice.push_token_hash_key_id).toBeNull();
+    expect(erasedDevice.voip_push_token_hash).toBeNull();
+    expect(erasedDevice.voip_push_token_hash_key_id).toBeNull();
+    expect(erasedDevice.auth_token_key_id).toBe("random-deleted");
     expect(erasedDevice.device_name).toBeNull();
     expect(await db`SELECT id FROM otp_challenges WHERE phone_lookup_hash = ${Buffer.from(original.phone_lookup_hash)}`)
       .toHaveLength(0);
@@ -642,6 +680,21 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("session reconciliation closes a socket after a missed ban notification", async () => {
+    const session = await makeAccount(testPhone(151), "Reconciled");
+    const closures: Array<{ code: number; reason: string }> = [];
+    const socket = {
+      data: { accountId: session.accountId, deviceId: session.deviceId },
+      close(code: number, reason: string) { closures.push({ code, reason }); },
+    };
+    const sockets = new Map([[session.accountId, new Set([socket])]]);
+    // Deliberately omit pg_notify to model a listener disconnect or lost notification. The server
+    // invokes this same database reconciliation pass every five seconds in production.
+    await db`UPDATE accounts SET status = 'banned' WHERE id = ${session.accountId}`;
+    await revalidateSocketSessions(db, sockets as any);
+    expect(closures).toEqual([{ code: 4002, reason: "account or device disabled" }]);
+  });
+
   test("operations endpoints expose safe readiness, correlation IDs, and protected metrics", async () => {
     const previousMetricsToken = process.env.TOJ_METRICS_TOKEN;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
@@ -860,11 +913,11 @@ describe("M3 cloud sync", () => {
       FROM devices WHERE id = ${first.deviceId}`)[0];
     expect(stored.push_token_hash).not.toBeNull();
     expect(Buffer.from(stored.push_token_ciphertext).includes(Buffer.from(token))).toBe(false);
-    expect(open({
+    expect((await openForScope(db, { kind: "account", accountId: first.accountId }, {
       keyId: stored.push_token_key_id,
       nonce: Buffer.from(stored.push_token_nonce),
       ciphertext: Buffer.from(stored.push_token_ciphertext),
-    }, pushTokenAAD(first.deviceId)).toString("utf8")).toBe(token);
+    }, pushTokenAAD(first.deviceId))).toString("utf8")).toBe(token);
 
     const second = await addIOSDevice(first.accountId);
     await registerPushToken(db, second.deviceId, token.toUpperCase(), "sandbox");
@@ -946,7 +999,21 @@ describe("M3 cloud sync", () => {
 
   test("a revoked device cannot commit a message after sign-out", async () => {
     const { alice, dialogId } = await makePair();
+    await registerPushToken(db, alice.deviceId, "77".repeat(32), "sandbox");
+    await registerVoIPPushToken(db, alice.deviceId, "66".repeat(32), "sandbox");
     await revokeDevice(db, alice.accountId, alice.deviceId);
+    const revoked = (await db`
+      SELECT auth_token_key_id, push_token_hash, push_token_hash_key_id,
+        voip_push_token_hash, voip_push_token_hash_key_id
+      FROM devices WHERE id = ${alice.deviceId}`)[0];
+    expect(revoked).toMatchObject({
+      auth_token_key_id: "random-deleted",
+      push_token_hash: null,
+      push_token_hash_key_id: null,
+      voip_push_token_hash: null,
+      voip_push_token_hash_key_id: null,
+    });
+    await expect(resolveDevice(db, alice.token)).rejects.toBeInstanceOf(AuthError);
     await expect(sendMessage(db, {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
       dialogId, clientMsgId: crypto.randomUUID(), body: "must not send",
@@ -990,7 +1057,7 @@ describe("M3 cloud sync", () => {
     });
   });
 
-  test("stale APNs rejection cannot erase a rotated token or newer delivery", async () => {
+  test("stale APNs rejection cannot erase a concurrently rotated token or newer delivery", async () => {
     const { alice, bob, dialogId } = await makePair();
     const oldToken = "66".repeat(32);
     const newToken = "77".repeat(32);
@@ -1004,7 +1071,11 @@ describe("M3 cloud sync", () => {
       body: "old token delivery",
     });
 
-    const sender = new RotatingPushSender(async () => {
+    const sender = new PausedPushSender({ status: 410, reason: "Unregistered" });
+    const processing = processPushBatch(db, sender, 1);
+    await sender.started;
+    let rotationCommitted = false;
+    const rotation = (async () => {
       await registerPushToken(db, bob.deviceId, newToken, "sandbox");
       await sendMessage(db, {
         senderAccountId: alice.accountId,
@@ -1013,23 +1084,87 @@ describe("M3 cloud sync", () => {
         clientMsgId: crypto.randomUUID(),
         body: "new token delivery",
       });
-    }, { status: 410, reason: "Unregistered" });
+      rotationCommitted = true;
+    })();
 
-    expect(await processPushBatch(db, sender, 1)).toBe(1);
+    await Bun.sleep(50);
+    expect(rotationCommitted).toBe(false);
+    sender.release();
+    expect(await processing).toBe(1);
+    await rotation;
     const device = (await db`
       SELECT push_token_ciphertext, push_token_nonce, push_token_key_id
       FROM devices WHERE id = ${bob.deviceId}`)[0];
-    expect(open({
+    expect((await openForScope(db, { kind: "account", accountId: bob.accountId }, {
       keyId: device.push_token_key_id,
       nonce: Buffer.from(device.push_token_nonce),
       ciphertext: Buffer.from(device.push_token_ciphertext),
-    }, pushTokenAAD(bob.deviceId)).toString("utf8")).toBe(newToken);
+    }, pushTokenAAD(bob.deviceId))).toString("utf8")).toBe(newToken);
 
     const deliveries = await db`
       SELECT status, last_error FROM push_deliveries ORDER BY created_at`;
     expect(deliveries).toHaveLength(2);
     expect(deliveries[0]).toMatchObject({ status: "dead", last_error: "Unregistered" });
     expect(deliveries[1]).toMatchObject({ status: "pending", last_error: null });
+  });
+
+  test("account bans and ordinary APNs sends have a single transaction ordering", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    await registerPushToken(db, bob.deviceId, "88".repeat(32), "sandbox");
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "ban race",
+    });
+
+    const sender = new PausedPushSender({ status: 200, apnsId: "before-ban" });
+    const processing = processPushBatch(db, sender, 1);
+    await sender.started;
+    let banCommitted = false;
+    const ban = db.begin(async (tx) => {
+      await tx`UPDATE accounts SET status = 'banned' WHERE id = ${bob.accountId}`;
+      await tx`UPDATE devices SET revoked_at = now(), push_token_hash = NULL,
+        push_token_hash_key_id = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+        push_token_key_id = NULL, push_environment = NULL WHERE id = ${bob.deviceId}`;
+      await tx`UPDATE push_deliveries SET status = 'dead', last_error = 'account banned',
+        claimed_at = NULL WHERE account_id = ${bob.accountId} AND status IN ('pending','sending')`;
+    }).then(() => { banCommitted = true; });
+
+    await Bun.sleep(50);
+    expect(banCommitted).toBe(false);
+    sender.release();
+    expect(await processing).toBe(1);
+    await ban;
+    expect(sender.requests).toHaveLength(1);
+    expect((await db`SELECT status FROM accounts WHERE id = ${bob.accountId}`)[0].status)
+      .toBe("banned");
+    expect((await db`SELECT status, last_error FROM push_deliveries`)[0])
+      .toMatchObject({ status: "sent", last_error: null });
+
+    const carol = await makeAccount(testPhone(160), "Carol");
+    const dana = await makeAccount(testPhone(161), "Dana");
+    const secondDialog = await getOrCreateDirectDialog(db, carol.accountId, dana.accountId);
+    await registerPushToken(db, dana.deviceId, "99".repeat(32), "sandbox");
+    await sendMessage(db, {
+      senderAccountId: carol.accountId,
+      senderDeviceId: carol.deviceId,
+      dialogId: secondDialog.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "ban commits first",
+    });
+    await db.begin(async (tx) => {
+      await tx`UPDATE accounts SET status = 'banned' WHERE id = ${dana.accountId}`;
+      await tx`UPDATE devices SET revoked_at = now(), push_token_hash = NULL,
+        push_token_hash_key_id = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+        push_token_key_id = NULL, push_environment = NULL WHERE id = ${dana.deviceId}`;
+      await tx`UPDATE push_deliveries SET status = 'dead', last_error = 'account banned',
+        claimed_at = NULL WHERE account_id = ${dana.accountId} AND status IN ('pending','sending')`;
+    });
+    const afterBan = new StubPushSender([{ status: 200 }]);
+    expect(await processPushBatch(db, afterBan)).toBe(0);
+    expect(afterBan.requests).toHaveLength(0);
   });
 
   test("push worker retries transient APNs failures without dropping the delivery", async () => {
@@ -1144,6 +1279,63 @@ describe("M3 cloud sync", () => {
         msg_id: String(first.msgId),
         sender_pts: String(first.senderPts),
       });
+  });
+
+  test("send retries remain idempotent across blind-index key rotation", async () => {
+    const { alice, dialogId } = await makePair();
+    const clientMsgId = crypto.randomUUID();
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId,
+      body: "retry across blind-index rotation",
+    };
+    const first = await sendMessage(db, request);
+    expect((await db`
+      SELECT fingerprint_key_id FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0]
+      .fingerprint_key_id).toBe("legacy-v1");
+    expect((await db`
+      SELECT send_fingerprint_key_id FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0]
+      .send_fingerprint_key_id).toBe("legacy-v1");
+
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "requests-v2": Buffer.alloc(32, 0x72).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "requests-v2";
+
+    const receiptRetry = await sendMessage(db, request);
+    expect(receiptRetry).toMatchObject({ duplicate: true, msgId: first.msgId });
+    expect((await db`
+      SELECT fingerprint_key_id FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0]
+      .fingerprint_key_id).toBe("requests-v2");
+
+    await db`DELETE FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`;
+    const canonicalRetry = await sendMessage(db, request);
+    expect(canonicalRetry).toMatchObject({ duplicate: true, msgId: first.msgId });
+    expect((await db`
+      SELECT fingerprint_key_id FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0]
+      .fingerprint_key_id).toBe("requests-v2");
+    expect((await db`
+      SELECT send_fingerprint_key_id FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0]
+      .send_fingerprint_key_id).toBe("requests-v2");
+    expect(Number((await db`
+      SELECT count(*) AS count FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0].count))
+      .toBe(1);
+
+    const newClientMsgId = crypto.randomUUID();
+    await sendMessage(db, { ...request, clientMsgId: newClientMsgId, body: "new key" });
+    expect((await db`
+      SELECT send_fingerprint_key_id FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${newClientMsgId}`)[0]
+      .send_fingerprint_key_id).toBe("requests-v2");
   });
 
   test("replies survive difference, history, and bootstrap contracts", async () => {
@@ -1430,11 +1622,11 @@ describe("M3 cloud sync", () => {
     const row = (await db`
       SELECT body_key_id, body_nonce, body_ciphertext, sender_account_id
       FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${sent.msgId}`)[0];
-    const liveBody = open({
+    const liveBody = (await openForScope(db, { kind: "account", accountId: row.sender_account_id }, {
       keyId: row.body_key_id,
       nonce: Buffer.from(row.body_nonce),
       ciphertext: Buffer.from(row.body_ciphertext),
-    }, bodyAAD(dialogId, sent.msgId, row.sender_account_id)).toString("utf8");
+    }, bodyAAD(dialogId, sent.msgId, row.sender_account_id))).toString("utf8");
     expect(liveBody).toBe("");
   });
 
@@ -2521,11 +2713,11 @@ describe("M3 cloud sync", () => {
         FROM media_objects WHERE id = ${first.mediaId}`)[0];
       expect(metadata.file_name).toBeNull();
       expect(Buffer.from(metadata.file_name_ciphertext).includes(Buffer.from("statement.pdf"))).toBe(false);
-      expect(open({
+      expect((await openForScope(db, { kind: "account", accountId: alice.accountId }, {
         keyId: metadata.file_name_key_id,
         nonce: Buffer.from(metadata.file_name_nonce),
         ciphertext: Buffer.from(metadata.file_name_ciphertext),
-      }, mediaFileNameAAD(first.mediaId)).toString("utf8")).toBe("statement.pdf");
+      }, mediaFileNameAAD(first.mediaId))).toString("utf8")).toBe("statement.pdf");
       await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
         kind: "file", contentType: "application/pdf", byteSize: 400, sha256: "11".repeat(32),
       })).rejects.toEqual(expect.objectContaining<Partial<MediaError>>({ status: 413 }));
@@ -2704,6 +2896,14 @@ describe("M3 cloud sync", () => {
     expect(attempts.filter((item) => item.status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter((item) => item.status === "rejected")[0])
       .toMatchObject({ reason: expect.objectContaining({ status: 409 }) });
+    expect(await lookupAccountByUsername(db, first.accountId, "@UNIQUE_NAME")).not.toBeNull();
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "username-v2": Buffer.alloc(32, 0x6b).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "username-v2";
+    expect(await lookupAccountByUsername(db, first.accountId, "unique_name")).not.toBeNull();
+    expect(Number((await db`SELECT count(*) AS count FROM contact_lookup_attempts
+      WHERE requester_account_id = ${first.accountId}`)[0].count)).toBe(1);
     expect(await lookupAccountByUsername(db, first.accountId, "not_valid!")).toBeNull();
     await expect(updateProfile(db, first.accountId, first.deviceId, { ...profile, username: "admin" }))
       .rejects.toMatchObject({ status: 400 });
@@ -2748,6 +2948,86 @@ describe("M3 cloud sync", () => {
     });
     expect(committed.pushes.map((push) => push.accountId).sort())
       .toEqual([alice.accountId, bob.accountId].sort());
+
+    const previousProfilePhotoFlag = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED;
+    const requestBody = JSON.stringify({
+      mediaId: upload.mediaId,
+      clientMutationId: mutationId,
+      basePhotoRevision: 0,
+    });
+    process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED = "0";
+    const hiddenServer = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    try {
+      const hiddenResponse = await fetch(
+        `http://127.0.0.1:${hiddenServer.port}/v1/profile/photo`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${alice.token}`,
+            "content-type": "application/json",
+          },
+          body: requestBody,
+        },
+      );
+      expect(hiddenResponse.status).toBe(404);
+      expect(await hiddenResponse.json()).toMatchObject({ code: "capability_unavailable" });
+    } finally {
+      hiddenServer.stop(true);
+    }
+
+    process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED = "1";
+    const routeServer = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    try {
+      const endpoint = `http://127.0.0.1:${routeServer.port}/v1/profile/photo`;
+      const unauthorized = await fetch(endpoint, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: requestBody,
+      });
+      expect(unauthorized.status).toBe(401);
+
+      const inaccessible = await fetch(endpoint, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${outsider.token}`,
+          "content-type": "application/json",
+        },
+        body: requestBody,
+      });
+      expect(inaccessible.status).toBe(404);
+
+      const duplicate = await fetch(endpoint, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${alice.token}`,
+          "content-type": "application/json",
+        },
+        body: requestBody,
+      });
+      expect(duplicate.status).toBe(200);
+      expect(await duplicate.json()).toMatchObject({
+        duplicate: true,
+        committedPhotoRevision: 1,
+        profile: {
+          accountId: alice.accountId,
+          photoRevision: 1,
+          photo: { id: upload.mediaId, file_name: "avatar.jpg" },
+        },
+      });
+    } finally {
+      routeServer.stop(true);
+      if (previousProfilePhotoFlag === undefined) {
+        delete process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED;
+      } else {
+        process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED = previousProfilePhotoFlag;
+      }
+    }
+
+    expect(await loadProfiles(db, [alice.accountId])).toContainEqual(expect.objectContaining({
+      accountId: alice.accountId,
+      photoRevision: 1,
+      photo: expect.objectContaining({ id: upload.mediaId, file_name: "avatar.jpg" }),
+    }));
     expect((await lookupAccountByPhone(db, outsider.accountId, "+16505550100"))?.photo).toBeNull();
     expect((await downloadMediaChunk(db, bob.accountId, upload.mediaId, 0)).bytes).toEqual(bytes);
     await expect(downloadMediaChunk(db, outsider.accountId, upload.mediaId, 0))
@@ -2769,7 +3049,7 @@ describe("M3 cloud sync", () => {
       expect.objectContaining({
         accountId: alice.accountId,
         photoRevision: 1,
-        photo: expect.objectContaining({ id: upload.mediaId }),
+        photo: expect.objectContaining({ id: upload.mediaId, file_name: "avatar.jpg" }),
       }),
     );
 

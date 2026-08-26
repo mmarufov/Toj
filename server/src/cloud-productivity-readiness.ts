@@ -5,6 +5,7 @@ import { recordHeartbeatCacheDatabaseError } from "./productivity-runtime";
 export type CloudProductivitySchemaState = {
   ready: boolean;
   missingTables: string[];
+  missingColumns: string[];
   missingIndexes: string[];
   missingMigrations: string[];
   eventConstraintReady: boolean;
@@ -42,12 +43,31 @@ const REQUIRED_INDEXES = [
   "message_link_previews_snapshot_idx",
   "link_preview_waiters_message_idx",
   "link_preview_cache_fanout_pending_idx",
+  "chat_folders_title_key_migration_idx",
+  "scheduled_items_payload_key_migration_idx",
+  "link_preview_cache_key_migration_idx",
+  "message_link_preview_key_migration_idx",
+  "link_preview_snapshot_url_key_migration_idx",
+  "link_preview_snapshot_metadata_key_migration_idx",
+  "link_preview_assets_key_migration_idx",
 ] as const;
+
+const REQUIRED_COLUMNS = {
+  chat_folder_mutation_requests: ["request_fingerprint", "fingerprint_key_id"],
+  scheduled_delivery_mutation_requests: ["request_fingerprint", "fingerprint_key_id"],
+  link_preview_assets: ["digest_key_id"],
+  link_preview_cache_entries: ["url_lookup_key_id"],
+  message_link_previews: ["url_lookup_key_id"],
+  link_preview_waiters: ["url_lookup_key_id"],
+} as const;
 
 const REQUIRED_MIGRATIONS = [
   "cloud-productivity-expand-v1",
   "cloud-productivity-indexes-v1",
   "cloud-productivity-contract-v1",
+  "cloud-productivity-encryption-expand-v2",
+  "cloud-productivity-encryption-indexes-v2",
+  "cloud-productivity-encryption-contract-v2",
   "account-private-cleanup-v2",
 ] as const;
 
@@ -91,6 +111,16 @@ export async function cloudProductivitySchemaState(
     const missingTables = tableRows
       .filter((row: any) => !row.present)
       .map((row: any) => String(row.name));
+
+    const requiredColumnNames = Object.entries(REQUIRED_COLUMNS)
+      .flatMap(([table, columns]) => columns.map((column) => `${table}.${column}`));
+    const columnRows = await sql`
+      SELECT table_name || '.' || column_name AS name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = ANY(${sql.array(Object.keys(REQUIRED_COLUMNS), "text")}::text[])`;
+    const presentColumns = new Set(columnRows.map((row: any) => String(row.name)));
+    const missingColumns = requiredColumnNames.filter((name) => !presentColumns.has(name));
 
     const indexRows = await sql`
       SELECT required.name,
@@ -145,11 +175,13 @@ export async function cloudProductivitySchemaState(
 
     return {
       ready: missingTables.length === 0
+        && missingColumns.length === 0
         && missingIndexes.length === 0
         && missingMigrations.length === 0
         && eventConstraintReady
         && fanoutPendingReady,
       missingTables,
+      missingColumns,
       missingIndexes,
       missingMigrations,
       eventConstraintReady,

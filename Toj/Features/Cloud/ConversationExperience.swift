@@ -79,6 +79,7 @@ struct TojConversationExperience: View {
     @State private var detailsLine: CloudAppModel.Line?
     @State private var deleteLine: CloudAppModel.Line?
     @State private var reactionLine: CloudAppModel.Line?
+    @State private var reportLine: CloudAppModel.Line?
     @State private var isAtBottom = true
     @State private var shouldFollowLatest = true
     @State private var didApplyOpeningAnchor = false
@@ -287,6 +288,21 @@ struct TojConversationExperience: View {
             MessageDetailsView(line: line)
                 .presentationDetents([.height(310)])
                 .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $reportLine) { line in
+            AbuseReportSheet(
+                subjectKind: .message,
+                submit: { reason, details, clientReportId in
+                    await model.submitMessageReport(
+                        line,
+                        reason: reason,
+                        details: details,
+                        clientReportId: clientReportId
+                    )
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
         }
     }
 
@@ -557,9 +573,15 @@ struct TojConversationExperience: View {
                             Text("Notes and files for your Toj account"),
                             icon: "bookmark.fill"
                         )
+                        .accessibilityLabel(CloudChatPrivacyPresentation.savedMessagesAccessibilityLabel)
                         .padding(.vertical, 8)
                     } else if !isGroup {
-                        timelinePill(Text("Private conversation"), icon: "lock.fill")
+                        timelinePill(
+                            Text(CloudChatPrivacyPresentation.title),
+                            icon: CloudChatPrivacyPresentation.systemImage
+                        )
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .accessibilityLabel(CloudChatPrivacyPresentation.accessibilityLabel)
                             .padding(.vertical, 8)
                     }
 
@@ -1226,6 +1248,8 @@ struct TojConversationExperience: View {
             model.retryFailedMessage(line)
         case .remove:
             model.removeFailedMessage(line)
+        case .report:
+            reportLine = line
         case .inspect:
             detailsLine = line
         }
@@ -4246,9 +4270,9 @@ private struct SelectedFilePreview: View {
                 Text(ByteCountFormatter.string(fromByteCount: file.byteSize, countStyle: .file))
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(TojTheme.secondaryText)
-                Label("Ready for encrypted upload", systemImage: "lock.fill")
+                Label("Ready for encrypted upload", systemImage: "cloud.fill")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(TojTheme.secure)
+                    .foregroundStyle(TojTheme.secondaryText)
             }
 
             HStack(spacing: 10) {

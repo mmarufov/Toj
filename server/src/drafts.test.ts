@@ -282,9 +282,11 @@ describe("cloud drafts and media groups", () => {
     try {
       await blocker.query(
         `INSERT INTO draft_mutation_tombstones (
-           account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+           account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+           resulting_revision
          )
-         SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+         SELECT account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+                resulting_revision
          FROM draft_mutation_requests
          WHERE account_id = $1 AND operation_id = $2`,
         [alice.accountId, operationId],
@@ -419,6 +421,43 @@ describe("cloud drafts and media groups", () => {
     expect(await db`
       SELECT type FROM account_events
       WHERE account_id = ${bob.accountId} AND type = 'draft.updated'`).toHaveLength(0);
+  });
+
+  test("fallback media-group message IDs survive legacy blind-index retirement", async () => {
+    const previousKeyring = process.env.TOJ_BLIND_INDEX_KEYRING;
+    const previousActive = process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+    const previousDisabled = process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED;
+    const previousProtocolKey = process.env.TOJ_PROTOCOL_ID_KEY;
+    try {
+      process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+        "lookup-v2": Buffer.alloc(32, 0x5a).toString("base64"),
+      });
+      process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "lookup-v2";
+      process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED = "1";
+      process.env.TOJ_PROTOCOL_ID_KEY = Buffer.alloc(32, 0x0b).toString("base64");
+      const { alice, dialogId } = await pair();
+      const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+      const request = {
+        senderAccountId: alice.accountId,
+        senderDeviceId: alice.deviceId,
+        dialogId,
+        clientGroupId: crypto.randomUUID(),
+        items: mediaIds.map((media_id) => ({ media_id })),
+        body: "rotated album",
+      };
+      const sent = await sendMediaGroup(db, request);
+      expect(sent.duplicate).toBe(false);
+      expect((await sendMediaGroup(db, request)).duplicate).toBe(true);
+    } finally {
+      if (previousKeyring == null) delete process.env.TOJ_BLIND_INDEX_KEYRING;
+      else process.env.TOJ_BLIND_INDEX_KEYRING = previousKeyring;
+      if (previousActive == null) delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+      else process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = previousActive;
+      if (previousDisabled == null) delete process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED;
+      else process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED = previousDisabled;
+      if (previousProtocolKey == null) delete process.env.TOJ_PROTOCOL_ID_KEY;
+      else process.env.TOJ_PROTOCOL_ID_KEY = previousProtocolKey;
+    }
   });
 
   test("silent media groups stay silent and cannot collide with alerting idempotency", async () => {
@@ -704,10 +743,11 @@ describe("cloud drafts and media groups", () => {
       await blocker.query(
         `INSERT INTO media_group_send_tombstones (
            sender_account_id, client_group_id, dialog_id, payload_fingerprint,
-           first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+           fingerprint_key_id, first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
          )
          SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint,
-                first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+                fingerprint_key_id, first_msg_id, last_msg_id, sender_pts,
+                cleared_draft_revision
          FROM media_group_send_requests
          WHERE sender_account_id = $1 AND client_group_id = $2`,
         [alice.accountId, clientGroupId],
@@ -861,9 +901,11 @@ describe("cloud drafts and media groups", () => {
     });
     await db`
       INSERT INTO draft_mutation_tombstones (
-        account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+        account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+        resulting_revision
       )
-      SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+      SELECT account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+             resulting_revision
       FROM draft_mutation_requests
       WHERE account_id = ${alice.accountId}
         AND operation_id = ${draftOperationId}`;
@@ -884,10 +926,11 @@ describe("cloud drafts and media groups", () => {
     await db`
       INSERT INTO media_group_send_tombstones (
         sender_account_id, client_group_id, dialog_id, payload_fingerprint,
-        first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+        fingerprint_key_id, first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
       )
       SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint,
-             first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+             fingerprint_key_id, first_msg_id, last_msg_id, sender_pts,
+             cleared_draft_revision
       FROM media_group_send_requests
       WHERE sender_account_id = ${alice.accountId}
         AND client_group_id = ${clientGroupId}`;
