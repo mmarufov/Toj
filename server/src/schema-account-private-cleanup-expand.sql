@@ -47,6 +47,22 @@ BEGIN
   WHERE account_id = target_account_id;
   DELETE FROM public.dialog_preference_action_budgets
   WHERE account_id = target_account_id;
+  DELETE FROM public.profile_photo_mutations
+  WHERE account_id = target_account_id;
+  DELETE FROM public.profile_photo_action_budgets
+  WHERE account_id = target_account_id;
+
+  -- Presence is exact account activity and therefore private deletion state. Dynamic SQL keeps the
+  -- cleanup function deployable during an expand phase in which the presence tables may not exist
+  -- on every database yet.
+  IF to_regclass('public.device_presence_leases') IS NOT NULL THEN
+    EXECUTE 'DELETE FROM public.device_presence_leases WHERE account_id = $1'
+      USING target_account_id;
+  END IF;
+  IF to_regclass('public.account_presence') IS NOT NULL THEN
+    EXECUTE 'DELETE FROM public.account_presence WHERE account_id = $1'
+      USING target_account_id;
+  END IF;
 
   DELETE FROM public.chat_folder_mutation_requests
   WHERE account_id = target_account_id;
@@ -134,6 +150,10 @@ BEGIN
       WHERE dialog.photo_media_id = media.id
     )
     AND NOT EXISTS (
+      SELECT 1 FROM public.accounts AS account
+      WHERE account.profile_photo_media_id = media.id
+    )
+    AND NOT EXISTS (
       SELECT 1 FROM public.draft_attachments AS attachment
       WHERE attachment.media_id = media.id
     );
@@ -148,6 +168,10 @@ AS $$
 BEGIN
   IF OLD.status <> 'deleted' AND NEW.status = 'deleted' THEN
     PERFORM public.toj_cleanup_account_private_state_v1(OLD.id);
+    -- A mixed-version binary may update only status. Clear the reference at the database boundary
+    -- so a private profile photo cannot survive anonymization merely because the caller predates
+    -- profile photos.
+    NEW.profile_photo_media_id := NULL;
   END IF;
   RETURN NEW;
 END
@@ -159,5 +183,40 @@ BEFORE UPDATE OF status ON public.accounts
 FOR EACH ROW
 WHEN (OLD.status IS DISTINCT FROM NEW.status)
 EXECUTE FUNCTION public.toj_cleanup_saved_messages_before_account_delete();
+
+CREATE OR REPLACE FUNCTION public.toj_cleanup_profile_photo_after_account_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  IF OLD.status <> 'deleted' AND NEW.status = 'deleted'
+     AND OLD.profile_photo_media_id IS NOT NULL THEN
+    DELETE FROM public.media_objects AS media
+    WHERE media.id = OLD.profile_photo_media_id
+      AND media.owner_account_id = OLD.id
+      AND NOT EXISTS (
+        SELECT 1 FROM public.messages AS message WHERE message.media_id = media.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM public.dialogs AS dialog WHERE dialog.photo_media_id = media.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM public.accounts AS account WHERE account.profile_photo_media_id = media.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM public.draft_attachments AS attachment WHERE attachment.media_id = media.id
+      );
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+DROP TRIGGER IF EXISTS accounts_cleanup_profile_photo ON public.accounts;
+CREATE TRIGGER accounts_cleanup_profile_photo
+AFTER UPDATE OF status ON public.accounts
+FOR EACH ROW
+WHEN (OLD.status IS DISTINCT FROM NEW.status)
+EXECUTE FUNCTION public.toj_cleanup_profile_photo_after_account_delete();
 
 COMMIT;

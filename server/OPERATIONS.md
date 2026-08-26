@@ -418,6 +418,45 @@ Profile updates are mixed-version safe: an omitted `username` key preserves the 
 while explicit JSON `null` or an empty string clears it. New clients send an explicit null when the
 user removes a handle. Reject non-string, non-null values rather than interpreting them as clears.
 
+## Profile photo rollout
+
+Profile photos are additive and dark by default. Run the ordinary migration first, deploy the
+server with `TOJ_PROFILE_PHOTOS_V1_ENABLED` unset, and confirm that `/v1/capabilities` does not
+advertise `profile_photos_v1`. The server admits the feature only when the purpose-constraint
+migration, account reference/revision constraints, and durable mutation table are all validated.
+
+Ship the compatible client before setting `TOJ_PROFILE_PHOTOS_V1_ENABLED=1` for an internal
+environment. During expansion, monitor the existing route/status metrics for
+`/v1/profile/photo`, media upload/complete latency and 4xx responses, plus cleanup backlog. Alert on
+sustained 409 growth (stale edits or idempotency misuse), terminal upload validation failures,
+unexpected media-download 401/403/404 changes, and a cleanup backlog that does not drain.
+
+Validate with two real accounts and two owner devices under packet loss: set, terminate/relaunch,
+conflicting edits, explicit conflict resolution, removal, partner visibility, membership revocation,
+and cache eviction/redownload. Roll back by clearing `TOJ_PROFILE_PHOTOS_V1_ENABLED`; canonical
+metadata and encrypted pending client work remain intact so a later re-enable can reconcile safely.
+
+## Presence and typing rollout
+
+Presence is dark by default and requires the additive `account_presence` and
+`device_presence_leases` contract. Run the migration before deploying this binary; `/ready` fails
+closed when the contract or expiry indexes are missing.
+
+- `TOJ_PRESENCE_V1_ENABLED=1` enables the authenticated protocol globally.
+- `TOJ_PRESENCE_ALLOWLIST` admits comma-separated internal account UUIDs.
+- `TOJ_PRESENCE_ROLLOUT_PERCENT` is a deterministic account rollout and defaults to zero.
+
+Deploy the schema with admission off, ship the compatible client, then validate foreground,
+background, force-quit, reconnect, multi-device, group membership, and block behavior with an
+allowlisted cohort. Expand only while `toj_presence_expired_leases` stays at zero after a cleanup
+interval and `toj_presence_oldest_expired_seconds` does not grow. Presence metrics contain aggregate
+counts only; never add account or dialog identifiers as labels.
+
+Rollback by setting the percentage to zero or clearing `TOJ_PRESENCE_V1_ENABLED`. Clients remove
+ephemeral online and typing state and show status unavailable; the additive tables and encrypted
+last-seen cache can remain. Do not use `devices.last_seen_at` as user presence: background requests
+also authenticate devices, while presence_v1 records only foreground leases.
+
 ## Account deletion
 
 Account deletion is a reauthenticated two-step flow: authenticated `POST /v1/account/deletion/start`

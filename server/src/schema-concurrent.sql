@@ -28,6 +28,7 @@ WHERE namespace.nspname = 'public'
     'media_group_send_tombstones_dialog_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx',
+    'accounts_profile_photo_media_idx',
     'accounts_phone_blind_key_migration_idx',
     'devices_push_hash_key_backfill_idx',
     'devices_voip_hash_key_backfill_idx',
@@ -121,6 +122,12 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_target_idx
   WHERE target_account_id IS NOT NULL;
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS accounts_username_active_unique_idx
   ON accounts (lower(username)) WHERE username IS NOT NULL AND status IN ('active','limited');
+
+-- PostgreSQL does not index referencing FK columns automatically. This keeps media authorization,
+-- reaping, and account-photo replacement from scanning every account.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS accounts_profile_photo_media_idx
+  ON accounts(profile_photo_media_id)
+  WHERE profile_photo_media_id IS NOT NULL;
 
 -- Temporary-compatible key selectors keep bounded SKIP LOCKED re-encryption batches index driven.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS accounts_phone_key_migration_idx

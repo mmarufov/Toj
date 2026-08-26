@@ -9,6 +9,8 @@ import {
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
 import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
+import { presenceSchemaReadiness } from "./presence";
+import { profilePhotosSchemaReadiness } from "./profile-photos";
 import { cleanupAbuseReports } from "./reports";
 import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 import { expireAcceptedMessages, expiredMessageBacklog } from "./message-expiry";
@@ -102,7 +104,7 @@ export function safeRoute(pathname: string): string {
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
     "/v1/group-calls", "/v1/group-calls/active",
     "/v1/chat-folders", "/v1/scheduled-messages",
-    "/v1/reports",
+    "/v1/presence/query", "/v1/reports",
     "/v1/stickers", "/v1/stickers/preferences", "/v1/giphy/config",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
@@ -375,6 +377,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
+  const presence = await presenceSchemaReadiness(sql);
+  const profilePhotos = await profilePhotosSchemaReadiness(sql);
   const messagingFeatures = await messagingFeatureSchemaState(sql, { bypassCache: true });
   const cloudProductivity = await cloudProductivitySchemaState(sql, { bypassCache: true });
   const authSecurityRow = (await sql`
@@ -411,7 +415,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
       && groupCallSchema.ready && authSecurityReady && messagingFeatures.ready
-      && cloudProductivity.ready
+      && cloudProductivity.ready && presence.ready && profilePhotos.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -426,6 +430,10 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // Maintenance, bootstrap, difference sync, and send paths all touch these relations whenever
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
+    presence,
+    // Profile columns are read by ordinary auth and sync paths even while photo mutation entry
+    // points are dark, so this is an unconditional binary/schema admission contract.
+    profilePhotos: profilePhotos.ready ? "ready" : "incomplete",
     authSecuritySchema: authSecurityReady ? "ready" : "incomplete",
     messagingFeatures,
     cloudProductivity,
@@ -556,6 +564,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
             AND (m.expires_at IS NULL OR m.expires_at > now())
         )
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+        AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.profile_photo_media_id = mo.id)
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_delivery_items item
           JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
@@ -586,6 +595,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
           AND (m.expires_at IS NULL OR m.expires_at > now())
       )
       AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+      AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.profile_photo_media_id = mo.id)
       AND NOT EXISTS (
         SELECT 1 FROM scheduled_delivery_items item
         JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
@@ -878,6 +888,17 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE budget.account_id = doomed.account_id
       AND budget.bucket_started = doomed.bucket_started
     RETURNING budget.account_id`;
+  const profilePhotoBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, bucket_started FROM profile_photo_action_budgets
+      WHERE updated_at < now() - interval '48 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM profile_photo_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
   const scheduledDeliveries = await sql`
     WITH doomed AS (
       SELECT id FROM scheduled_deliveries
@@ -1035,6 +1056,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     blindIndexReceiptsExpired,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
     dialogPreferenceBudgets: dialogPreferenceBudgets.length,
+    profilePhotoBudgets: profilePhotoBudgets.length,
     scheduledDeliveries: scheduledDeliveries.length,
     scheduledBudgets: scheduledBudgets.length,
     folderBudgets: folderBudgets.length,
@@ -1058,6 +1080,7 @@ function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): nu
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
     + value.blindIndexReceiptsExpired
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
+    + value.profilePhotoBudgets
     + value.scheduledDeliveries + value.scheduledBudgets + value.folderBudgets
     + value.previewBudgets + value.previewCache + value.previewSnapshots + value.previewAssets
     + Object.values(value.callData).reduce((sum, count) => sum + count, 0)

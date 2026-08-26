@@ -30,6 +30,7 @@ import {
   submitAbuseReport,
   viewAbuseReport,
 } from "./reports";
+import { setPresenceActivity, startPresenceNotificationListener } from "./presence";
 import { deleteMessage, editMessage, getOrCreateDirectDialog, sendMessage } from "./sync";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
@@ -760,6 +761,69 @@ describe.serial("abuse reports", () => {
     }
   });
 
+  test("account-ban resolution atomically publishes terminal presence and removes every lease", async () => {
+    const previousPresence = process.env.TOJ_PRESENCE_V1_ENABLED;
+    const previousPresenceRollout = process.env.TOJ_PRESENCE_ROLLOUT_PERCENT;
+    process.env.TOJ_PRESENCE_V1_ENABLED = "1";
+    process.env.TOJ_PRESENCE_ROLLOUT_PERCENT = "100";
+    const { alice, bob, dialogId } = await fixture();
+    const connectionId = crypto.randomUUID();
+    await setPresenceActivity(db, {
+      accountId: bob.accountId,
+      deviceId: bob.deviceId,
+      connectionId,
+      active: true,
+    });
+
+    const terminalEvents: any[] = [];
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => { resolveTerminal = resolve; });
+    const stopPresenceListener = startPresenceNotificationListener(TEST_URL, (broadcast) => {
+      if (!broadcast.recipientAccountIds.includes(alice.accountId)) return;
+      const event = broadcast.event as any;
+      if (event.accountId !== bob.accountId) return;
+      terminalEvents.push(event);
+      const hasOffline = terminalEvents.some((candidate) => (
+        candidate.type === "presence_update" && candidate.online === false
+      ));
+      const hasHidden = terminalEvents.some((candidate) => (
+        candidate.type === "presence_visibility" && candidate.visible === false
+      ));
+      if (hasOffline && hasHidden) resolveTerminal();
+    });
+
+    try {
+      // The listener connects asynchronously; wait before the transaction commits its NOTIFYs.
+      await Bun.sleep(100);
+      const submitted = await submitAbuseReport(db, alice.accountId, alice.deviceId, {
+        clientReportId: crypto.randomUUID(), dialogId,
+        subject: { type: "account", accountId: bob.accountId }, reason: "scam",
+      });
+      await claimAbuseReport(db, submitted.reportId, "moderator-1", null);
+      await resolveAbuseReport(db, submitted.reportId, "moderator-1", "account_banned", null);
+      await Promise.race([
+        terminal,
+        Bun.sleep(3_000).then(() => { throw new Error("terminal presence notification timed out"); }),
+      ]);
+
+      expect(terminalEvents).toContainEqual(expect.objectContaining({
+        type: "presence_update", accountId: bob.accountId, online: false,
+      }));
+      expect(terminalEvents).toContainEqual({
+        type: "presence_visibility", accountId: bob.accountId, visible: false,
+      });
+      expect(await db`
+        SELECT connection_id FROM device_presence_leases WHERE account_id = ${bob.accountId}`)
+        .toHaveLength(0);
+    } finally {
+      stopPresenceListener();
+      if (previousPresence === undefined) delete process.env.TOJ_PRESENCE_V1_ENABLED;
+      else process.env.TOJ_PRESENCE_V1_ENABLED = previousPresence;
+      if (previousPresenceRollout === undefined) delete process.env.TOJ_PRESENCE_ROLLOUT_PERCENT;
+      else process.env.TOJ_PRESENCE_ROLLOUT_PERCENT = previousPresenceRollout;
+    }
+  }, 5_000);
+
   test("account bans and VoIP invites have a single transaction ordering", async () => {
     const { alice, bob, dialogId } = await fixture();
     await sendMessage(db, {
@@ -860,29 +924,51 @@ describe.serial("abuse reports", () => {
   });
 
   test("advertises only when schema and all operator gates are ready", async () => {
-    const { alice } = await fixture();
-    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const previousProfilePhotos = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED;
+    const previousPresence = process.env.TOJ_PRESENCE_V1_ENABLED;
+    const previousPresenceRollout = process.env.TOJ_PRESENCE_ROLLOUT_PERCENT;
+    process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED = "1";
+    process.env.TOJ_PRESENCE_V1_ENABLED = "1";
+    process.env.TOJ_PRESENCE_ROLLOUT_PERCENT = "100";
     try {
-      const response = await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`, {
-        headers: { authorization: `Bearer ${alice.token}` },
-      });
-      expect(response.status).toBe(200);
-      expect((await response.json() as { capabilities: string[] }).capabilities)
-        .toContain("abuse_reports_v1");
-      const metrics = await abuseReportMetrics(db);
-      expect(metrics).toContain("toj_abuse_report_schema_available 1");
-    } finally {
-      server.stop(true);
-    }
+      const { alice } = await fixture();
+      const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+      try {
+        const response = await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`, {
+          headers: { authorization: `Bearer ${alice.token}` },
+        });
+        expect(response.status).toBe(200);
+        expect((await response.json() as { capabilities: string[] }).capabilities)
+          .toEqual(expect.arrayContaining([
+            "abuse_reports_v1", "presence_v1", "profile_photos_v1",
+          ]));
+        const metrics = await abuseReportMetrics(db);
+        expect(metrics).toContain("toj_abuse_report_schema_available 1");
+      } finally {
+        server.stop(true);
+      }
 
-    delete process.env.TOJ_ABUSE_REPORTS_OPERATOR_READY;
-    const hiddenServer = startCloudServer(0, db, null, null, { backgroundWorkers: false });
-    try {
-      const response = await fetch(`http://127.0.0.1:${hiddenServer.port}/v1/capabilities`);
-      expect((await response.json() as { capabilities: string[] }).capabilities)
-        .not.toContain("abuse_reports_v1");
+      delete process.env.TOJ_ABUSE_REPORTS_OPERATOR_READY;
+      const hiddenServer = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+      try {
+        const response = await fetch(`http://127.0.0.1:${hiddenServer.port}/v1/capabilities`, {
+          headers: { authorization: `Bearer ${alice.token}` },
+        });
+        const capabilities = (await response.json() as { capabilities: string[] }).capabilities;
+        expect(capabilities).not.toContain("abuse_reports_v1");
+        expect(capabilities).toEqual(expect.arrayContaining([
+          "presence_v1", "profile_photos_v1",
+        ]));
+      } finally {
+        hiddenServer.stop(true);
+      }
     } finally {
-      hiddenServer.stop(true);
+      if (previousProfilePhotos === undefined) delete process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED;
+      else process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED = previousProfilePhotos;
+      if (previousPresence === undefined) delete process.env.TOJ_PRESENCE_V1_ENABLED;
+      else process.env.TOJ_PRESENCE_V1_ENABLED = previousPresence;
+      if (previousPresenceRollout === undefined) delete process.env.TOJ_PRESENCE_ROLLOUT_PERCENT;
+      else process.env.TOJ_PRESENCE_ROLLOUT_PERCENT = previousPresenceRollout;
     }
   });
 });

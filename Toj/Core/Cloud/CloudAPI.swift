@@ -222,6 +222,8 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let bio: String?
     let birthday: String?
     let colorIndex: Int?
+    let photo: CloudMedia?
+    let photoRevision: Int64?
     let profileUpdatedAt: String?
     let peerAccountId: String?
     let sharedDialogIds: [String]?
@@ -255,6 +257,8 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         bio: String? = nil,
         birthday: String? = nil,
         colorIndex: Int? = nil,
+        photo: CloudMedia? = nil,
+        photoRevision: Int64? = nil,
         profileUpdatedAt: String? = nil,
         peerAccountId: String? = nil,
         sharedDialogIds: [String]? = nil,
@@ -287,6 +291,8 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.bio = bio
         self.birthday = birthday
         self.colorIndex = colorIndex
+        self.photo = photo
+        self.photoRevision = photoRevision
         self.profileUpdatedAt = profileUpdatedAt
         self.peerAccountId = peerAccountId
         self.sharedDialogIds = sharedDialogIds
@@ -321,6 +327,8 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case bio
         case birthday
         case colorIndex = "color_index"
+        case photo
+        case photoRevision = "photo_revision"
         case profileUpdatedAt = "updated_at"
         case peerAccountId = "peer_account_id"
         case sharedDialogIds = "shared_dialog_ids"
@@ -450,6 +458,8 @@ nonisolated struct ContactLookupResponse: Codable, Sendable {
     let bio: String?
     let birthday: String?
     let colorIndex: Int?
+    let photo: CloudMedia?
+    let photoRevision: Int64?
     let updatedAt: String?
 }
 
@@ -462,7 +472,61 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
     let bio: String
     let birthday: String?
     let colorIndex: Int
+    let photo: CloudMedia?
+    let photoRevision: Int64
     let updatedAt: String
+
+    init(
+        accountId: String,
+        username: String? = nil,
+        firstName: String,
+        lastName: String,
+        displayName: String,
+        bio: String,
+        birthday: String?,
+        colorIndex: Int,
+        photo: CloudMedia? = nil,
+        photoRevision: Int64 = 0,
+        updatedAt: String
+    ) {
+        self.accountId = accountId
+        self.username = username
+        self.firstName = firstName
+        self.lastName = lastName
+        self.displayName = displayName
+        self.bio = bio
+        self.birthday = birthday
+        self.colorIndex = colorIndex
+        self.photo = photo
+        self.photoRevision = photoRevision
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        accountId = try values.decode(String.self, forKey: .accountId)
+        username = try values.decodeIfPresent(String.self, forKey: .username)
+        firstName = try values.decode(String.self, forKey: .firstName)
+        lastName = try values.decode(String.self, forKey: .lastName)
+        displayName = try values.decode(String.self, forKey: .displayName)
+        bio = try values.decode(String.self, forKey: .bio)
+        birthday = try values.decodeIfPresent(String.self, forKey: .birthday)
+        colorIndex = try values.decode(Int.self, forKey: .colorIndex)
+        photo = try values.decodeIfPresent(CloudMedia.self, forKey: .photo)
+        photoRevision = try values.decodeIfPresent(Int64.self, forKey: .photoRevision) ?? 0
+        updatedAt = try values.decode(String.self, forKey: .updatedAt)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountId, username, firstName, lastName, displayName, bio, birthday, colorIndex
+        case photo, photoRevision, updatedAt
+    }
+}
+
+nonisolated struct ProfilePhotoMutationResponse: Codable, Sendable {
+    let profile: CloudProfile
+    let committedPhotoRevision: Int64
+    let duplicate: Bool
 }
 
 nonisolated struct CloudServiceData: Codable, Equatable, Sendable {
@@ -919,6 +983,21 @@ nonisolated struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+nonisolated struct CloudPresence: Codable, Equatable, Sendable {
+    let accountId: String
+    let online: Bool
+    let lastSeenAt: String?
+    let revision: Int64
+}
+
+nonisolated struct CloudPresenceResponse: Codable, Equatable, Sendable {
+    let presences: [CloudPresence]
+}
+
+private struct PresenceQueryRequest: Codable, Sendable {
+    let accountIds: [String]
+}
+
 private struct DeviceListResponse: Codable, Sendable {
     let devices: [CloudDevice]
 }
@@ -1353,6 +1432,23 @@ struct CloudAPI: Sendable {
                 bio: profile.bio,
                 birthday: profile.birthday.map(Self.profileDateFormatter.string(from:)),
                 colorIndex: profile.colorIndex
+            ),
+            token: token
+        )
+    }
+
+    func updateProfilePhoto(
+        mediaId: String?,
+        clientMutationId: String,
+        basePhotoRevision: Int64,
+        token: String
+    ) async throws -> ProfilePhotoMutationResponse {
+        try await put(
+            "v1/profile/photo",
+            body: ProfilePhotoMutationRequest(
+                mediaId: mediaId,
+                clientMutationId: clientMutationId,
+                basePhotoRevision: basePhotoRevision
             ),
             token: token
         )
@@ -2228,6 +2324,15 @@ struct CloudAPI: Sendable {
         return response.devices
     }
 
+    func queryPresence(accountIds: [String], token: String) async throws -> CloudPresenceResponse {
+        try await post(
+            "v1/presence/query",
+            body: PresenceQueryRequest(accountIds: accountIds),
+            token: token,
+            timeoutInterval: 8
+        )
+    }
+
     func revokeDevice(id: String, token: String) async throws -> SessionRevocationResponse {
         try await delete("v1/devices/\(id)", token: token)
     }
@@ -2429,6 +2534,12 @@ private struct ServerError: Codable {
 }
 
 private struct EmptyBody: Encodable {}
+
+private struct ProfilePhotoMutationRequest: Encodable {
+    let mediaId: String?
+    let clientMutationId: String
+    let basePhotoRevision: Int64
+}
 
 private struct CreateGroupRequest: Encodable {
     let groupId: String

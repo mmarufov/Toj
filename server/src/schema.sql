@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   bio                   TEXT  NOT NULL DEFAULT '',
   birthday              DATE,
   profile_color         INT   NOT NULL DEFAULT 0 CHECK (profile_color BETWEEN 0 AND 7),
+  profile_photo_media_id UUID,
+  profile_photo_revision BIGINT NOT NULL DEFAULT 0 CHECK (profile_photo_revision >= 0),
   status                TEXT  NOT NULL DEFAULT 'active'
                           CHECK (status IN ('active','limited','banned','deleted')),
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -32,6 +34,8 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS birthday DATE;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_color INT NOT NULL DEFAULT 0;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_photo_media_id UUID;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_photo_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS phone_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 DO $$ BEGIN
   ALTER TABLE accounts ADD CONSTRAINT accounts_profile_color_check
@@ -480,7 +484,7 @@ CREATE TABLE IF NOT EXISTS media_objects (
   status                TEXT NOT NULL DEFAULT 'uploading'
                           CHECK (status IN ('uploading','ready','rejected','deleted')),
   purpose               TEXT NOT NULL DEFAULT 'message'
-                          CHECK (purpose IN ('message','group_photo')),
+                          CHECK (purpose IN ('message','group_photo','profile_photo')),
   thumbnail_key_id      TEXT,
   thumbnail_nonce       BYTEA,
   thumbnail_ciphertext  BYTEA,
@@ -515,6 +519,13 @@ DO $$ BEGIN
       CHECK (purpose IN ('message','group_photo')) NOT VALID;
   END IF;
 END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'media-purpose-profile-photo-v1')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'media_objects_purpose_check_profile_photo') THEN
+    ALTER TABLE media_objects ADD CONSTRAINT media_objects_purpose_check_profile_photo
+      CHECK (purpose IN ('message','group_photo','profile_photo')) NOT VALID;
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS media_objects_owner_quota_idx
   ON media_objects(owner_account_id, status, created_at);
 
@@ -526,6 +537,50 @@ DO $$ BEGIN
     FOREIGN KEY (photo_media_id) REFERENCES media_objects(id) ON DELETE SET NULL;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+DO $$ BEGIN
+  ALTER TABLE accounts ADD CONSTRAINT accounts_profile_photo_media_id_fkey
+    FOREIGN KEY (profile_photo_media_id) REFERENCES media_objects(id) ON DELETE SET NULL NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE accounts ADD CONSTRAINT accounts_profile_photo_revision_check
+    CHECK (profile_photo_revision >= 0) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Profile-photo mutation receipts are retained until account deletion. A device can retry after
+-- an arbitrarily long offline period or a lost HTTP response without replaying an old avatar.
+CREATE TABLE IF NOT EXISTS profile_photo_mutations (
+  account_id          UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  client_mutation_id  UUID NOT NULL,
+  payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  media_id            UUID REFERENCES media_objects(id) ON DELETE SET NULL,
+  base_revision       BIGINT NOT NULL CHECK (base_revision >= 0),
+  status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+  result_revision     BIGINT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at        TIMESTAMPTZ,
+  PRIMARY KEY (account_id, client_mutation_id),
+  CHECK (
+    (status = 'pending' AND result_revision IS NULL AND completed_at IS NULL)
+    OR (status = 'completed' AND result_revision IS NOT NULL AND completed_at IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS profile_photo_mutations_account_created_idx
+  ON profile_photo_mutations(account_id, created_at DESC);
+
+-- Exact replays do not consume this budget. New mutation IDs are bounded per UTC day so a
+-- compromised authenticated client cannot turn durable idempotency receipts into unbounded
+-- high-rate storage growth.
+CREATE TABLE IF NOT EXISTS profile_photo_action_budgets (
+  account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  bucket_started  TIMESTAMPTZ NOT NULL,
+  mutation_count  INT NOT NULL DEFAULT 0 CHECK (mutation_count >= 0),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, bucket_started)
+);
+CREATE INDEX IF NOT EXISTS profile_photo_action_budgets_retention_idx
+  ON profile_photo_action_budgets(bucket_started, account_id);
 
 -- Kept separately from media_objects so create/cancel loops cannot evade per-account rate limits.
 CREATE TABLE IF NOT EXISTS media_upload_attempts (

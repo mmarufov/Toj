@@ -71,7 +71,14 @@ struct TojCallScreen: View {
                             .frame(width: 154, height: 154)
                             .scaleEffect(1.15)
                     }
-                    TojAvatar(title: coordinator.peerName, size: 122)
+                    CloudProfileAvatar(
+                        model: .shared,
+                        title: coordinator.peerName,
+                        media: CloudAppModel.shared.dialogs.first {
+                            $0.id == coordinator.activeDialogId
+                        }?.photo,
+                        size: 122
+                    )
                 }
 
                 Text(coordinator.peerName)
@@ -249,7 +256,14 @@ struct TojCallScreen: View {
                 TojVideoRendererView(handle: handle, mirrored: false)
             } else {
                 VStack(spacing: primary ? 16 : 7) {
-                    TojAvatar(title: coordinator.peerName, size: primary ? 104 : 48)
+                    CloudProfileAvatar(
+                        model: .shared,
+                        title: coordinator.peerName,
+                        media: CloudAppModel.shared.dialogs.first {
+                            $0.id == coordinator.activeDialogId
+                        }?.photo,
+                        size: primary ? 104 : 48
+                    )
                     if primary {
                         Text(remotePlaceholderTitle)
                             .font(.subheadline.weight(.medium))

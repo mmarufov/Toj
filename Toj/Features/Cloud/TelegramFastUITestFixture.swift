@@ -26,6 +26,10 @@ enum TelegramFastUITestFixture {
         ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] == "1"
     }
 
+    static var presenceScenario: String? {
+        ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE_PRESENCE"]
+    }
+
     static var session: StoredCloudSession {
         StoredCloudSession(
             session: CloudSession(

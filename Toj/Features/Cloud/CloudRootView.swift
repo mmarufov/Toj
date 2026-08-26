@@ -1575,7 +1575,7 @@ private struct CloudChatsView: View {
                         Image(systemName: selectedDialogIds.contains(dialog.id) ? "checkmark.circle.fill" : "circle")
                             .font(.system(size: 23, weight: .semibold))
                             .foregroundStyle(selectedDialogIds.contains(dialog.id) ? TojTheme.gold : TojTheme.secondaryText)
-                        CloudDialogRow(dialog: dialog)
+                        CloudDialogRow(dialog: dialog, model: model)
                     }
                 }
                 .buttonStyle(.plain)
@@ -1587,9 +1587,9 @@ private struct CloudChatsView: View {
                 )
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             } else if let onOpen {
-                Button { onOpen(dialog.id) } label: { CloudDialogRow(dialog: dialog) }
+                Button { onOpen(dialog.id) } label: { CloudDialogRow(dialog: dialog, model: model) }
             } else {
-                NavigationLink(value: dialog.id) { CloudDialogRow(dialog: dialog) }
+                NavigationLink(value: dialog.id) { CloudDialogRow(dialog: dialog, model: model) }
             }
         }
         .buttonStyle(.tojPressable)
@@ -1789,7 +1789,7 @@ private struct ArchivedChatsView: View {
                         Button {
                             onOpen(dialog.id)
                         } label: {
-                            CloudDialogRow(dialog: dialog)
+                            CloudDialogRow(dialog: dialog, model: model)
                         }
                         .buttonStyle(.tojPressable)
                         .contextMenu {
@@ -1857,11 +1857,14 @@ private struct ArchivedChatsView: View {
 /// the list it came from.
 struct CloudDialogRow: View {
     let dialog: CloudAppModel.Dialog
+    var model: CloudAppModel = .shared
 
     var body: some View {
         HStack(spacing: 12) {
-            TojAvatar(
+            CloudProfileAvatar(
+                model: model,
                 title: dialog.title,
+                media: dialog.photo,
                 size: 56,
                 highlighted: false,
                 colorIndex: dialog.profileColorIndex,
@@ -1897,8 +1900,8 @@ struct CloudDialogRow: View {
                     if dialog.isPending {
                         ProgressView().controlSize(.mini).tint(TojTheme.secondaryText)
                     }
-                    if dialog.isTyping {
-                        Text("typing…")
+                    if let typing = model.typingSummary(dialogId: dialog.id) {
+                        Text(typing)
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(TojTheme.secure)
                             .lineLimit(1)
@@ -1969,6 +1972,34 @@ struct CloudDialogRow: View {
                 .frame(height: 0.5)
                 .padding(.leading, 68)
         }
+    }
+}
+
+struct CloudProfileAvatar: View {
+    @Bindable var model: CloudAppModel
+    let title: String
+    let media: CloudMedia?
+    var size: CGFloat = 52
+    var highlighted = false
+    var colorIndex: Int? = nil
+    var systemImage: String? = nil
+    @State private var photoData: Data?
+
+    var body: some View {
+        TojAvatar(
+            title: title,
+            size: size,
+            highlighted: highlighted,
+            colorIndex: colorIndex,
+            systemImage: systemImage,
+            photoData: photoData
+        )
+        .task(id: media?.id) {
+            photoData = nil
+            guard let media else { return }
+            photoData = await model.thumbnailData(for: media)
+        }
+        .onDisappear { photoData = nil }
     }
 }
 
@@ -2139,6 +2170,8 @@ private struct CloudSettingsView: View {
                         .padding(.top, 4)
                     }
                     .padding(.top, 16)
+
+                    profilePhotoSyncBanner
 
                     TojSectionCard {
                         Button(action: openSavedMessages) {
@@ -2390,6 +2423,9 @@ private struct CloudSettingsView: View {
                 await model.refreshMediaCacheUsage()
                 if let accountId = profilePhotoAccountId {
                     profilePhotoData = await EncryptedProfilePhotoStore.load(accountId: accountId)
+                    if let cloudData = model.profilePhotoDisplayData {
+                        profilePhotoData = cloudData
+                    }
                 } else {
                     profilePhotoData = nil
                 }
@@ -2398,6 +2434,9 @@ private struct CloudSettingsView: View {
                     showingProfileEditor = true
                 }
                 #endif
+            }
+            .onChange(of: model.profilePhotoDisplayData) { _, value in
+                profilePhotoData = value
             }
             .confirmationDialog(
                 pendingLogoutItemCount > 0
@@ -2448,6 +2487,69 @@ private struct CloudSettingsView: View {
                 .presentationBackground(TojTheme.canvas)
             }
         }
+    }
+
+    @ViewBuilder
+    private var profilePhotoSyncBanner: some View {
+        switch model.profilePhotoSyncState {
+        case .pending:
+            profilePhotoBanner(
+                title: "Profile photo waiting to sync",
+                systemImage: "arrow.triangle.2.circlepath.icloud",
+                tint: TojTheme.secondaryText
+            )
+            .accessibilityIdentifier("profile-photo-sync-pending")
+        case let .failed(message):
+            VStack(alignment: .leading, spacing: 10) {
+                profilePhotoBanner(
+                    title: message,
+                    systemImage: "exclamationmark.icloud.fill",
+                    tint: TojTheme.danger
+                )
+                HStack(spacing: 18) {
+                    Button("Retry") { Task { await model.retryProfilePhoto() } }
+                    Button("Discard", role: .destructive) {
+                        Task { await model.discardPendingProfilePhoto() }
+                    }
+                }
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 16)
+            }
+            .padding(.vertical, 12)
+            .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: TojRadius.card))
+            .accessibilityIdentifier("profile-photo-sync-failed")
+        case .conflict:
+            VStack(alignment: .leading, spacing: 10) {
+                profilePhotoBanner(
+                    title: "Profile photo changed on another device",
+                    systemImage: "arrow.triangle.branch",
+                    tint: TojTheme.accent
+                )
+                HStack(spacing: 18) {
+                    Button("Use cloud photo") { Task { await model.useCloudProfilePhoto() } }
+                    Button("Use mine") { Task { await model.retryProfilePhoto() } }
+                }
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 16)
+            }
+            .padding(.vertical, 12)
+            .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: TojRadius.card))
+            .accessibilityIdentifier("profile-photo-sync-conflict")
+        case .localOnly, .synced:
+            EmptyView()
+        }
+    }
+
+    private func profilePhotoBanner(
+        title: String,
+        systemImage: String,
+        tint: Color
+    ) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
     }
 
     private var savedMessagesRowValue: LocalizedStringKey? {

@@ -45,6 +45,9 @@ const MAX_IMAGE_PIXELS = 40_000_000;
 const MAX_THUMBNAIL_DIMENSION = 2_048;
 const MAX_THUMBNAIL_PIXELS = 4_000_000;
 const MAX_IMAGE_HEADER_BYTES = 256 * 1024;
+const MAX_PROFILE_PHOTO_BYTES = 3 * 1024 * 1024;
+const MAX_PROFILE_PHOTO_DIMENSION = 1_024;
+const MAX_PROFILE_PHOTO_PIXELS = MAX_PROFILE_PHOTO_DIMENSION * MAX_PROFILE_PHOTO_DIMENSION;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 const CONTENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
 const KINDS = new Set<MediaKind>(["photo", "video", "file", "voice"]);
@@ -146,11 +149,14 @@ export async function createMediaUpload(sql: SQL, accountId: string, deviceId: s
   const kind = String(input.kind ?? "") as MediaKind;
   if (!KINDS.has(kind)) throw new MediaError("unsupported media kind");
   const purpose = input.purpose == null ? "message" : String(input.purpose);
-  if (purpose !== "message" && purpose !== "group_photo") {
+  if (purpose !== "message" && purpose !== "group_photo" && purpose !== "profile_photo") {
     throw new MediaError("invalid media purpose");
   }
   if (purpose === "group_photo" && kind !== "photo") {
     throw new MediaError("group photo upload must be an image");
+  }
+  if (purpose === "profile_photo" && kind !== "photo") {
+    throw new MediaError("profile photo upload must be an image");
   }
   const contentType = String(input.contentType ?? "").toLowerCase();
   if (!CONTENT_TYPE_PATTERN.test(contentType) || contentType.length > 127) {
@@ -170,6 +176,9 @@ export async function createMediaUpload(sql: SQL, accountId: string, deviceId: s
   const totalParts = partSize == null ? null : Math.ceil(byteSize / partSize);
   const { chunkBytes, maxObjectBytes, accountQuotaBytes, maxActiveUploads, maxDailyUploads } = mediaLimits();
   if (!Number.isSafeInteger(byteSize) || byteSize <= 0) throw new MediaError("invalid media size");
+  if (purpose === "profile_photo" && byteSize > MAX_PROFILE_PHOTO_BYTES) {
+    throw new MediaError("profile photo exceeds the upload limit", 413, "profile_photo_too_large");
+  }
   if (byteSize > maxObjectBytes) {
     throw new MediaError("media exceeds the upload limit", 413, "media_too_large");
   }
@@ -189,6 +198,17 @@ export async function createMediaUpload(sql: SQL, accountId: string, deviceId: s
   }
   if (kind === "photo" && (width == null || height == null)) {
     throw new MediaError("photo dimensions are required");
+  }
+  if (purpose === "profile_photo") {
+    if (contentType !== "image/jpeg") {
+      throw new MediaError("profile photos must be JPEG", 415, "invalid_profile_photo_type");
+    }
+    if (width! > MAX_PROFILE_PHOTO_DIMENSION || height! > MAX_PROFILE_PHOTO_DIMENSION
+        || width! * height! > MAX_PROFILE_PHOTO_PIXELS) {
+      throw new MediaError(
+        "profile photo dimensions exceed the limit", 413, "profile_photo_dimensions_too_large",
+      );
+    }
   }
   if (kind === "video" && (width == null || height == null || durationMs == null || durationMs <= 0)) {
     throw new MediaError("video dimensions and duration are required");
@@ -559,6 +579,28 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
           )
       )
       OR EXISTS (
+        SELECT 1
+        FROM accounts profile
+        WHERE profile.profile_photo_media_id = mo.id
+          AND profile.status IN ('active','limited')
+          AND (
+            profile.id = ${accountId}
+            OR EXISTS (
+              SELECT 1
+              FROM dialog_members owner_membership
+              JOIN dialog_members requester_membership
+                ON requester_membership.dialog_id = owner_membership.dialog_id
+               AND requester_membership.account_id = ${accountId}
+               AND requester_membership.left_at IS NULL
+              JOIN dialogs shared_dialog
+                ON shared_dialog.id = owner_membership.dialog_id
+               AND shared_dialog.closed_at IS NULL
+              WHERE owner_membership.account_id = profile.id
+                AND owner_membership.left_at IS NULL
+            )
+          )
+      )
+      OR EXISTS (
         SELECT 1 FROM draft_attachments attachment
         JOIN account_dialog_drafts draft
           ON draft.account_id = attachment.account_id
@@ -633,6 +675,8 @@ export async function cancelMediaUpload(sql: SQL, accountId: string, deviceId: s
         AND (expires_at IS NULL OR expires_at > now())
       UNION ALL
       SELECT 1 FROM dialogs WHERE photo_media_id = ${mediaId}
+      UNION ALL
+      SELECT 1 FROM accounts WHERE profile_photo_media_id = ${mediaId}
       UNION ALL
       SELECT 1
       FROM draft_attachments attachment

@@ -245,7 +245,12 @@ struct GroupProfileView: View {
                 }
                 ForEach(model.groupMembersByDialog[dialogId] ?? []) { member in
                     HStack(spacing: 12) {
-                        TojAvatar(title: member.displayName, size: 40)
+                        CloudProfileAvatar(
+                            model: model,
+                            title: member.displayName,
+                            media: member.photo,
+                            size: 40
+                        )
                         Text(member.displayName)
                         Spacer()
                         if member.role != "member" {

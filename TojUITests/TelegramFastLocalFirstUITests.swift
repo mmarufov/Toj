@@ -18,7 +18,37 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         if name.contains("testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking") {
             app.launchEnvironment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] = "1"
         }
+        if name.contains("testPresenceOnline") {
+            app.launchEnvironment["TOJ_UI_FIXTURE_PRESENCE"] = "online"
+        } else if name.contains("testPresenceTyping") {
+            app.launchEnvironment["TOJ_UI_FIXTURE_PRESENCE"] = "typing"
+        } else if name.contains("testPresenceUnsupported") {
+            app.launchEnvironment["TOJ_UI_FIXTURE_PRESENCE"] = "unsupported"
+        } else if name.contains("testPresenceConnectionTrouble") {
+            app.launchEnvironment["TOJ_UI_FIXTURE_PRESENCE"] = "offline_override"
+        }
         launch(reset: true)
+    }
+
+    func testPresenceOnlineUsesAuthenticatedFixtureState() {
+        openChat(Fixture.primaryDialog)
+        XCTAssertEqual(element("conversation-subtitle").label, "online")
+    }
+
+    func testPresenceTypingAppearsInListAndConversation() {
+        XCTAssertTrue(app.staticTexts["typing…"].waitForExistence(timeout: 5))
+        openChat(Fixture.primaryDialog)
+        XCTAssertEqual(element("conversation-subtitle").label, "typing…")
+    }
+
+    func testPresenceUnsupportedShowsUnavailableInsteadOfAnApproximation() {
+        openChat(Fixture.primaryDialog)
+        XCTAssertEqual(element("conversation-subtitle").label, "status unavailable")
+    }
+
+    func testPresenceConnectionTroubleOverridesOnline() {
+        openChat(Fixture.primaryDialog)
+        XCTAssertEqual(element("conversation-subtitle").label, "Offline — showing saved chats")
     }
 
     func testColdOfflineOpenAndRapidChatSwitching() {

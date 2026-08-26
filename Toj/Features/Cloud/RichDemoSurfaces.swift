@@ -33,9 +33,22 @@ struct TojPeerProfileView: View {
             ScrollView {
                 VStack(spacing: 22) {
                     VStack(spacing: 10) {
-                        TojAvatar(title: title, size: 82, colorIndex: dialog?.profileColorIndex)
+                        CloudProfileAvatar(
+                            model: model,
+                            title: title,
+                            media: dialog?.photo,
+                            size: 82,
+                            colorIndex: dialog?.profileColorIndex
+                        )
                         Text(title)
                             .font(TojTheme.heading(.title, weight: .bold))
+                        Text(model.typingSummary(dialogId: dialogId)
+                             ?? model.directPresenceSubtitle(dialogId: dialogId))
+                            .font(.subheadline)
+                            .foregroundStyle(
+                                model.typingSummary(dialogId: dialogId) != nil
+                                    ? TojTheme.gold : TojTheme.secondaryText
+                            )
                         if let bio = dialog?.peerBio, !bio.isEmpty {
                             Text(bio)
                                 .font(.subheadline)

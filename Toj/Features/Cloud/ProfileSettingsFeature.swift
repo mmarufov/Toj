@@ -292,8 +292,59 @@ struct ProfileEditView: View {
                 .font(.caption.weight(.semibold))
                 .buttonStyle(.tojPressable)
             }
+
+            profilePhotoSyncStatus
         }
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var profilePhotoSyncStatus: some View {
+        switch model.profilePhotoSyncState {
+        case .localOnly:
+            if model.capabilities.contains(.profilePhotos) == false {
+                Label("Saved on this device", systemImage: "iphone")
+                    .font(.caption)
+                    .foregroundStyle(TojTheme.secondaryText)
+            }
+        case .synced:
+            Label("Synced", systemImage: "checkmark.icloud.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(TojTheme.secure)
+                .accessibilityIdentifier("profile-photo-status-synced")
+        case .pending:
+            Label("Waiting to sync", systemImage: "arrow.triangle.2.circlepath.icloud")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(TojTheme.secondaryText)
+                .accessibilityIdentifier("profile-photo-status-pending")
+        case let .failed(message):
+            VStack(spacing: 8) {
+                Label(message, systemImage: "exclamationmark.icloud.fill")
+                    .font(.caption)
+                    .foregroundStyle(TojTheme.danger)
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 16) {
+                    Button("Retry") { Task { await model.retryProfilePhoto() } }
+                    Button("Discard", role: .destructive) {
+                        Task { await model.discardPendingProfilePhoto() }
+                    }
+                }
+                .font(.caption.weight(.semibold))
+            }
+            .accessibilityIdentifier("profile-photo-status-failed")
+        case .conflict:
+            VStack(spacing: 8) {
+                Label("Photo changed on another device", systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .foregroundStyle(TojTheme.accent)
+                HStack(spacing: 16) {
+                    Button("Use cloud photo") { Task { await model.useCloudProfilePhoto() } }
+                    Button("Use mine") { Task { await model.retryProfilePhoto() } }
+                }
+                .font(.caption.weight(.semibold))
+            }
+            .accessibilityIdentifier("profile-photo-status-conflict")
+        }
     }
 
     private var nameFields: some View {
@@ -413,17 +464,21 @@ struct ProfileEditView: View {
         saveError = nil
         defer { isSaving = false }
 
-        guard await model.saveProfileDetails(details) else {
-            saveError = String(localized: "Your profile could not be saved. Please try again.")
-            return
-        }
-
+        let detailsSaved = await model.saveProfileDetails(details)
+        var photoSaved = true
         if photoWasEdited, let photoAccountId {
-            guard await EncryptedProfilePhotoStore.persist(photoData, accountId: photoAccountId) else {
-                saveError = String(localized: "Your details were saved, but the photo could not be stored.")
-                return
+            photoSaved = await model.saveProfilePhoto(photoData, accountId: photoAccountId)
+            if photoSaved { persistedPhotoData = photoData }
+        }
+        guard detailsSaved, photoSaved else {
+            saveError = if detailsSaved {
+                String(localized: "Your details were saved, but the photo could not be stored.")
+            } else if photoSaved && photoWasEdited {
+                String(localized: "Your photo was saved, but your profile details still need attention.")
+            } else {
+                String(localized: "Your profile could not be saved. Please try again.")
             }
-            persistedPhotoData = photoData
+            return
         }
         TojFeedback.selection()
         dismiss()

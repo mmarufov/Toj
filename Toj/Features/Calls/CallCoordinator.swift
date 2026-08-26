@@ -73,6 +73,7 @@ final class CallCoordinator {
     private(set) var videoQualityTier: CallVideoQualityTier = .high
     private(set) var videoIsAutomaticallyPaused = false
     private(set) var hasVideoExperience = false
+    var activeDialogId: String? { runtime?.dialogId }
     var isPresented = false
 
     var hasCall: Bool { state != .idle }

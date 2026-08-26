@@ -111,6 +111,30 @@ enum SafeMediaImageDecoder {
         )
     }
 
+    nonisolated static func prepareProfilePhotoUpload(_ data: Data) -> PreparedPhotoUpload? {
+        guard let decoded = decode(data, maxPixelSize: 1_024), let cgImage = decoded.image.cgImage else {
+            return nil
+        }
+        let image = UIImage(cgImage: cgImage)
+        var encoded: Data?
+        for quality in [0.86, 0.76, 0.64, 0.52] {
+            guard let candidate = image.jpegData(compressionQuality: quality) else { continue }
+            encoded = candidate
+            if candidate.count <= 3 * 1024 * 1024 { break }
+        }
+        guard let encoded, !encoded.isEmpty, encoded.count <= 3 * 1024 * 1024,
+              cgImage.width <= 1_024, cgImage.height <= 1_024
+        else { return nil }
+        return PreparedPhotoUpload(
+            data: encoded,
+            thumbnail: thumbnailData(image),
+            pixelWidth: cgImage.width,
+            pixelHeight: cgImage.height,
+            contentType: "image/jpeg",
+            filenameExtension: "jpg"
+        )
+    }
+
     nonisolated static func thumbnailData(_ image: UIImage) -> Data? {
         for dimension in [640.0, 480.0, 320.0] {
             guard let resized = image.preparingThumbnail(

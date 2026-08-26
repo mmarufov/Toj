@@ -212,7 +212,7 @@ struct TojConversationExperience: View {
             .presentationBackground(TojTheme.base)
         }
         .sheet(isPresented: $showingForwarding) {
-            DemoForwardingView(dialogs: model.dialogs) { targetDialogId in
+            DemoForwardingView(model: model, dialogs: model.dialogs) { targetDialogId in
                 if let forwardLine {
                     Task { await model.forwardMessage(forwardLine, to: targetDialogId) }
                 }
@@ -349,6 +349,7 @@ struct TojConversationExperience: View {
                                 .font(.system(size: 12.5))
                                 .foregroundStyle(headerSubtitleColor)
                                 .lineLimit(1)
+                                .accessibilityIdentifier("conversation-subtitle")
                         }
                         if model.replicaSyncState.showsRetry {
                             Image(systemName: "arrow.clockwise")
@@ -449,8 +450,10 @@ struct TojConversationExperience: View {
                         || model.capabilities.contains(.profiles)
                         || model.capabilities.contains(.calls)
                 } label: {
-                    TojAvatar(
+                    CloudProfileAvatar(
+                        model: model,
                         title: model.dialogTitle(dialogId),
+                        media: model.dialogs.first(where: { $0.id == dialogId })?.photo,
                         size: 46,
                         colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex,
                         systemImage: isSavedMessages ? "bookmark.fill" : nil
@@ -484,9 +487,7 @@ struct TojConversationExperience: View {
         model.dialogs.first(where: { $0.id == dialogId })?.unreadCount ?? 0
     }
 
-    private var isPeerTyping: Bool {
-        model.dialogs.first(where: { $0.id == dialogId })?.isTyping ?? false
-    }
+    private var typingSummary: String? { model.typingSummary(dialogId: dialogId) }
 
     /// Telegram grammar: the subtitle is presence; connection trouble takes its place when relevant.
     private var headerSubtitle: String {
@@ -495,9 +496,12 @@ struct TojConversationExperience: View {
             if isSavedMessages {
                 String(localized: "Synced across your devices")
             } else if isGroup {
-                "\(dialog?.memberCount ?? 0) members"
+                typingSummary ?? String(
+                    format: String(localized: "%lld members"),
+                    Int64(dialog?.memberCount ?? 0)
+                )
             } else {
-                isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
+                typingSummary ?? model.directPresenceSubtitle(dialogId: dialogId)
             }
         case .checking, .updating, .offline, .connectionSlow, .serverUnavailable,
              .sessionExpired, .protocolFailure, .localFailure, .configurationError:
@@ -507,7 +511,7 @@ struct TojConversationExperience: View {
 
     private var headerSubtitleColor: Color {
         switch model.replicaSyncState {
-        case .ready: isPeerTyping ? TojTheme.gold : TojTheme.secondaryText
+        case .ready: typingSummary != nil ? TojTheme.gold : TojTheme.secondaryText
         case .checking, .updating, .connectionSlow: TojTheme.secondaryText
         case .offline, .serverUnavailable, .sessionExpired, .protocolFailure,
              .localFailure, .configurationError: .orange
@@ -919,7 +923,12 @@ struct TojConversationExperience: View {
                                 composerFocused = true
                             } label: {
                                 HStack(spacing: 6) {
-                                    TojAvatar(title: member.displayName, size: 24)
+                                    CloudProfileAvatar(
+                                        model: model,
+                                        title: member.displayName,
+                                        media: member.photo,
+                                        size: 24
+                                    )
                                     Text(member.displayName)
                                         .font(.caption.weight(.semibold))
                                 }
@@ -941,7 +950,17 @@ struct TojConversationExperience: View {
             }
 
             HStack(alignment: .bottom, spacing: 4) {
-                TextField("Message", text: $model.draft, axis: .vertical)
+                TextField("Message", text: Binding(
+                    get: { model.draft },
+                    set: { value in
+                        model.draft = value
+                        model.userEditedComposer(
+                            dialogId: dialogId,
+                            text: value,
+                            focused: composerFocused
+                        )
+                    }
+                ), axis: .vertical)
                     .focused($composerFocused)
                     .lineLimit(1...8)
                     .font(.body)
@@ -951,6 +970,9 @@ struct TojConversationExperience: View {
                     .onSubmit { if canSend { send() } }
                     .accessibilityLabel("Message")
                     .disabled(model.composerMode.isRecording)
+                    .onChange(of: composerFocused) { _, focused in
+                        model.composerFocusChanged(dialogId: dialogId, focused: focused)
+                    }
 
                 if !model.draft.isEmpty, !model.composerMode.isRecording {
                     Menu {
@@ -1556,7 +1578,14 @@ private struct TojMessageBubble: View {
             if isIncomingGroupMessage {
                 Group {
                     if isLastInGroup {
-                        TojAvatar(title: senderLabel, size: 28)
+                        CloudProfileAvatar(
+                            model: model,
+                            title: senderLabel,
+                            media: line.senderAccountId.flatMap {
+                                model.groupMemberPhoto(accountId: $0, dialogId: line.dialogId ?? "")
+                            },
+                            size: 28
+                        )
                             .accessibilityHidden(true)
                     } else {
                         Color.clear
@@ -4879,6 +4908,7 @@ private struct DemoAttachmentPicker: View {
 }
 
 private struct DemoForwardingView: View {
+    @Bindable var model: CloudAppModel
     let dialogs: [CloudAppModel.Dialog]
     let onDone: (String) -> Void
 
@@ -4890,8 +4920,10 @@ private struct DemoForwardingView: View {
                     onDone(dialog.id)
                 } label: {
                     HStack(spacing: 12) {
-                        TojAvatar(
+                        CloudProfileAvatar(
+                            model: model,
                             title: dialog.title,
+                            media: dialog.photo,
                             size: 42,
                             colorIndex: dialog.profileColorIndex,
                             systemImage: dialog.type == "saved" ? "bookmark.fill" : nil

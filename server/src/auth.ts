@@ -5,6 +5,7 @@ import {
   codeHashIndex, tokenHashCandidates, tokenHashIndex,
   normalizePhone, constantTimeEqual,
 } from "./crypto";
+import { loadMediaDTO, type MediaDTO } from "./media";
 import { CryptoUnavailableError, openForScope, sealForScope } from "./envelope-crypto";
 import { enqueuePushDeliveries, revokePushBindingsForDevice } from "./push";
 import { notifySyncWakeups } from "./sync-wakeup";
@@ -247,6 +248,8 @@ export type ProfileDTO = {
   bio: string;
   birthday: string | null;
   colorIndex: number;
+  photo: MediaDTO | null;
+  photoRevision: number;
   updatedAt: string;
 };
 
@@ -260,7 +263,7 @@ export type UsernameLookupDTO = {
   updatedAt: string;
 };
 
-type ProfilePush = { accountId: string; pts: number; ptsCount: number };
+export type ProfilePush = { accountId: string; pts: number; ptsCount: number };
 
 const profileDate = (value: unknown): string | null => {
   if (value == null || value === "") return null;
@@ -280,7 +283,7 @@ const profileDate = (value: unknown): string | null => {
   return value;
 };
 
-function profileDTO(row: any): ProfileDTO {
+export function profileDTO(row: any, photo: MediaDTO | null = null): ProfileDTO {
   const birthday = birthdayString(row.birthday);
   return {
     accountId: row.id,
@@ -291,6 +294,8 @@ function profileDTO(row: any): ProfileDTO {
     bio: row.bio,
     birthday,
     colorIndex: Number(row.profile_color),
+    photo,
+    photoRevision: Number(row.profile_photo_revision ?? 0),
     updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
   };
 }
@@ -1033,10 +1038,109 @@ export async function lookupAccountByPhone(
 /** Return the canonical account profile for this authenticated account. */
 export async function getProfile(sql: SQL, accountId: string): Promise<ProfileDTO> {
   const row = (await sql`
-    SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+    SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color,
+           profile_photo_media_id, profile_photo_revision, updated_at
     FROM accounts WHERE id = ${accountId} AND status IN ('active','limited')`)[0];
   if (!row) throw new AuthError("account unavailable", 403);
-  return profileDTO(row);
+  return profileDTO(row, await loadMediaDTO(sql, row.profile_photo_media_id));
+}
+
+export async function fanoutProfileUpdate(
+  tx: SQL,
+  accountId: string,
+  deviceId: string,
+  profile: ProfileDTO,
+): Promise<ProfilePush[]> {
+  const recipientRows = await tx`
+    WITH recipients AS (
+      SELECT DISTINCT peer.account_id
+      FROM dialog_members mine
+      JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id AND peer.left_at IS NULL
+      JOIN dialogs dialog ON dialog.id = mine.dialog_id AND dialog.closed_at IS NULL
+      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+      UNION SELECT ${accountId}::uuid AS account_id
+    ), shared_direct_dialogs AS (
+      SELECT peer.account_id,
+             jsonb_agg(DISTINCT mine.dialog_id ORDER BY mine.dialog_id) AS dialog_ids
+      FROM dialog_members mine
+      JOIN dialog_members peer
+        ON peer.dialog_id = mine.dialog_id
+       AND peer.account_id <> ${accountId}
+       AND peer.left_at IS NULL
+      JOIN dialogs dialog
+        ON dialog.id = mine.dialog_id
+       AND dialog.type = 'direct'
+       AND dialog.closed_at IS NULL
+      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+      GROUP BY peer.account_id
+    )
+    SELECT recipient.account_id,
+           COALESCE(shared.dialog_ids, '[]'::jsonb) AS shared_dialog_ids
+    FROM recipients recipient
+    LEFT JOIN shared_direct_dialogs shared ON shared.account_id = recipient.account_id
+    ORDER BY recipient.account_id`;
+  const recipients = recipientRows.map((row) => String(row.account_id));
+  const baseData = {
+    subject_account_id: profile.accountId,
+    username: profile.username,
+    first_name: profile.firstName,
+    last_name: profile.lastName,
+    display_name: profile.displayName,
+    bio: profile.bio,
+    birthday: profile.birthday,
+    color_index: profile.colorIndex,
+    photo: profile.photo,
+    photo_revision: profile.photoRevision,
+    updated_at: profile.updatedAt,
+  };
+  // Keep lock acquisition deterministic while advancing every recipient in one set-based write.
+  await tx`
+    SELECT account_id FROM account_sync_states
+    WHERE account_id = ANY(${tx.array(recipients, "uuid")}::uuid[])
+    ORDER BY account_id FOR UPDATE`;
+  const stateRows = await tx`
+    UPDATE account_sync_states
+    SET pts = pts + 1, updated_at = now()
+    WHERE account_id = ANY(${tx.array(recipients, "uuid")}::uuid[])
+    RETURNING account_id, pts`;
+  if (stateRows.length !== recipients.length) {
+    throw new AuthError("profile recipient state unavailable", 503);
+  }
+  const sharedByAccount = new Map(recipientRows.map((row) => [
+    String(row.account_id),
+    (row.shared_dialog_ids ?? []).map(String),
+  ]));
+  const eventRows = stateRows.map((state) => ({
+    account_id: String(state.account_id),
+    pts: Number(state.pts),
+    data: {
+      ...baseData,
+      shared_dialog_ids: sharedByAccount.get(String(state.account_id)) ?? [],
+    },
+  })).sort((left, right) => left.account_id.localeCompare(right.account_id));
+  const encodedRows = JSON.stringify(eventRows);
+  await tx`
+    INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
+    SELECT event.account_id, event.pts, 'profile.updated', ${accountId}, event.data
+    FROM jsonb_to_recordset(${encodedRows}::text::jsonb)
+      AS event(account_id uuid, pts bigint, data jsonb)`;
+  await tx`
+    INSERT INTO push_deliveries (account_id, pts, device_id, alert)
+    SELECT event.account_id, event.pts, device.id, false
+    FROM jsonb_to_recordset(${encodedRows}::text::jsonb)
+      AS event(account_id uuid, pts bigint, data jsonb)
+    JOIN devices device ON device.account_id = event.account_id
+    WHERE device.platform = 'ios'
+      AND device.revoked_at IS NULL
+      AND device.push_token_hash IS NOT NULL
+      AND device.push_token_ciphertext IS NOT NULL
+      AND device.id <> ${deviceId}
+    ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
+  return eventRows.map((event) => ({
+    accountId: event.account_id,
+    pts: event.pts,
+    ptsCount: 1,
+  }));
 }
 
 /** Persist a profile and fan a silent sync event out to every device and active chat partner. */
@@ -1070,7 +1174,8 @@ export async function updateProfile(
   try {
     return await sql.begin(async (tx) => {
     const current = (await tx`
-      SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+      SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color,
+             profile_photo_media_id, profile_photo_revision, updated_at
       FROM accounts WHERE id = ${accountId} AND status IN ('active','limited') FOR UPDATE`)[0];
     if (!current) throw new AuthError("account unavailable", 403);
     await requireActiveDevice(tx, accountId, deviceId);
@@ -1083,61 +1188,23 @@ export async function updateProfile(
     const changed = (current.username ?? null) !== username
       || current.first_name !== firstName || current.last_name !== lastName
       || current.bio !== bio || currentBirthday !== birthday || Number(current.profile_color) !== colorIndex;
-    if (!changed) return { profile: profileDTO(current), pushes: [] };
+    if (!changed) {
+      return {
+        profile: profileDTO(current, await loadMediaDTO(tx, current.profile_photo_media_id)),
+        pushes: [],
+      };
+    }
 
     const updated = (await tx`
       UPDATE accounts SET username = ${username}, first_name = ${firstName}, last_name = ${lastName},
         display_name = ${displayName}, bio = ${bio}, birthday = ${birthday}::date,
         profile_color = ${colorIndex}, updated_at = now()
       WHERE id = ${accountId}
-      RETURNING id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at`)[0];
+      RETURNING id, username, first_name, last_name, display_name, bio, birthday, profile_color,
+                profile_photo_media_id, profile_photo_revision, updated_at`)[0];
 
-    const recipientRows = await tx`
-      SELECT DISTINCT peer.account_id
-      FROM dialog_members mine
-      JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id AND peer.left_at IS NULL
-      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
-      UNION SELECT ${accountId}::uuid AS account_id`;
-    const recipients = recipientRows.map((row) => String(row.account_id)).sort();
-    const profile = profileDTO(updated);
-    const baseData = {
-      subject_account_id: profile.accountId,
-      username: profile.username,
-      first_name: profile.firstName,
-      last_name: profile.lastName,
-      display_name: profile.displayName,
-      bio: profile.bio,
-      birthday: profile.birthday,
-      color_index: profile.colorIndex,
-      updated_at: profile.updatedAt,
-    };
-    const pushes: ProfilePush[] = [];
-    for (const recipient of recipients) {
-      const sharedRows = recipient === accountId ? [] : await tx`
-        SELECT mine.dialog_id
-        FROM dialog_members mine
-        JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id
-        JOIN dialogs d ON d.id = mine.dialog_id AND d.type = 'direct'
-        WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
-          AND peer.account_id = ${recipient} AND peer.left_at IS NULL
-        ORDER BY mine.dialog_id`;
-      const data = JSON.stringify({
-        ...baseData,
-        shared_dialog_ids: sharedRows.map((row) => String(row.dialog_id)),
-      });
-      const state = (await tx`
-        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
-        WHERE account_id = ${recipient} RETURNING pts`)[0];
-      const pts = Number(state.pts);
-      await tx`
-        INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
-        VALUES (${recipient}, ${pts}, 'profile.updated', ${accountId}, ${data}::jsonb)`;
-      await enqueuePushDeliveries(tx, {
-        accountId: recipient, pts, senderAccountId: accountId,
-        sourceDeviceId: deviceId, alertRecipients: false,
-      });
-      pushes.push({ accountId: recipient, pts, ptsCount: 1 });
-    }
+    const profile = profileDTO(updated, await loadMediaDTO(tx, updated.profile_photo_media_id));
+    const pushes = await fanoutProfileUpdate(tx, accountId, deviceId, profile);
     return { profile, pushes };
     });
   } catch (error: any) {
@@ -1334,7 +1401,10 @@ export async function deleteAccount(
   sql: SQL,
   accountId: string,
   code: string,
-  options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
+  options: {
+    beforeCleanup?: (tx: SQL) => Promise<void>;
+    beforeCommit?: (tx: SQL) => Promise<void>;
+  } = {},
 ): Promise<{ deleted: true }> {
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   const result: { deleted: true } | AuthError = await sql.begin(async (tx) => {
@@ -1382,10 +1452,11 @@ export async function deleteAccount(
     }
 
     const account = (await tx`
-      SELECT status FROM accounts WHERE id = ${accountId} FOR UPDATE`)[0];
+      SELECT status, profile_photo_media_id FROM accounts WHERE id = ${accountId} FOR UPDATE`)[0];
     if (!account || !["active", "limited"].includes(account.status)) {
       return new AuthError("account unavailable", 403);
     }
+    await options.beforeCleanup?.(tx);
     // This database-boundary function is also called by the account-status trigger used by old
     // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
     await tx`SELECT public.toj_cleanup_account_private_state_v1(${accountId})`;
@@ -1410,9 +1481,19 @@ export async function deleteAccount(
         bio = '',
         birthday = NULL,
         profile_color = 0,
+        profile_photo_media_id = NULL,
         status = 'deleted',
         updated_at = now()
       WHERE id = ${accountId}`;
+    if (account.profile_photo_media_id) {
+      await tx`
+        DELETE FROM media_objects media
+        WHERE media.id = ${account.profile_photo_media_id}
+          AND NOT EXISTS (SELECT 1 FROM messages WHERE media_id = media.id)
+          AND NOT EXISTS (SELECT 1 FROM dialogs WHERE photo_media_id = media.id)
+          AND NOT EXISTS (SELECT 1 FROM accounts WHERE profile_photo_media_id = media.id)
+          AND NOT EXISTS (SELECT 1 FROM draft_attachments WHERE media_id = media.id)`;
+    }
     await tx`
       UPDATE push_deliveries SET status = 'dead', claimed_at = NULL,
         last_error = 'account deleted'

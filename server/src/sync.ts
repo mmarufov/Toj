@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import type { ProfileDTO } from "./auth";
 import { Client } from "pg";
 import { timingSafeEqual } from "node:crypto";
 import { bodyAAD, mediaGroupClientMessageIdDigest, requestFingerprintIndex } from "./crypto";
@@ -1687,6 +1688,9 @@ async function mutateMessage(sql: SQL, p: {
               SELECT 1 FROM messages m
               WHERE m.media_id = mo.id AND m.state = 'visible'
                 AND (m.expires_at IS NULL OR m.expires_at > now())
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM accounts a WHERE a.profile_photo_media_id = mo.id
             )`;
       }
     }
@@ -1812,18 +1816,6 @@ export type Difference =
       hasMore: boolean;
     };
 
-export type ProfileDTO = {
-  accountId: string;
-  username: string | null;
-  firstName: string;
-  lastName: string;
-  displayName: string;
-  bio: string;
-  birthday: string | null;
-  colorIndex: number;
-  updatedAt: string;
-};
-
 function collectAccountIds(value: unknown, into: Set<string>): void {
   if (Array.isArray(value)) {
     for (const item of value) collectAccountIds(item, into);
@@ -1844,11 +1836,26 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
   const ids = [...new Set(accountIds)].filter((id) => ACCOUNT_UUID_PATTERN.test(id)).sort();
   if (ids.length === 0) return [];
   const rows = await sql`
-    SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
-    FROM accounts
-    WHERE id = ANY(${sql.array(ids, "uuid")}::uuid[])
-    ORDER BY id`;
-  return rows.map((profile: any) => ({
+    SELECT profile.id, profile.username, profile.first_name, profile.last_name, profile.display_name,
+           profile.bio, profile.birthday, profile.profile_color,
+           profile.profile_photo_media_id, profile.profile_photo_revision, profile.updated_at,
+           photo.kind AS photo_kind, photo.content_type AS photo_content_type,
+           photo.file_name AS photo_file_name, photo.file_name_key_id AS photo_file_name_key_id,
+           photo.file_name_nonce AS photo_file_name_nonce,
+           photo.file_name_ciphertext AS photo_file_name_ciphertext,
+           photo.byte_size AS photo_byte_size, photo.duration_ms AS photo_duration_ms,
+           photo.width AS photo_width, photo.height AS photo_height,
+           photo.thumbnail_ciphertext AS photo_thumbnail_ciphertext
+    FROM accounts profile
+    LEFT JOIN media_objects photo
+      ON photo.id = profile.profile_photo_media_id AND photo.status = 'ready'
+    WHERE profile.id = ANY(${sql.array(ids, "uuid")}::uuid[])
+    ORDER BY profile.id`;
+  await preloadEnvelopeKeys(
+    sql,
+    rows.map((profile: any) => profile.photo_file_name_key_id).filter(Boolean).map(String),
+  );
+  return await Promise.all(rows.map(async (profile: any) => ({
     accountId: profile.id,
     username: profile.username ?? null,
     firstName: profile.first_name,
@@ -1861,8 +1868,24 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
         : String(profile.birthday).slice(0, 10)
     ),
     colorIndex: n(profile.profile_color),
+    photo: profile.profile_photo_media_id == null ? null : await mediaDTOFromRow(sql, {
+      id: profile.profile_photo_media_id,
+      owner_account_id: profile.id,
+      kind: profile.photo_kind,
+      content_type: profile.photo_content_type,
+      file_name: profile.photo_file_name,
+      file_name_key_id: profile.photo_file_name_key_id,
+      file_name_nonce: profile.photo_file_name_nonce,
+      file_name_ciphertext: profile.photo_file_name_ciphertext,
+      byte_size: profile.photo_byte_size,
+      duration_ms: profile.photo_duration_ms,
+      width: profile.photo_width,
+      height: profile.photo_height,
+      thumbnail_ciphertext: profile.photo_thumbnail_ciphertext,
+    }),
+    photoRevision: n(profile.profile_photo_revision),
     updatedAt: iso(profile.updated_at),
-  }));
+  })));
 }
 
 /** review B3 (pruned floor → too_long) + I3 (byte + count budget, slicing). */
@@ -1931,9 +1954,23 @@ export async function getDifference(
         'bio', profile.bio,
         'birthday', profile.birthday,
         'colorIndex', profile.profile_color,
+        'photo', CASE WHEN photo.id IS NULL THEN NULL ELSE jsonb_build_object(
+          'id', photo.id,
+          'kind', photo.kind,
+          'content_type', photo.content_type,
+          'file_name', NULL,
+          'byte_size', photo.byte_size,
+          'duration_ms', photo.duration_ms,
+          'width', photo.width,
+          'height', photo.height,
+          'has_thumbnail', photo.thumbnail_ciphertext IS NOT NULL
+        ) END,
+        'photoRevision', profile.profile_photo_revision,
         'updatedAt', profile.updated_at
       ) ORDER BY profile.id), '[]'::jsonb) AS profiles
       FROM accounts profile
+      LEFT JOIN media_objects photo
+        ON photo.id = profile.profile_photo_media_id AND photo.status = 'ready'
       WHERE profile.id IN (SELECT account_id FROM referenced_accounts)
     )
     SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
@@ -2414,8 +2451,17 @@ export async function getBootstrapDialogsPage(
       ORDER BY account_id`;
     const profiles = await sql`
       SELECT a.id, a.first_name, a.last_name, a.display_name, a.bio, a.birthday,
-             a.profile_color, a.updated_at
+             a.profile_color, a.profile_photo_media_id, a.profile_photo_revision, a.updated_at,
+             photo.kind AS photo_kind, photo.content_type AS photo_content_type,
+             photo.file_name AS photo_file_name, photo.file_name_key_id AS photo_file_name_key_id,
+             photo.file_name_nonce AS photo_file_name_nonce,
+             photo.file_name_ciphertext AS photo_file_name_ciphertext,
+             photo.byte_size AS photo_byte_size, photo.duration_ms AS photo_duration_ms,
+             photo.width AS photo_width, photo.height AS photo_height,
+             photo.thumbnail_ciphertext AS photo_thumbnail_ciphertext
       FROM accounts a
+      LEFT JOIN media_objects photo
+        ON photo.id = a.profile_photo_media_id AND photo.status = 'ready'
       WHERE a.id IN (
         SELECT dm.account_id FROM dialog_members dm
         WHERE dm.dialog_id = ${row.dialog_id} AND dm.left_at IS NULL
@@ -2432,6 +2478,10 @@ export async function getBootstrapDialogsPage(
           AND message.service_data ? 'subject_account_id'
       )
       ORDER BY a.id`;
+    await preloadEnvelopeKeys(
+      sql,
+      profiles.map((profile: any) => profile.photo_file_name_key_id).filter(Boolean).map(String),
+    );
     // The five-message preview is intentionally sparse. Carry the authoritative unread count
     // separately so a new device can prioritize unread dialogs without first downloading history.
     const unread = (await sql`
@@ -2481,13 +2531,30 @@ export async function getBootstrapDialogsPage(
         joined_at: iso(m.joined_at),
         is_active: true,
       })),
-      profiles: profiles.map((p) => ({
+      profiles: await Promise.all(profiles.map(async (p) => ({
         accountId: p.id, firstName: p.first_name, lastName: p.last_name,
         displayName: p.display_name, bio: p.bio,
         birthday: p.birthday == null ? null : (p.birthday instanceof Date
           ? p.birthday.toISOString().slice(0, 10) : String(p.birthday).slice(0, 10)),
-        colorIndex: n(p.profile_color), updatedAt: iso(p.updated_at),
-      })),
+        colorIndex: n(p.profile_color),
+        photo: p.profile_photo_media_id == null ? null : await mediaDTOFromRow(sql, {
+          id: p.profile_photo_media_id,
+          owner_account_id: p.id,
+          kind: p.photo_kind,
+          content_type: p.photo_content_type,
+          file_name: p.photo_file_name,
+          file_name_key_id: p.photo_file_name_key_id,
+          file_name_nonce: p.photo_file_name_nonce,
+          file_name_ciphertext: p.photo_file_name_ciphertext,
+          byte_size: p.photo_byte_size,
+          duration_ms: p.photo_duration_ms,
+          width: p.photo_width,
+          height: p.photo_height,
+          thumbnail_ciphertext: p.photo_thumbnail_ciphertext,
+        }),
+        photoRevision: n(p.profile_photo_revision),
+        updatedAt: iso(p.updated_at),
+      }))),
       messages,
     });
   }

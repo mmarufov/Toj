@@ -4,6 +4,39 @@ import Security
 @testable import Toj
 
 final class CloudLocalStoreTests: XCTestCase {
+    func testPresenceCacheIsEncryptedAndIsolatedByObserverAccount() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "presence.sqlite").path,
+            key: Data("presence-cache-test-key".utf8)
+        )
+        try await store.savePresenceSnapshot(LocalPresenceSnapshot(
+            observerAccountId: "observer-a", subjectAccountId: "peer",
+            lastSeenAt: "2026-08-11T09:30:00.000Z", revision: 4
+        ))
+        try await store.savePresenceSnapshot(LocalPresenceSnapshot(
+            observerAccountId: "observer-b", subjectAccountId: "peer",
+            lastSeenAt: "2026-08-11T10:00:00.000Z", revision: 9
+        ))
+        let observerA = try await store.loadPresenceCache(observerAccountId: "observer-a")
+        XCTAssertEqual(observerA, [
+            LocalPresenceSnapshot(
+                observerAccountId: "observer-a", subjectAccountId: "peer",
+                lastSeenAt: "2026-08-11T09:30:00.000Z", revision: 4
+            ),
+        ])
+        try await store.removePresenceCache(
+            observerAccountId: "observer-a", subjectAccountIds: ["peer"]
+        )
+        let observerAAfterRemoval = try await store.loadPresenceCache(observerAccountId: "observer-a")
+        let observerB = try await store.loadPresenceCache(observerAccountId: "observer-b")
+        XCTAssertTrue(observerAAfterRemoval.isEmpty)
+        XCTAssertEqual(observerB.first?.revision, 9)
+    }
+
     func testAppLockTimeoutBoundaries() {
         XCTAssertTrue(AppLockTimeout.immediate.shouldLock(after: 0))
         XCTAssertFalse(AppLockTimeout.oneMinute.shouldLock(after: 59.999))
@@ -3323,6 +3356,366 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.completeMediaTransfer(transferId: transferId)
         let completed = try await store.mediaTransfer(id: transferId)
         XCTAssertNil(completed)
+    }
+
+    func testProfilePhotoMutationAndPreparedTransferSurviveProcessDeathAtomically() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "profile-photo.sqlite").path
+        let key = Data("profile-photo-recovery-key".utf8)
+        let accountId = "account-profile-photo"
+        let transferId = UUID().uuidString.lowercased()
+        let prepared = PreparedMediaUpload(
+            transferId: transferId, kind: "photo", contentType: "image/jpeg",
+            fileName: "profile-photo.jpg", byteSize: 1_024,
+            sha256: String(repeating: "c", count: 64), durationMs: nil,
+            width: 1_024, height: 768,
+            encryptedSourcePath: "/private/profile-photo.tojmedia",
+            encryptedThumbnailPath: "/private/profile-photo.thumb"
+        )
+        let mutationId: String
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            let mutation = try await store.stageProfilePhotoSet(
+                accountId: accountId,
+                prepared: prepared,
+                basePhotoRevision: 7
+            )
+            mutationId = mutation.clientMutationId
+            XCTAssertEqual(mutation.state, "pending")
+            let stagedTransfer = try await store.mediaTransfer(id: transferId)
+            XCTAssertEqual(stagedTransfer?.purpose, "profile_photo")
+        }
+
+        let reopened = try CloudLocalStore(path: path, key: key)
+        let recoveredValue = try await reopened.pendingProfilePhotoMutation(accountId: accountId)
+        let recovered = try XCTUnwrap(recoveredValue)
+        XCTAssertEqual(recovered.clientMutationId, mutationId)
+        XCTAssertEqual(recovered.basePhotoRevision, 7)
+        XCTAssertEqual(recovered.transferId, transferId)
+        let reopenedTransfer = try await reopened.mediaTransfer(id: transferId)
+        XCTAssertNotNil(reopenedTransfer)
+
+        let mediaId = UUID().uuidString.lowercased()
+        try await reopened.updateMediaTransfer(
+            transferId: transferId, mediaId: mediaId, uploadOffset: 1_024,
+            state: "ready_to_send", error: nil
+        )
+        try await reopened.markProfilePhotoUploaded(transferId: transferId, mediaId: mediaId)
+        let readyValue = try await reopened.readyProfilePhotoMutation(accountId: accountId)
+        let ready = try XCTUnwrap(readyValue)
+        XCTAssertEqual(ready.mediaId, mediaId)
+
+        let canonicalMedia = CloudMedia(
+            id: mediaId, kind: "photo", contentType: "image/jpeg",
+            fileName: "profile-photo.jpg", byteSize: 1_024,
+            durationMs: nil, width: 1_024, height: 768, hasThumbnail: true
+        )
+        let profile = CloudProfile(
+            accountId: accountId, firstName: "A", lastName: "B", displayName: "A B",
+            bio: "", birthday: nil, colorIndex: 2, photo: canonicalMedia,
+            photoRevision: 8, updatedAt: "2026-08-11T10:00:00.000Z"
+        )
+        _ = try await reopened.completeProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: mutationId,
+            profile: profile
+        )
+        let completedMutation = try await reopened.pendingProfilePhotoMutation(accountId: accountId)
+        let completedTransfer = try await reopened.mediaTransfer(id: transferId)
+        let completedProfile = try await reopened.profile(accountId: accountId)
+        XCTAssertNil(completedMutation)
+        XCTAssertNil(completedTransfer)
+        XCTAssertEqual(completedProfile?.photoRevision, 8)
+        XCTAssertEqual(completedProfile?.photo, canonicalMedia)
+    }
+
+    func testProfilePhotoConflictPreservesMineAndExplicitRebaseCreatesNewIntent() async throws {
+        let store = try makeStore()
+        let accountId = "account-profile-conflict"
+        let prepared = PreparedMediaUpload(
+            transferId: UUID().uuidString.lowercased(), kind: "photo",
+            contentType: "image/jpeg", fileName: "mine.jpg", byteSize: 64,
+            sha256: String(repeating: "d", count: 64), durationMs: nil,
+            width: 64, height: 64, encryptedSourcePath: "/private/mine.tojmedia",
+            encryptedThumbnailPath: nil
+        )
+        let original = try await store.stageProfilePhotoSet(
+            accountId: accountId, prepared: prepared, basePhotoRevision: 3
+        )
+        try await store.markProfilePhotoUploaded(
+            transferId: prepared.transferId,
+            mediaId: UUID().uuidString.lowercased()
+        )
+        _ = try await store.failProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: original.clientMutationId,
+            error: "changed elsewhere",
+            retryAfter: nil,
+            conflict: true
+        )
+        let conflictedValue = try await store.pendingProfilePhotoMutation(accountId: accountId)
+        let conflicted = try XCTUnwrap(conflictedValue)
+        XCTAssertEqual(conflicted.state, "conflict")
+        XCTAssertEqual(conflicted.transferId, prepared.transferId)
+
+        _ = try await store.rebaseProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: original.clientMutationId,
+            baseRevision: 9
+        )
+        let rebasedValue = try await store.readyProfilePhotoMutation(accountId: accountId)
+        let rebased = try XCTUnwrap(rebasedValue)
+        XCTAssertNotEqual(rebased.clientMutationId, original.clientMutationId)
+        XCTAssertEqual(rebased.basePhotoRevision, 9)
+        XCTAssertEqual(rebased.transferId, prepared.transferId)
+        XCTAssertNil(rebased.lastError)
+
+        let rebasedTransferValue = try await store.mediaTransfer(id: prepared.transferId)
+        let rebasedTransfer = try XCTUnwrap(rebasedTransferValue)
+        try await store.markMediaTerminal(
+            clientMsgId: rebasedTransfer.clientMsgId,
+            error: "invalid photo"
+        )
+        _ = try await store.failProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: rebased.clientMutationId,
+            error: "invalid photo",
+            retryAfter: nil,
+            terminal: true
+        )
+        _ = try await store.retryProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: rebased.clientMutationId
+        )
+        let retriedMutation = try await store.pendingProfilePhotoMutation(accountId: accountId)
+        XCTAssertFalse(try XCTUnwrap(retriedMutation).terminal)
+        let retriedTransfer = try await store.mediaTransfer(id: prepared.transferId)
+        XCTAssertFalse(try XCTUnwrap(retriedTransfer).terminal)
+    }
+
+    func testFailedProfilePhotoRemovalRetryReturnsDirectlyToCommitLane() async throws {
+        let store = try makeStore()
+        let accountId = "account-profile-removal-retry"
+        let removal = try await store.stageProfilePhotoRemoval(
+            accountId: accountId,
+            basePhotoRevision: 4
+        )
+        _ = try await store.failProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: removal.clientMutationId,
+            error: "temporary outage",
+            retryAfter: nil,
+            terminal: true
+        )
+        _ = try await store.retryProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: removal.clientMutationId
+        )
+        let readyValue = try await store.readyProfilePhotoMutation(accountId: accountId)
+        let ready = try XCTUnwrap(readyValue)
+        XCTAssertEqual(ready.operation, "remove")
+        XCTAssertEqual(ready.state, "ready_to_commit")
+        XCTAssertNil(ready.mediaId)
+        XCTAssertFalse(ready.terminal)
+    }
+
+    func testProfileTextAndPhotoClocksMergeWithoutCrossClobbering() async throws {
+        let store = try makeStore()
+        let accountId = "account-independent-profile-clocks"
+        let firstPhoto = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "photo", contentType: "image/jpeg",
+            fileName: "first.jpg", byteSize: 10, durationMs: nil,
+            width: 10, height: 10, hasThumbnail: true
+        )
+        let newerPhoto = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "photo", contentType: "image/jpeg",
+            fileName: "newer.jpg", byteSize: 11, durationMs: nil,
+            width: 11, height: 11, hasThumbnail: true
+        )
+        try await store.saveProfile(CloudProfile(
+            accountId: accountId, firstName: "Newest text", lastName: "One",
+            displayName: "Newest text One", bio: "new bio", birthday: nil, colorIndex: 1,
+            photo: firstPhoto, photoRevision: 2, updatedAt: "2026-08-11T12:00:00.000Z"
+        ))
+        try await store.saveProfile(CloudProfile(
+            accountId: accountId, firstName: "Older text", lastName: "Two",
+            displayName: "Older text Two", bio: "old bio", birthday: nil, colorIndex: 2,
+            photo: newerPhoto, photoRevision: 3, updatedAt: "2026-08-11T11:00:00.000Z"
+        ))
+        let firstMerged = try await store.profile(accountId: accountId)
+        var merged = try XCTUnwrap(firstMerged)
+        XCTAssertEqual(merged.displayName, "Newest text One")
+        XCTAssertEqual(merged.photo, newerPhoto)
+        XCTAssertEqual(merged.photoRevision, 3)
+
+        try await store.saveProfile(CloudProfile(
+            accountId: accountId, firstName: "Newest text", lastName: "Three",
+            displayName: "Newest text Three", bio: "latest bio", birthday: nil, colorIndex: 3,
+            photo: firstPhoto, photoRevision: 2, updatedAt: "2026-08-11T13:00:00.000Z"
+        ))
+        let secondMerged = try await store.profile(accountId: accountId)
+        merged = try XCTUnwrap(secondMerged)
+        XCTAssertEqual(merged.displayName, "Newest text Three")
+        XCTAssertEqual(merged.photo, newerPhoto)
+        XCTAssertEqual(merged.photoRevision, 3)
+    }
+
+    func testExactPhotoRollbackCannotDeleteANewerIntent() async throws {
+        let store = try makeStore()
+        let accountId = "account-profile-exact-rollback"
+        let old = try await store.stageProfilePhotoRemoval(
+            accountId: accountId,
+            basePhotoRevision: 1
+        )
+        let newer = try await store.stageProfilePhotoRemoval(
+            accountId: accountId,
+            basePhotoRevision: 2
+        )
+        let discardedOld = try await store.discardProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: old.clientMutationId
+        )
+        XCTAssertFalse(discardedOld)
+        let remaining = try await store.pendingProfilePhotoMutation(accountId: accountId)
+        XCTAssertEqual(
+            remaining?.clientMutationId,
+            newer.clientMutationId
+        )
+    }
+
+    func testDelayedPhotoCompletionPreservesANewerIntent() async throws {
+        let store = try makeStore()
+        let accountId = "account-profile-delayed-completion"
+        let older = try await store.stageProfilePhotoRemoval(
+            accountId: accountId,
+            basePhotoRevision: 2
+        )
+        let newer = try await store.stageProfilePhotoRemoval(
+            accountId: accountId,
+            basePhotoRevision: 3
+        )
+        let canonical = CloudProfile(
+            accountId: accountId, firstName: "Canonical", lastName: "Profile",
+            displayName: "Canonical Profile", bio: "", birthday: nil, colorIndex: 2,
+            photo: nil, photoRevision: 3, updatedAt: "2026-08-11T12:00:00.000Z"
+        )
+
+        let completed = try await store.completeProfilePhotoMutation(
+            accountId: accountId,
+            clientMutationId: older.clientMutationId,
+            profile: canonical
+        )
+
+        XCTAssertFalse(completed)
+        let remaining = try await store.pendingProfilePhotoMutation(accountId: accountId)
+        let storedCanonical = try await store.profile(accountId: accountId)
+        XCTAssertEqual(remaining?.clientMutationId, newer.clientMutationId)
+        XCTAssertEqual(storedCanonical, canonical)
+    }
+
+    func testInFlightPhotoCommitCannotConsumeANewerStagedIntent() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let config = CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+        )
+        let api = CloudAPI(config: config, session: session)
+        let mediaEngine = CloudMediaTransferEngine(config: config, session: session)
+        let store = try makeStore()
+        let accountId = "account-profile-in-flight"
+        let cloudSession = CloudSession(
+            accountId: accountId,
+            deviceId: "device-profile-in-flight",
+            token: "session-token"
+        )
+        let gate = LockedGate()
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/profile/photo")
+            gate.signalStarted()
+            gate.waitForRelease()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"profile":{"accountId":"\(accountId)","firstName":"Canonical",
+                 "lastName":"Profile","displayName":"Canonical Profile","bio":"",
+                 "birthday":null,"colorIndex":2,"photo":null,"photoRevision":1,
+                 "updatedAt":"2026-08-11T12:00:00.000Z"},
+                 "committedPhotoRevision":1,"duplicate":false}
+                """.utf8)
+            )
+        }
+        defer {
+            gate.release()
+            CloudAPIMockURLProtocol.handler = nil
+        }
+
+        let coordinator = ProfilePhotoSyncCoordinator(api: api, mediaEngine: mediaEngine)
+        await coordinator.configure(store: store, session: cloudSession, enabled: true)
+        _ = try await coordinator.stageRemoval(baseRevision: 0)
+        let olderCommit = Task { await coordinator.commitReady() }
+        XCTAssertTrue(gate.waitUntilStarted())
+
+        let newer = try await coordinator.stageRemoval(baseRevision: 1)
+        if case .idle = await coordinator.commitReady() {
+            // The mutation lane is intentionally serialized while the older request is unresolved.
+        } else {
+            XCTFail("A second profile-photo commit must not run concurrently")
+        }
+        gate.release()
+
+        guard case let .superseded(profile) = await olderCommit.value else {
+            return XCTFail("The delayed response should be canonical without consuming the newer intent")
+        }
+        XCTAssertEqual(profile.photoRevision, 1)
+        let remaining = try await store.pendingProfilePhotoMutation(accountId: accountId)
+        XCTAssertEqual(remaining?.clientMutationId, newer.clientMutationId)
+    }
+
+    func testRevokedLastSharedDialogPurgesProfileThumbnailButAnotherDialogProtectsIt() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        let firstDialog = "dialog-profile-first"
+        let secondDialog = "dialog-profile-second"
+        let media = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "photo", contentType: "image/jpeg",
+            fileName: "peer.jpg", byteSize: 128, durationMs: nil,
+            width: 64, height: 64, hasThumbnail: true
+        )
+        let profile = CloudProfile(
+            accountId: peerId, firstName: "Peer", lastName: "", displayName: "Peer",
+            bio: "", birthday: nil, colorIndex: 0, photo: media,
+            photoRevision: 1, updatedAt: "2026-08-11T10:00:00.000Z"
+        )
+        for dialogId in [firstDialog, secondDialog] {
+            try await store.upsertDialog(dialogId: dialogId, type: "direct", title: "Peer")
+            try await store.saveMembers(dialogId: dialogId, members: [
+                BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
+                BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+            ])
+        }
+        try await store.saveProfile(profile)
+
+        try await store.revokeGroupAccess(dialogId: firstDialog, reason: "access revoked")
+        let firstJobs = try await store.pendingAccessPurgeJobs()
+        let firstJob = try XCTUnwrap(firstJobs.first)
+        XCTAssertFalse(firstJob.purgeMediaIds.contains(media.id))
+        try await store.markAccessPurgeFilesDeleted(id: firstJob.id)
+        try await store.finalizeAccessPurge(id: firstJob.id)
+
+        try await store.revokeGroupAccess(dialogId: secondDialog, reason: "access revoked")
+        let secondJobs = try await store.pendingAccessPurgeJobs()
+        let secondJob = try XCTUnwrap(secondJobs.first)
+        XCTAssertTrue(secondJob.allMediaIds.contains(media.id))
+        XCTAssertTrue(secondJob.purgeMediaIds.contains(media.id))
     }
 
     func testCancellingMediaTransferRemovesDurableRetryAndOptimisticBubble() async throws {

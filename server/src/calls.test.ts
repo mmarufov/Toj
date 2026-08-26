@@ -1287,6 +1287,10 @@ describe("E2EE voice-call control plane", () => {
       }).toString("base64"),
       supportedProtocolVersions: [1], offeredMediaProfileVersions: [1],
     }).then(() => null, (error: unknown) => error);
+    // Ensure block, send, and call are all queued on the shared account boundary before release.
+    // Before the call path followed the common lock order, it held dialog membership rows here and
+    // deterministically deadlocked with the sender that acquired the advisory lock ahead of it.
+    await waitForAdvisoryWaiters(3);
     releaseLocks();
     await holder;
 

@@ -27,6 +27,7 @@ import {
   requireGroupCallSFUBarrierApplied,
   revokeGroupCallAccountTx,
 } from "./group-calls";
+import { revokeAccountPresence } from "./presence";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REPORT_REASONS = new Set([
@@ -790,6 +791,10 @@ async function banReportedAccount(sql: SQL, accountId: string): Promise<{
   endedCalls: CallRow[]; affectedGroupCallIds: string[];
 }> {
   await sql`UPDATE accounts SET status = 'banned', updated_at = now() WHERE id = ${accountId}`;
+  // Keep the account -> presence lock order used by account deletion, then publish the terminal
+  // state while this transaction can still identify every authorized direct-chat recipient.
+  // PostgreSQL defers NOTIFY delivery until commit, so peers never observe a ban that rolls back.
+  await revokeAccountPresence(sql, accountId);
   const endedCalls = await terminateCallsForAccountTx(sql, accountId, "account_banned");
   const affectedGroupCallIds = await revokeGroupCallAccountTx(sql, accountId);
   await handoffOwnedGroupsForDeletedAccount(sql, accountId);

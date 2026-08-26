@@ -21,6 +21,12 @@ import {
   revokeGroupCallDeviceTx,
   type GroupCallSFUControl,
 } from "./group-calls";
+import {
+  publishPresenceSessionRevocation,
+  revokeAccountPresence,
+  revokeDevicePresence,
+  type PresenceBroadcast,
+} from "./presence";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
@@ -763,6 +769,8 @@ export async function createCall(sql: SQL, p: {
     const participants = [p.callerAccountId, calleeAccountId].sort();
     await lockAccountMutations(tx, participants);
 
+    // Revalidate membership and account status while locked. Anchor the query to the discovered
+    // pair so an unexpected concurrent replacement fails closed instead of changing lock scope.
     const pair = (await tx`
       SELECT pair.account_low, pair.account_high
       FROM direct_dialog_pairs pair
@@ -773,6 +781,8 @@ export async function createCall(sql: SQL, p: {
       JOIN accounts low_account ON low_account.id = pair.account_low AND low_account.status IN ('active','limited')
       JOIN accounts high_account ON high_account.id = pair.account_high AND high_account.status IN ('active','limited')
       WHERE pair.dialog_id = ${dialogId}
+        AND pair.account_low = ${candidatePair.account_low}
+        AND pair.account_high = ${candidatePair.account_high}
         AND (${p.callerAccountId}::uuid = pair.account_low OR ${p.callerAccountId}::uuid = pair.account_high)
       FOR SHARE`)[0];
     if (!pair) throw new CallError("eligible direct dialog required", "ineligible", 403);
@@ -1476,20 +1486,35 @@ export async function revokeDeviceAndTerminateCalls(
   accountId: string,
   deviceId: string,
   groupCallSFUControl?: GroupCallSFUControl,
-): Promise<{ revoked: true; hints: CallHint[]; syncPushes: Push[] }> {
+): Promise<{
+  revoked: true;
+  hints: CallHint[];
+  syncPushes: Push[];
+  presenceBroadcasts: PresenceBroadcast[];
+}> {
   let ended: CallRow[] = [];
   let affectedGroupCallIds: string[] = [];
+  let presenceBroadcasts: PresenceBroadcast[] = [];
   const revoked = await revokeAuthDevice(sql, accountId, deviceId, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "device", accountId, deviceId);
       affectedGroupCallIds = await revokeGroupCallDeviceTx(tx, accountId, deviceId);
+      presenceBroadcasts = await revokeDevicePresence(tx, accountId, deviceId);
+      // PostgreSQL delivers NOTIFY only after commit, so remote WebSocket nodes cannot observe a
+      // revocation before it is durable and cannot miss the signal after a successful response.
+      await publishPresenceSessionRevocation(tx, accountId, deviceId, "device_revoked");
     },
   });
   if (affectedGroupCallIds.length) {
     await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
   }
   const syncPushes = await flushCallHistory(sql, ended);
-  return { ...revoked, hints: await hintsForRows(sql, ended), syncPushes };
+  return {
+    ...revoked,
+    hints: await hintsForRows(sql, ended),
+    syncPushes,
+    presenceBroadcasts,
+  };
 }
 
 /** Account status, device revocation, and call termination commit or roll back as one unit. */
@@ -1500,22 +1525,33 @@ export async function deleteAccountAndTerminateCalls(
   groupCallSFUControl?: GroupCallSFUControl,
 ): Promise<{
   deleted: true; hints: CallHint[]; syncPushes: Push[];
+  presenceBroadcasts: PresenceBroadcast[];
 }> {
   let ended: CallRow[] = [];
   let affectedGroupCallIds: string[] = [];
+  let presenceBroadcasts: PresenceBroadcast[] = [];
   const deleted = await deleteAuthAccount(sql, accountId, code, {
+    beforeCleanup: async (tx) => {
+      presenceBroadcasts = await revokeAccountPresence(tx, accountId);
+    },
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "account", accountId);
       affectedGroupCallIds = await revokeGroupCallAccountTx(tx, accountId);
       await handoffOwnedGroupsForDeletedAccount(tx, accountId);
       await purgeAccountDraftState(tx, accountId);
+      await publishPresenceSessionRevocation(tx, accountId, null, "account_deleted");
     },
   });
   if (affectedGroupCallIds.length) {
     await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
   }
   const syncPushes = await flushCallHistory(sql, ended);
-  return { ...deleted, hints: await hintsForRows(sql, ended), syncPushes };
+  return {
+    ...deleted,
+    hints: await hintsForRows(sql, ended),
+    syncPushes,
+    presenceBroadcasts,
+  };
 }
 
 export async function getIceConfig(sql: SQL, accountId: string, deviceId: string, rawCallId: unknown): Promise<{
