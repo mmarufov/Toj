@@ -5,6 +5,13 @@ All notable changes to Toj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to a `MAJOR.MINOR.PATCH.BUILD` version scheme.
 
+## [0.4.0.1] — 2026-08-29
+
+### Fixed
+
+- Made the search background-wake regression check synchronize with task retirement and enqueue
+  its deep backlog atomically, preventing slow CI machines from reporting a false timeout.
+
 ## [0.4.0.0] — 2026-07-23
 
 Adds one-to-one encrypted camera video calls on top of Toj's existing voice-call

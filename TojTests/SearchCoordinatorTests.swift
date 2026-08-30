@@ -101,14 +101,12 @@ final class SearchCoordinatorTests: XCTestCase {
         try await eventually("initial empty index settles") {
             try await self.coordinator.coverage().isComplete
         }
-        try await Task.sleep(for: .milliseconds(150))
+        await coordinator.waitForBackgroundTaskToRetireForTesting()
 
         let total = SearchCoordinator.foregroundDrainBudget + 37
-        for index in 1...total {
-            try await insert(Int64(index), "wake \(index)")
-        }
+        try await insertRange(1...total, textPrefix: "wake")
 
-        try await eventually("post-idle deep queue drains") {
+        try await eventually("post-idle deep queue drains", timeout: 30) {
             let coverage = try await self.coordinator.coverage()
             return coverage.indexed == total && coverage.queueDepth == 0
         }
@@ -319,6 +317,30 @@ final class SearchCoordinatorTests: XCTestCase {
                 VALUES (?, ?, ?, ?, 'a1', 'text', ?, 0, 0, 'visible', '2026-07-12T09:00:00Z', 'sent')
                 """, arguments: ["\(dialogId):\(msgId)", dialogId, msgId,
                                  "\(dialogId)-c\(msgId)", text])
+        }
+    }
+
+    /// Commits the whole backlog atomically so the observation sees one deterministic empty-to-deep
+    /// transition instead of racing hundreds of encrypted fixture writes.
+    private func insertRange(
+        _ range: ClosedRange<Int>, textPrefix: String, dialogId: String = "d1"
+    ) async throws {
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO dialogs(dialog_id, type, title, last_msg_id, updated_at)
+                VALUES (?, 'group', 'Test', 0, datetime('now'))
+                """, arguments: [dialogId])
+            for index in range {
+                let msgId = Int64(index)
+                try db.execute(sql: """
+                    INSERT INTO messages(local_id, dialog_id, msg_id, client_msg_id,
+                                         sender_account_id, kind, text, is_forwarded, edit_version,
+                                         state, server_ts, local_state)
+                    VALUES (?, ?, ?, ?, 'a1', 'text', ?, 0, 0, 'visible',
+                            '2026-07-12T09:00:00Z', 'sent')
+                    """, arguments: ["\(dialogId):\(msgId)", dialogId, msgId,
+                                     "\(dialogId)-c\(msgId)", "\(textPrefix) \(index)"])
+            }
         }
     }
 }
