@@ -134,6 +134,14 @@ actor SearchCoordinator {
         try await indexer.coverage()
     }
 
+#if DEBUG
+    /// Synchronization point for lifecycle tests that need the initial empty drain to have fully
+    /// retired before enqueueing new work. Production code never waits for background indexing.
+    func waitForBackgroundTaskToRetireForTesting() async {
+        await backgroundTask?.value
+    }
+#endif
+
     // MARK: - Background
 
     private func startQueueObservation() {
