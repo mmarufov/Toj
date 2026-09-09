@@ -53,7 +53,19 @@ notification listeners need session semantics. Staging limits the Bun query pool
 leaving room for those six listeners. `TOJ_CALL_NOTIFY_DATABASE_URL` can hold a separate
 verified session URL but normally inherits `DATABASE_URL`. Verify listener reconnects, worker
 heartbeats, and actual connection counts after deployment. Do not disable TLS certificate validation
-to work around certificate errors; install the appropriate trusted CA if required.
+to work around certificate errors. The staging package command loads the bundled public
+`certs/supabase-root-2021.crt` using `NODE_EXTRA_CA_CERTS` **before** starting Bun. This extends
+the trust store used by both Bun.SQL and all six pg notification clients, preserving public roots,
+chain verification, and hostname verification. Setting this variable after process startup is too late.
+For standalone migration/operator commands on this host, set the same environment variable first.
+
+The certificate is fetched from Supabase's [official distribution](https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt),
+whose URL is defined in Supabase Studio's [source](https://github.com/supabase/supabase/blob/master/apps/studio/hooks/custom-content/custom-content.json).
+Its SHA-256 fingerprint is `807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA`,
+and it expires on 2031-04-26. It is a public CA certificate, not a secret or private key.
+Review and replace it from the official source when Supabase rotates its CA; do not trust a
+certificate merely because an unverified server sent it. The regression test checks provenance
+fingerprint, expiry, and startup trust loading. Never set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
 `TOJ_TRUST_PROXY=0` is deliberate until the edge's forwarded-header handling has been verified.
 It can group staging OTP rate limits by proxy IP; use only a few test accounts and respect cooldowns.
