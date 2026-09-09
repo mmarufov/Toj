@@ -68,6 +68,10 @@ class WebhookOTPDelivery implements OTPDelivery {
   }
 }
 
+function hostedAuthentication(): boolean {
+  return process.env.NODE_ENV === "production" || process.env.NODE_ENV === "staging";
+}
+
 export function otpDeliveryFromEnvironment(): OTPDelivery | null {
   const rawUrl = process.env.TOJ_SMS_WEBHOOK_URL;
   const token = process.env.TOJ_SMS_WEBHOOK_TOKEN;
@@ -76,8 +80,8 @@ export function otpDeliveryFromEnvironment(): OTPDelivery | null {
     throw new Error("TOJ_SMS_WEBHOOK_URL and TOJ_SMS_WEBHOOK_TOKEN must be set together");
   }
   const url = new URL(rawUrl);
-  if (process.env.NODE_ENV === "production" && url.protocol !== "https:") {
-    throw new Error("TOJ_SMS_WEBHOOK_URL must use HTTPS in production");
+  if (hostedAuthentication() && url.protocol !== "https:") {
+    throw new Error("TOJ_SMS_WEBHOOK_URL must use HTTPS in production or staging");
   }
   return new WebhookOTPDelivery(url, token);
 }
@@ -90,7 +94,7 @@ type StartVerificationOptions = {
 
 function privateBetaOTPAllowed(normalizedPhone: string): boolean {
   if (process.env.TOJ_RETURN_OTP !== "1") return false;
-  if (process.env.NODE_ENV !== "production") return true;
+  if (!hostedAuthentication()) return true;
   return (process.env.TOJ_DEV_OTP_ALLOWLIST ?? "")
     .split(",")
     .map((value) => value.trim())
@@ -101,7 +105,7 @@ function privateBetaOTPAllowed(normalizedPhone: string): boolean {
 /** Used only for provider-readiness reporting; it never exposes the allowlisted values. */
 export function privateBetaOTPConfigured(): boolean {
   if (process.env.TOJ_RETURN_OTP !== "1") return false;
-  if (process.env.NODE_ENV !== "production") return true;
+  if (!hostedAuthentication()) return true;
   return (process.env.TOJ_DEV_OTP_ALLOWLIST ?? "")
     .split(",")
     .some((value) => /^\+[1-9]\d{7,14}$/.test(value.trim()));
@@ -141,10 +145,10 @@ export async function startVerification(
   const networkCandidates = networkInput
     ? tokenHashCandidates(networkInput).map((candidate) => candidate.digest)
     : [];
-  const production = process.env.NODE_ENV === "production";
-  const returnOTP = !production || privateBetaOTPAllowed(normalizedPhone);
+  const hosted = hostedAuthentication();
+  const returnOTP = !hosted || privateBetaOTPAllowed(normalizedPhone);
   const delivery = options.delivery ?? null;
-  if (production && !delivery && !returnOTP) {
+  if (hosted && !delivery && !returnOTP) {
     throw new AuthError("verification service temporarily unavailable", 503);
   }
 
@@ -234,7 +238,7 @@ export async function startVerification(
     }
   }
 
-  return production && !returnOTP ? {} : { code, retryAfter: OTP_RESEND_COOLDOWN_SECONDS };
+  return hosted && !returnOTP ? {} : { code, retryAfter: OTP_RESEND_COOLDOWN_SECONDS };
 }
 
 export type Session = { accountId: string; deviceId: string; token: string };

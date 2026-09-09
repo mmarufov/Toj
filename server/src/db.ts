@@ -5,6 +5,8 @@ import { SQL } from "bun";
 export const DEFAULT_URL = "postgres://localhost:5432/toj_dev";
 
 export function makeSql(url: string = process.env.DATABASE_URL ?? DEFAULT_URL): SQL {
+  // Leave room for the six dedicated LISTEN clients in the small staging session pool.
+  if (process.env.NODE_ENV === "staging") return new SQL(url, { max: 5 });
   return new SQL(url);
 }
 

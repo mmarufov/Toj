@@ -264,11 +264,11 @@ describe("M3 cloud sync", () => {
     expect((networkError as AuthError).status).toBe(429);
   });
 
-  test("production refuses to issue an OTP without a delivery adapter", async () => {
+  test.each(["production", "staging"])("%s refuses to issue an OTP without a delivery adapter", async (environment) => {
     const previous = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
     const previousHmacKey = process.env.TOJ_HMAC_KEY;
-    process.env.NODE_ENV = "production";
+    process.env.NODE_ENV = environment;
     process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x31).toString("base64");
     delete process.env.TOJ_RETURN_OTP;
     let error: unknown;
@@ -287,12 +287,12 @@ describe("M3 cloud sync", () => {
     expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
   });
 
-  test("private-beta OTP return requires the explicit switch and production phone allowlist", async () => {
+  test.each(["production", "staging"])("private-beta OTP return requires the explicit switch and %s phone allowlist", async (environment) => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
     const previousAllowlist = process.env.TOJ_DEV_OTP_ALLOWLIST;
     const previousHmacKey = process.env.TOJ_HMAC_KEY;
-    process.env.NODE_ENV = "production";
+    process.env.NODE_ENV = environment;
     process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x32).toString("base64");
     process.env.TOJ_RETURN_OTP = "1";
     delete process.env.TOJ_DEV_OTP_ALLOWLIST;

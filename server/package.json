@@ -5,6 +5,7 @@
   "scripts": {
     "start": "bun run server.ts",
     "cloud": "bun run src/cloud.ts",
+    "staging": "bun run src/staging.ts",
     "worker:scheduled-delivery": "bun run src/scheduled-delivery-worker.ts",
     "worker:link-preview": "bun run src/link-preview-worker.ts",
     "migrate": "bun run src/migrate.ts",
