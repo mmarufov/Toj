@@ -39,3 +39,6 @@ infra/coturn/certs/
 
 # Python bytecode from scripts/
 __pycache__/
+
+# Scratch space for unrelated local artifacts (screenshots, scratch PDFs, fixtures)
+tmp/
