@@ -341,6 +341,15 @@ private struct CloudAuthView: View {
                             keyboard: .default
                         )
                         .focused($focusedField, equals: .name)
+                        #if DEBUG
+                        if model.telegramOTPAvailable {
+                            Toggle("Receive my code in Telegram", isOn: $model.useTelegramOTP)
+                                .disabled(model.authRequestInFlight)
+                            Text("Private staging test. Sends a Toj code to the Telegram account for this number, not by SMS.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        #endif
                     }
                 }
                 .padding(.top, 34)
@@ -410,8 +419,13 @@ private struct CloudAuthView: View {
                     HStack(spacing: 18) {
                         Button("Change number") { model.resetAuthCode() }
                         if model.resendSeconds > 0 {
-                            Text("Resend in \(model.resendSeconds)s")
-                                .foregroundStyle(TojTheme.secondaryText)
+                            Group {
+                                switch model.resendCountdown {
+                                case .seconds(let seconds): Text("Resend in \(seconds)s")
+                                case .minutes(let minutes): Text("Resend in \(minutes)m")
+                                }
+                            }
+                            .foregroundStyle(TojTheme.secondaryText)
                         } else {
                             Button("Send again") { Task { await model.requestCode() } }
                         }
@@ -464,6 +478,11 @@ private struct CloudAuthView: View {
                 ? "Enter one saved recovery code and choose a replacement password."
                 : "Enter the account password you set in Privacy and Security."
         }
+        #if DEBUG
+        if model.requestedCode && model.telegramOTPAvailable && model.useTelegramOTP {
+            return "Check Telegram for your six-digit Toj code."
+        }
+        #endif
         return model.requestedCode
             ? "We sent a six-digit code to your phone."
             : "Fast, private messaging made for your people."

@@ -370,7 +370,7 @@ export function providerState(value: unknown): ProviderState {
   return value ? "configured" : "disabled";
 }
 
-export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState }) {
+export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState; telegram?: ProviderState }) {
   const started = performance.now();
   await sql`SELECT 1`;
   const savedMessages = await savedMessagesSchemaReadiness(sql);
@@ -451,6 +451,9 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const messagingFeatureReceipts = await cleanupMessagingFeatureReceipts(sql, batchSize);
   const callData = await cleanupCallData(sql, batchSize);
   const abuseReportData = await cleanupAbuseReports(sql, batchSize);
+  // Retention feeds the Telegram pilot's 24-hour request budget (auth.ts startVerification), which
+  // counts rows by created_at. expires_at is created_at + OTP_TTL, so rows outlive the budget
+  // window by that TTL; shortening either side would silently make the budget resettable.
   const otp = await sql`
     WITH doomed AS (
       SELECT id FROM otp_challenges

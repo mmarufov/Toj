@@ -5676,6 +5676,22 @@
         }
       }
     },
+    "Resend in %lldm" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторить через %lld мин"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пас аз %lld дақиқа дубора фиристодан"
+          }
+        }
+      }
+    },
     "Resend in %llds" : {
       "localizations" : {
         "ru" : {

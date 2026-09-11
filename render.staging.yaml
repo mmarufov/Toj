@@ -26,8 +26,18 @@ services:
         value: "0"
       - key: TOJ_TRUST_PROXY
         value: "0"
+      # Dashboard-owned: the Telegram pilot requires exactly "0" and the synthetic bypass requires
+      # "1". A pinned value here would be restored on every Blueprint sync and crash-loop the
+      # service against its own runbook, so this stays unsynced. See server/STAGING.md.
       - key: TOJ_RETURN_OTP
-        value: "1"
+        sync: false
+      # Telegram OTP pilot. Absent or unset leaves delivery disabled; never pin values here.
+      - key: TOJ_OTP_PROVIDER
+        sync: false
+      - key: TOJ_TELEGRAM_GATEWAY_TOKEN
+        sync: false
+      - key: TOJ_TELEGRAM_TEST_ALLOWLIST
+        sync: false
       - key: TOJ_MEDIA_MAX_OBJECT_BYTES
         value: "5242880"
       - key: TOJ_MEDIA_ACCOUNT_QUOTA_BYTES

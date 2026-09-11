@@ -87,6 +87,82 @@ fails closed before storing an OTP. Returned test OTPs are not proof of phone ow
 knows an allowlisted number could use this testing login. Use synthetic test identities and disposable
 content, never real private conversations. Real SMS and stronger private access are launch work.
 
+## Optional private Telegram OTP pilot
+
+Implemented for **staging login only**; token presence alone does not activate it.
+Publish/deploy the reviewed integration first, then configure these privately in Render:
+
+| Variable | Value |
+| --- | --- |
+| `TOJ_OTP_PROVIDER` | `telegram` |
+| `TOJ_TELEGRAM_GATEWAY_TOKEN` | Token from the owner's Telegram Gateway account; never paste into chat/Git |
+| `TOJ_TELEGRAM_TEST_ALLOWLIST` | Start with only the Gateway owner's actual E.164 phone number, entered privately |
+| `TOJ_RETURN_OTP` | `0` (mandatory; no direct test-code responses) |
+
+All four are `sync: false` in `render.staging.yaml`, so the Blueprint asks for them once and never
+overwrites them afterwards. `TOJ_RETURN_OTP` in particular must not be pinned in the Blueprint:
+the pilot needs `0` and the synthetic bypass needs `1`, so a pinned value would be restored on the
+next Blueprint sync and crash-loop the service against this runbook.
+
+Remove/unset SMS webhook configuration if present; it cannot run alongside this pilot.
+The old synthetic allowlist has no effect while direct code return is disabled. Do not put
+real numbers in that old bypass. No keys, TLS configuration, or database schema need changing.
+The pilot fails startup outside staging, with a missing/malformed token, with an invalid/empty
+allowlist (maximum five numbers), or with OTP return enabled. Allowlist entries may be pasted with
+spaces, parentheses, or hyphens; they are normalized exactly as the login path normalizes a typed
+number, so formatting alone never crash-loops the deployment. `/ready` reports
+`providers.telegram=configured` and `providers.sms=disabled`. Configured means the local
+adapter is wired, not that Telegram accepted the token or delivered a message.
+
+The iOS **Toj Staging** Debug build offers an unchecked "Receive my code in Telegram" toggle.
+The test user must opt in; login sends `deliveryChannel: "telegram"` to `/v1/auth/start`.
+Missing/other channels, non-allowlisted recipients, and non-login purposes fail closed before
+creating a challenge. Account-deletion and security-change OTP flows are not enabled in this
+pilot and need separate work before broader use; they answer `503` with code
+`capability_unavailable` so an operator can tell "not wired up" from "broken", while recipient
+scope and the OTP-return interlock share one generic `503` so the endpoint cannot be used to test
+allowlist membership. Security-change SMS alerts are simply not sent on this provider.
+Release does not expose the toggle.
+
+The server supplies its own six-digit code, retains existing expiry/attempt/reuse controls,
+and sends a single HTTPS POST to Telegram's fixed endpoint with header-based authorization
+and a 300-second delivery TTL. There is no billable eligibility preflight, automatic retry,
+fallback send, arbitrary endpoint, or callback. Timeouts/ambiguous failures consume the local
+challenge; even if a late message arrives its code will not work. A manual resend is subject
+to the existing cooldown. Errors never expose provider JSON, tokens, phones, or codes.
+
+Telegram echoes the number back in E.164 but does not guarantee the leading `+` survives, so the
+echo is compared digit-by-digit: an accepted — and possibly already billed and delivered — send is
+never thrown away over formatting. Every failure logs exactly one tag as
+`auth.otp.telegram_failed <reason>`, which is the whole diagnostic and carries no token, phone, or
+code. Expect `http_<status>:<CODE>` (an uppercase Gateway error such as `ACCESS_TOKEN_INVALID` or
+`BALANCE_NOT_ENOUGH`; any other provider string is reported as `unrecognized` rather than echoed),
+`timeout`, `network`, `malformed_response`, `phone_mismatch`, `delivery_expired/revoked`, or
+`transport_error`. Read this tag first when a code does not arrive; a bare `503` at the client
+says nothing on its own.
+
+An additional **10 OTP challenges per rolling 24 hours across this staging database** is
+serialized with a database advisory lock. Failed sends and pre-existing synthetic challenges
+count too; restarts do not reset the budget. Existing maintenance retains these records for longer
+than the budget window — that coupling is now pinned by a test and cross-referenced from
+`cleanupExpiredData`, because shortening either side would silently make the budget resettable.
+Account deletion hard-deletes a phone's challenges and would reset it, which is another reason the
+deletion OTP stays closed here. Do not clear challenge records to bypass it. This is a request cap, not a
+guaranteed monetary cap; keep the Gateway balance at zero for the initial owner-number test.
+Before any funded test, confirm actual account pricing, obtain spending approval, and review
+the allowlist. Official Gateway API docs advertise free sends to the owner's own number;
+API docs and Gateway terms have conflicting delivery/refund wording, so do not promise refunds.
+
+After deployment and private configuration, have the owner request a code in the staging app,
+read it in Telegram, and enter it personally. Verify successful login, incorrect/expired/reused
+codes, cooldown, outsider rejection, and redacted logs. Keep token contents out of screenshots.
+For rollback, unset `TOJ_OTP_PROVIDER` and leave `TOJ_RETURN_OTP=0` to disable logins safely;
+synthetic bypass may be restored only with the original synthetic-only allowlist reviewed.
+
+References: [Gateway API](https://core.telegram.org/gateway/api),
+[testing guide](https://core.telegram.org/gateway/verification-tutorial),
+[Gateway terms](https://telegram.org/tos/gateway).
+
 ## Fresh database bootstrap
 
 The canonical implementation is `src/migrate.ts`, including every SQL phase, TypeScript backfill,

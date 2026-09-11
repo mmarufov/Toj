@@ -11,6 +11,7 @@ import { enqueuePushDeliveries, revokePushBindingsForDevice } from "./push";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
+import { telegramOTPFromEnvironment } from "./telegram-otp";
 export { AuthError } from "./auth-error";
 import {
   isV2AccessToken,
@@ -34,6 +35,9 @@ type OTPPurpose = "login" | "account_deletion" | "security_change";
 export type SecurityChangeEvent = "two_factor_enabled" | "two_factor_changed" | "two_factor_disabled";
 
 export interface OTPDelivery {
+  readonly channel?: "telegram";
+  readonly dailyRequestLimit?: number;
+  allows?(phone: string): boolean;
   send(phone: string, code: string, purpose: OTPPurpose): Promise<void>;
   sendSecurityAlert?(phone: string, event: SecurityChangeEvent): Promise<void>;
 }
@@ -73,6 +77,12 @@ function hostedAuthentication(): boolean {
 }
 
 export function otpDeliveryFromEnvironment(): OTPDelivery | null {
+  const provider = process.env.TOJ_OTP_PROVIDER;
+  if (provider && provider !== "telegram" && provider !== "webhook") {
+    throw new Error("TOJ_OTP_PROVIDER must be telegram or webhook when set");
+  }
+  const telegram = telegramOTPFromEnvironment();
+  if (telegram) return telegram;
   const rawUrl = process.env.TOJ_SMS_WEBHOOK_URL;
   const token = process.env.TOJ_SMS_WEBHOOK_TOKEN;
   if (!rawUrl && !token) return null;
@@ -90,6 +100,7 @@ type StartVerificationOptions = {
   networkKey?: string | null;
   delivery?: OTPDelivery | null;
   purpose?: OTPPurpose;
+  deliveryChannel?: unknown;
 };
 
 function privateBetaOTPAllowed(normalizedPhone: string): boolean {
@@ -146,8 +157,27 @@ export async function startVerification(
     ? tokenHashCandidates(networkInput).map((candidate) => candidate.digest)
     : [];
   const hosted = hostedAuthentication();
-  const returnOTP = !hosted || privateBetaOTPAllowed(normalizedPhone);
   const delivery = options.delivery ?? null;
+  if (delivery?.channel === "telegram") {
+    // Stated plainly: the pilot is login-only, and an operator staring at a 503 should not have to
+    // guess whether account deletion or a two-step change is broken or simply not wired up yet.
+    if (purpose !== "login") {
+      throw new AuthError("this verification step is unavailable in the Telegram pilot", 503,
+        undefined, "capability_unavailable");
+    }
+    // Recipient scope and the OTP-return interlock share one generic message on purpose: a
+    // distinct reply would turn this endpoint into an allowlist-membership oracle.
+    if (process.env.TOJ_RETURN_OTP !== "0" || !delivery.allows?.(normalizedPhone)) {
+      throw new AuthError("verification service temporarily unavailable", 503);
+    }
+    if (options.deliveryChannel !== "telegram") {
+      throw new AuthError("choose Telegram code delivery to continue", 400);
+    }
+  } else if (options.deliveryChannel !== undefined) {
+    // Never silently substitute SMS or synthetic codes after a Telegram choice.
+    throw new AuthError("requested verification channel unavailable", 503);
+  }
+  const returnOTP = delivery?.channel !== "telegram" && (!hosted || privateBetaOTPAllowed(normalizedPhone));
   if (hosted && !delivery && !returnOTP) {
     throw new AuthError("verification service temporarily unavailable", 503);
   }
@@ -159,6 +189,17 @@ export async function startVerification(
   const networkLocks = networkCandidates.map((candidate) => candidate.readBigInt64BE(0));
 
   const challengeId: string = await sql.begin(async (tx) => {
+    if (delivery?.dailyRequestLimit) {
+      // Taken before the phone/network locks below so every caller acquires the same ordering.
+      // The window is only meaningful while cleanupExpiredData retains challenges for longer than
+      // 24 hours; ops.ts carries the matching note and m3.test.ts pins the pair.
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended('toj-otp-daily-budget-v1', 0))`;
+      const count = Number((await tx`SELECT count(*) AS count FROM otp_challenges
+        WHERE created_at > now() - interval '24 hours'`)[0].count);
+      if (count >= delivery.dailyRequestLimit) {
+        throw new AuthError("verification request budget reached; try again later", 429, 86400);
+      }
+    }
     const locks = [...phoneLocks, ...networkLocks]
       .sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
     for (const lock of locks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
@@ -238,7 +279,8 @@ export async function startVerification(
     }
   }
 
-  return hosted && !returnOTP ? {} : { code, retryAfter: OTP_RESEND_COOLDOWN_SECONDS };
+  return returnOTP ? { code, retryAfter: OTP_RESEND_COOLDOWN_SECONDS }
+    : { retryAfter: OTP_RESEND_COOLDOWN_SECONDS };
 }
 
 export type Session = { accountId: string; deviceId: string; token: string };

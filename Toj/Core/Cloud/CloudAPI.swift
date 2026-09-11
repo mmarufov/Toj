@@ -1267,8 +1267,10 @@ struct CloudAPI: Sendable {
         return formatter
     }()
 
-    func startAuth(phone: String) async throws -> AuthStartResponse {
-        try await post("v1/auth/start", body: ["phone": phone], token: nil)
+    func startAuth(phone: String, deliveryChannel: String? = nil) async throws -> AuthStartResponse {
+        var body = ["phone": phone]
+        if let deliveryChannel { body["deliveryChannel"] = deliveryChannel }
+        return try await post("v1/auth/start", body: body, token: nil)
     }
 
     func capabilities(token: String? = nil) async throws -> CloudCapabilitiesResponse {
