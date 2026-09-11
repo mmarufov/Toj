@@ -933,7 +933,9 @@ export function startCloudServer(
 
         else if (url.pathname === "/ready") {
           const baseState = await readiness(db, {
-            sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
+            sms: otpDelivery?.channel === "telegram" ? "disabled"
+              : otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
+            ...(otpDelivery?.channel === "telegram" ? { telegram: "configured" as const } : {}),
             push: pushSender ? "configured" : "disabled",
           });
           const reportSchema = await abuseReportSchemaReadiness(db);
@@ -1080,6 +1082,7 @@ export function startCloudServer(
           if (!body.phone) throw new AuthError("phone required", 400);
           response = json(await startVerification(db, body.phone, {
             networkKey: networkKey(req, server), delivery: otpDelivery,
+            deliveryChannel: body.deliveryChannel,
           }));
         }
 

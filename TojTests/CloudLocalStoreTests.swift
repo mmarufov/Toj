@@ -2233,6 +2233,145 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.baseURL, expected)
     }
 
+    #if DEBUG
+    @MainActor
+    func testTelegramStagingLoginRequiresExplicitChoiceAndNeverAutofillsReturnedCode() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://api.tojchat.tech/v1/auth/start")
+            let data = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+            XCTAssertEqual(body["deliveryChannel"], "telegram")
+            return (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
+                httpVersion: "HTTP/1.1", headerFields: nil)),
+                Data("{\"code\":\"123456\",\"retryAfter\":30}".utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+        let api = CloudAPI(config: config, session: URLSession(configuration: configuration))
+        let model = CloudAppModel(config: config, api: api, useDefaultLocalStore: false)
+        XCTAssertTrue(model.telegramOTPAvailable)
+        XCTAssertFalse(model.useTelegramOTP)
+        model.phone = "+12025550101"
+        model.displayName = "Synthetic"
+        model.useTelegramOTP = true
+        await model.requestCode()
+        XCTAssertTrue(model.requestedCode)
+        XCTAssertEqual(model.code, "")
+        let other = CloudAppModel(config: CloudConfig(baseURL: try XCTUnwrap(
+            URL(string: "https://api.sandstrm.online/cloud"))), useDefaultLocalStore: false)
+        XCTAssertFalse(other.telegramOTPAvailable)
+    }
+    #endif
+
+    #if DEBUG
+    @MainActor
+    func testLoginWithoutTheTelegramToggleNeverRequestsAChannel() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            let data = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+            XCTAssertEqual(body["phone"], "+12025550101")
+            XCTAssertNil(body["deliveryChannel"])
+            return (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
+                httpVersion: "HTTP/1.1", headerFields: nil)),
+                Data("{\"code\":\"123456\",\"retryAfter\":30}".utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+        let model = CloudAppModel(config: config, api: CloudAPI(config: config,
+            session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
+        model.phone = "+12025550101"
+        model.displayName = "Synthetic"
+        XCTAssertFalse(model.useTelegramOTP)
+        await model.requestCode()
+        // The untouched toggle leaves the existing synthetic-code path exactly as it was.
+        XCTAssertEqual(model.code, "123456")
+    }
+
+    @MainActor
+    func testExhaustedRequestBudgetDoesNotParkResendForADay() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: "HTTP/1.1",
+                headerFields: ["Retry-After": "86400"])),
+             Data("{\"error\":\"verification request budget reached; try again later\"}".utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+        let model = CloudAppModel(config: config, api: CloudAPI(config: config,
+            session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
+        model.phone = "+12025550101"
+        model.displayName = "Synthetic"
+        model.useTelegramOTP = true
+        await model.requestCode()
+
+        XCTAssertFalse(model.requestedCode)
+        XCTAssertEqual(model.resendSeconds, CloudAppModel.maxResendCountdownSeconds)
+        XCTAssertEqual(model.resendCountdown, .minutes(60))
+    }
+
+    @MainActor
+    func testResendCountdownSwitchesFromSecondsToMinutes() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let cases: [(Int, CloudAppModel.ResendCountdown)] = [
+            (30, .seconds(30)), (59, .seconds(59)), (60, .minutes(1)), (90, .minutes(2)),
+        ]
+        for (retryAfter, expected) in cases {
+            CloudAPIMockURLProtocol.handler = { request in
+                (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: "HTTP/1.1",
+                    headerFields: ["Retry-After": String(retryAfter)])),
+                 Data("{\"error\":\"please wait before requesting another code\"}".utf8))
+            }
+            let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+            let model = CloudAppModel(config: config, api: CloudAPI(config: config,
+                session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
+            model.phone = "+12025550101"
+            model.displayName = "Synthetic"
+            await model.requestCode()
+            XCTAssertEqual(model.resendCountdown, expected, "retryAfter \(retryAfter)")
+        }
+    }
+    #endif
+
+    func testStagingEndpointPersistsAndUsesRootV1Routes() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let launched = CloudConfig.resolve(
+            environment: ["TOJ_CLOUD_BASE_URL": "https://api.tojchat.tech"],
+            defaults: defaults
+        )
+        let relaunched = CloudConfig.resolve(environment: [:], defaults: defaults)
+
+        XCTAssertEqual(launched.baseURL, relaunched.baseURL)
+        XCTAssertEqual(relaunched.httpURL(path: "v1/auth/start").absoluteString,
+                       "https://api.tojchat.tech/v1/auth/start")
+        XCTAssertEqual(relaunched.wsURL().absoluteString, "wss://api.tojchat.tech/v1/ws")
+        XCTAssertNil(relaunched.validationIssue(environment: [:]))
+    }
+
+    func testBundledProductionEndpointOverridesPersistedStagingEndpoint() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("https://api.tojchat.tech", forKey: "TOJ_CLOUD_BASE_URL")
+
+        let config = CloudConfig.resolve(
+            environment: [:],
+            defaults: defaults,
+            bundledBaseURL: "https://api.sandstrm.online/cloud"
+        )
+
+        XCTAssertEqual(config.baseURL.absoluteString, "https://api.sandstrm.online/cloud")
+    }
+
     func testCloudConfigUsesBundledReleaseURLOnFreshInstall() throws {
         let suiteName = "CloudConfigTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

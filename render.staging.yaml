@@ -1,0 +1,60 @@
+# Review and approve cost/public exposure before connecting this Blueprint.
+# Secrets are entered through Render, never committed. See server/STAGING.md.
+services:
+  - type: web
+    name: toj-staging
+    runtime: node
+    plan: 0.5c-512mb
+    region: frankfurt
+    numInstances: 1
+    branch: mmarufov/tajikistan-servers
+    rootDir: server
+    buildCommand: bun install --frozen-lockfile
+    startCommand: bun run staging
+    healthCheckPath: /ready
+    autoDeployTrigger: "off"
+    envVars:
+      - key: BUN_VERSION
+        value: 1.3.11
+      - key: NODE_ENV
+        value: staging
+      - key: TOJ_CRYPTO_MODE
+        value: envelope
+      - key: TOJ_KEY_ENCRYPTION_PROVIDER
+        value: local
+      - key: TOJ_PRODUCTIVITY_WORKERS_DISABLED
+        value: "0"
+      - key: TOJ_TRUST_PROXY
+        value: "0"
+      # Dashboard-owned: the Telegram pilot requires exactly "0" and the synthetic bypass requires
+      # "1". A pinned value here would be restored on every Blueprint sync and crash-loop the
+      # service against its own runbook, so this stays unsynced. See server/STAGING.md.
+      - key: TOJ_RETURN_OTP
+        sync: false
+      # Telegram OTP pilot. Absent or unset leaves delivery disabled; never pin values here.
+      - key: TOJ_OTP_PROVIDER
+        sync: false
+      - key: TOJ_TELEGRAM_GATEWAY_TOKEN
+        sync: false
+      - key: TOJ_TELEGRAM_TEST_ALLOWLIST
+        sync: false
+      - key: TOJ_MEDIA_MAX_OBJECT_BYTES
+        value: "5242880"
+      - key: TOJ_MEDIA_ACCOUNT_QUOTA_BYTES
+        value: "20971520"
+      - key: DATABASE_URL
+        sync: false
+      - key: TOJ_DEV_OTP_ALLOWLIST
+        sync: false
+      - key: TOJ_LOCAL_KEY_ENCRYPTION_KEY
+        generateValue: true
+      - key: TOJ_MESSAGE_KEY
+        generateValue: true
+      - key: TOJ_HMAC_KEY
+        generateValue: true
+      - key: TOJ_PROTOCOL_ID_KEY
+        generateValue: true
+      - key: TOJ_STAGING_BLIND_INDEX_KEY
+        generateValue: true
+      - key: TOJ_METRICS_TOKEN
+        generateValue: true

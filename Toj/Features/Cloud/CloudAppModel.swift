@@ -289,6 +289,12 @@ final class CloudAppModel {
     private(set) var replicaUpdatePhase: ReplicaUpdatePhase = .idle
     private(set) var lastSuccessfulServerContact: Date?
     private(set) var requestedCode = false
+    #if DEBUG
+    var useTelegramOTP = false
+    // Matched on host so a trailing slash or path on the configured endpoint cannot silently
+    // hide the staging toggle with no explanation.
+    var telegramOTPAvailable: Bool { api.config.baseURL.host?.lowercased() == "api.tojchat.tech" }
+    #endif
     private(set) var authRequestInFlight = false
     private(set) var authVerifyInFlight = false
     private(set) var twoFactorChallengeId: String?
@@ -299,6 +305,16 @@ final class CloudAppModel {
     private(set) var securityStepUpToken: String?
     private(set) var requiresDifferentAccountCleanupConfirmation = false
     private(set) var resendSeconds = 0
+    /// The OTP request budget answers an exhausted quota with a full day; counting that down one
+    /// second at a time would park the resend button for 24 hours instead of letting the user ask
+    /// again and see the real answer.
+    static let maxResendCountdownSeconds = 3600
+    /// The unit choice lives here so it stays testable; the view keeps both literal interpolations
+    /// so the string catalog can continue to extract and translate them.
+    enum ResendCountdown: Equatable { case seconds(Int), minutes(Int) }
+    var resendCountdown: ResendCountdown {
+        resendSeconds >= 60 ? .minutes((resendSeconds + 59) / 60) : .seconds(resendSeconds)
+    }
     private(set) var activeDialogId: String?
     private(set) var pendingDeepLinkDialogId: String?
     private(set) var conversationOpenState: ConversationOpenState = .loadingLocal
@@ -896,9 +912,15 @@ final class CloudAppModel {
         authRequestInFlight = true
         defer { authRequestInFlight = false }
         do {
-            let response = try await api.startAuth(phone: trimmed)
+            var deliveryChannel: String?
+            #if DEBUG
+            if telegramOTPAvailable && useTelegramOTP { deliveryChannel = "telegram" }
+            #endif
+            let response = try await api.startAuth(phone: trimmed, deliveryChannel: deliveryChannel)
             requestedCode = true
-            if let devCode = response.code {
+            if deliveryChannel != nil {
+                code = ""
+            } else if let devCode = response.code {
                 code = devCode
             }
             startResendCountdown(response.retryAfter ?? 30)
@@ -2630,7 +2652,7 @@ final class CloudAppModel {
 
     private func startResendCountdown(_ seconds: Int) {
         resendTask?.cancel()
-        resendSeconds = max(0, seconds)
+        resendSeconds = min(max(0, seconds), Self.maxResendCountdownSeconds)
         guard resendSeconds > 0 else {
             resendTask = nil
             return

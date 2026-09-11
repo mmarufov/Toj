@@ -8,6 +8,8 @@ import {
   getProfile,
   updateProfile,
   startAccountDeletion,
+  startSecurityChange,
+  otpDeliveryFromEnvironment,
   deleteAccount,
   requireActiveDevice,
   resolveDevice,
@@ -66,6 +68,7 @@ import {
 } from "./media";
 import { createHash } from "node:crypto";
 import { Client } from "pg";
+import { TelegramOTPDelivery } from "./telegram-otp";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
@@ -264,11 +267,11 @@ describe("M3 cloud sync", () => {
     expect((networkError as AuthError).status).toBe(429);
   });
 
-  test("production refuses to issue an OTP without a delivery adapter", async () => {
+  test.each(["production", "staging"])("%s refuses to issue an OTP without a delivery adapter", async (environment) => {
     const previous = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
     const previousHmacKey = process.env.TOJ_HMAC_KEY;
-    process.env.NODE_ENV = "production";
+    process.env.NODE_ENV = environment;
     process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x31).toString("base64");
     delete process.env.TOJ_RETURN_OTP;
     let error: unknown;
@@ -287,12 +290,12 @@ describe("M3 cloud sync", () => {
     expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
   });
 
-  test("private-beta OTP return requires the explicit switch and production phone allowlist", async () => {
+  test.each(["production", "staging"])("private-beta OTP return requires the explicit switch and %s phone allowlist", async (environment) => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
     const previousAllowlist = process.env.TOJ_DEV_OTP_ALLOWLIST;
     const previousHmacKey = process.env.TOJ_HMAC_KEY;
-    process.env.NODE_ENV = "production";
+    process.env.NODE_ENV = environment;
     process.env.TOJ_HMAC_KEY = Buffer.alloc(32, 0x32).toString("base64");
     process.env.TOJ_RETURN_OTP = "1";
     delete process.env.TOJ_DEV_OTP_ALLOWLIST;
@@ -882,6 +885,186 @@ describe("M3 cloud sync", () => {
         + (SELECT count(*) FROM media_group_send_requests)
         + (SELECT count(*) FROM media_group_send_budgets) AS count`)[0];
     expect(Number(remaining.count)).toBe(0);
+  });
+
+  test("Telegram HTTP login enforces consent and recipient scope, hides OTP, and reports the real channel", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const phone = testPhone(190);
+    let deliveredCode = "";
+    let sends = 0;
+    const delivery = new TelegramOTPDelivery("synthetic", [phone], async (_url, init) => {
+      sends++;
+      deliveredCode = JSON.parse(init.body as string).code;
+      return Response.json({ ok: true, result: { request_id: "test", phone_number: phone, request_cost: 0 } });
+    });
+    const server = startCloudServer(0, db, null, delivery, { backgroundWorkers: false });
+    const base = `http://127.0.0.1:${server.port}`;
+    const request = (body: unknown) => fetch(`${base}/v1/auth/start`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    try {
+      expect((await request({ phone })).status).toBe(400);
+      expect((await request({ phone: testPhone(191), deliveryChannel: "telegram" })).status).toBe(503);
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
+      expect(sends).toBe(0);
+      const response = await request({ phone, deliveryChannel: "telegram" });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ retryAfter: 30 });
+      expect(sends).toBe(1);
+      expect((await request({ phone, deliveryChannel: "telegram" })).status).toBe(429);
+      expect(sends).toBe(1);
+      const session = await checkVerification(db, phone, deliveredCode, "ios", "Test", "Telegram Test");
+      expect(session.accountId).toBeTruthy();
+      const ready = await (await fetch(`${base}/ready`)).json() as any;
+      expect(ready.providers).toMatchObject({ sms: "disabled", telegram: "configured" });
+      // Accidental operator re-enabling of the old bypass must fail closed, not expose a code.
+      process.env.TOJ_RETURN_OTP = "1";
+      expect((await request({ phone, deliveryChannel: "telegram" })).status).toBe(503);
+      expect(sends).toBe(1);
+    } finally {
+      await server.stop(true);
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("Telegram daily budget is database-backed and serialized across concurrent recipients", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    let sends = 0;
+    const delivery: OTPDelivery = { channel: "telegram", dailyRequestLimit: 1,
+      allows: () => true, async send() { sends++; } };
+    try {
+      const results = await Promise.allSettled([192, 193].map((suffix) => startVerification(db, testPhone(suffix), {
+        delivery, deliveryChannel: "telegram",
+      })));
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      expect(sends).toBe(1);
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(1);
+      await expect(startVerification(db, testPhone(194), { delivery: { ...delivery }, deliveryChannel: "telegram" }))
+        .rejects.toMatchObject({ status: 429 });
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("Telegram provider failure consumes challenge without leaking a code or retrying", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    let sends = 0;
+    const delivery = new TelegramOTPDelivery("synthetic", [testPhone(195)], async () => {
+      sends++;
+      return Response.json({ ok: false, error: "provider details must stay private" });
+    });
+    try {
+      await expect(startVerification(db, testPhone(195), { delivery, deliveryChannel: "telegram" }))
+        .rejects.toMatchObject({ status: 503 });
+      expect(sends).toBe(1);
+      expect((await db`SELECT consumed_at FROM otp_challenges`)[0].consumed_at).not.toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("challenge retention outlives the budget window so maintenance cannot refill it", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const delivery: OTPDelivery = { channel: "telegram", dailyRequestLimit: 1,
+      allows: () => true, async send() {} };
+    const backdate = (hours: number) => db`
+      UPDATE otp_challenges SET created_at = now() - (${hours} * interval '1 hour'),
+        expires_at = now() - (${hours} * interval '1 hour') + interval '5 minutes'`;
+    try {
+      await startVerification(db, testPhone(196), { delivery, deliveryChannel: "telegram" });
+      await backdate(23);
+      await cleanupExpiredData(db);
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(1);
+      await expect(startVerification(db, testPhone(197), { delivery, deliveryChannel: "telegram" }))
+        .rejects.toMatchObject({ status: 429 });
+
+      // Past the window the same maintenance does drop the row and the budget legitimately refills.
+      await backdate(25);
+      await cleanupExpiredData(db);
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
+      await startVerification(db, testPhone(197), { delivery, deliveryChannel: "telegram" });
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("Telegram pilot refuses non-login verification explicitly and keeps deletion shut", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const phone = testPhone(198);
+    const account = await makeAccount(phone, "Pilot");
+    let sends = 0;
+    const delivery = new TelegramOTPDelivery("synthetic", [phone], async () => {
+      sends++;
+      return Response.json({ ok: true, result: { request_id: "t", phone_number: phone, request_cost: 0 } });
+    });
+    try {
+      for (const start of [startAccountDeletion, startSecurityChange]) {
+        await expect(start(db, account.accountId, { delivery }))
+          .rejects.toMatchObject({ status: 503, code: "capability_unavailable" });
+      }
+      expect(sends).toBe(0);
+      // deleteAccount hard-deletes this phone's challenges, so it would reset the budget. That
+      // path stays closed only because no account_deletion challenge can be minted here.
+      expect(await db`SELECT id FROM otp_challenges WHERE purpose <> 'login'`).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("Telegram-delivered codes keep the existing expiry and single-use guarantees", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const phone = testPhone(199);
+    let delivered = "";
+    const delivery = new TelegramOTPDelivery("synthetic", [phone], async (_url, init) => {
+      delivered = JSON.parse(init.body as string).code;
+      return Response.json({ ok: true, result: { request_id: "t", phone_number: phone, request_cost: 0 } });
+    });
+    try {
+      await startVerification(db, phone, { delivery, deliveryChannel: "telegram" });
+      expect(delivered).toMatch(/^\d{6}$/);
+      expect((await checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).accountId).toBeTruthy();
+      await expect(checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).rejects.toThrow();
+
+      // Age the consumed challenge past the resend cooldown, then expire the replacement.
+      await db`UPDATE otp_challenges SET created_at = now() - interval '1 hour'`;
+      await startVerification(db, phone, { delivery, deliveryChannel: "telegram" });
+      await db`UPDATE otp_challenges SET expires_at = now() - interval '1 second' WHERE consumed_at IS NULL`;
+      await expect(checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).rejects.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("provider selection is explicit: a stored Telegram token alone stays inert", () => {
+    const keys = ["TOJ_OTP_PROVIDER", "TOJ_TELEGRAM_GATEWAY_TOKEN", "TOJ_TELEGRAM_TEST_ALLOWLIST",
+      "TOJ_SMS_WEBHOOK_URL", "TOJ_SMS_WEBHOOK_TOKEN"] as const;
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      for (const key of keys) delete process.env[key];
+      process.env.TOJ_TELEGRAM_GATEWAY_TOKEN = "synthetic";
+      process.env.TOJ_TELEGRAM_TEST_ALLOWLIST = testPhone(200);
+      expect(otpDeliveryFromEnvironment()).toBeNull();
+
+      process.env.TOJ_OTP_PROVIDER = "sms";
+      expect(() => otpDeliveryFromEnvironment()).toThrow();
+
+      // An explicit webhook selection must keep using the webhook, never the stored token.
+      process.env.TOJ_OTP_PROVIDER = "webhook";
+      process.env.TOJ_SMS_WEBHOOK_URL = "https://example.test/hook";
+      process.env.TOJ_SMS_WEBHOOK_TOKEN = "synthetic";
+      expect(otpDeliveryFromEnvironment()?.channel).toBeUndefined();
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]!;
+      }
+    }
   });
 
   test("failed OTP delivery consumes the unusable challenge", async () => {
