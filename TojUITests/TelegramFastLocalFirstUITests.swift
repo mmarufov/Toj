@@ -248,7 +248,7 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
             app.swipeUp()
         }
         XCTAssertTrue(pendingGroup.waitForExistence(timeout: 15))
-        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+        assertDraftAttachmentClears("ui-draft-0", "The grouped send left its draft attachment in the composer.")
     }
 
     func testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking() {
@@ -259,7 +259,7 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         XCTAssertTrue(send.waitForExistence(timeout: 15))
         send.tap()
         XCTAssertTrue(element("media-bubble-\(Fixture.photo)").waitForExistence(timeout: 15))
-        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+        assertDraftAttachmentClears("ui-draft-0", "The single-attachment send left its draft attachment in the composer.")
     }
 
     func testPartialAndFailedAlbumsExposeStableAccessiblePresentation() {
@@ -306,7 +306,33 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         let back = app.buttons["Back"].firstMatch
         XCTAssertTrue(back.waitForExistence(timeout: 15))
         back.tap()
-        XCTAssertTrue(app.buttons["chat-row-\(Fixture.primaryDialog)"].waitForExistence(timeout: 15))
+        // A tap synthesized while the push transition is still animating can be swallowed, so
+        // retry once exactly as openChat(_:) already does rather than failing the whole test.
+        let row = app.buttons["chat-row-\(Fixture.primaryDialog)"]
+        if !row.waitForExistence(timeout: 5), back.waitForExistence(timeout: 15) {
+            back.tap()
+        }
+        XCTAssertTrue(
+            row.waitForExistence(timeout: 15),
+            "The back tap did not complete navigation to the chat list."
+        )
+    }
+
+    /// The composer's attachment chips are driven by `currentDraft`, which is refreshed only by the
+    /// local-store draft observation. Consuming a draft therefore clears the chips on a separate,
+    /// un-awaited path from the optimistic bubble render, so the two are deliberately unordered.
+    /// Wait for the clear instead of demanding it has already happened, but keep the timeout tight
+    /// enough that a draft which never clears still fails.
+    private func assertDraftAttachmentClears(
+        _ attachmentID: String,
+        _ message: String,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            element("draft-attachment-\(attachmentID)").waitForNonExistence(timeout: 5),
+            message,
+            line: line
+        )
     }
 
     private func openMedia(_ mediaID: String, towardOlderMessages: Bool) {
