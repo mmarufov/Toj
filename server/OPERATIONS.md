@@ -117,7 +117,9 @@ in general: the receipt window (`ROTATION_RECEIPT_TTL_MS`) bounds how long a ret
 matched to its original rotation, and a retry arriving after it is not treated as the same request.
 Assess that window against the retention rule under Maintenance before relying on retry behaviour
 here, and treat a rising `refresh_replay_revocation` count as a client-retry problem until proven
-otherwise.
+otherwise. Revisit this paragraph when that window changes: once a late retry resolves to re-claiming
+its original rotation, the behaviour can and should be described here in full. The narrow phrasing
+above is provisional, not the settled wording.
 
 Alert on sustained increases in `refresh_failure`, `refresh_replay_revocation`, or `session_expired`
 within `toj_auth_security_events_total`. Track `second_factor_failure`, `second_factor_locked`,
