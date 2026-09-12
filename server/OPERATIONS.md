@@ -42,6 +42,51 @@ account deletion because an offline client can retry a lost response after any f
 Pending records are also never aged out. Message history and attached media are not deleted by this
 worker; account events follow the separately configured synchronization retention floor.
 
+### Retention is a security decision
+
+The paragraph above contains a worked example of a general rule: completed dialog-preference
+idempotency records are retained until account deletion **because** an offline client can retry a
+lost response after any fixed cleanup window. That reasoning is not specific to preferences. It
+governs every retention choice in this server, and it has been rediscovered independently enough
+times to be worth stating once.
+
+The hazard is that **absence is load-bearing**. Code elsewhere reads "no row matched", "no such
+column", or "expired" and treats that as meaningful, but nothing at the deletion site says so.
+Whoever later writes a cleanup job, adds a column, or tunes a TTL cannot see the dependency they are
+about to break. It appears in three shapes, sharing one remedy:
+
+- **Row absence.** A missing row *is* the decision. Retaining expired OTP challenges for longer than
+  24 hours is what keeps the Telegram daily-send budget non-resettable, because `startVerification`
+  counts rows by `created_at`; shortening retention silently makes the budget bypassable. Refresh
+  token history is what turns a replayed credential into an explicit `refresh_reuse_detected` rather
+  than an ambiguous failure; pruning it by age silently disables reuse detection for exactly the slow
+  attacker it exists to catch. Retention must outlive the decision that depends on it — where that
+  decision is itself a time window, time-based retention is correct and must simply exceed the
+  window; where it is "a client may retry", no fixed window is safe and the table should be pruned by
+  generation, keeping the last N records per parent.
+- **Column absence.** A missing column can itself be a control. The OTP abuse windows
+  (`OTP_PHONE_WINDOW_LIMIT`, `OTP_NETWORK_WINDOW_LIMIT`) are cross-channel *by construction* because
+  `otp_challenges` carries no channel column, so no query can scope them per channel. Adding such a
+  column is therefore not neutral: it invites a later change to scope an abuse limit by it and open a
+  bypass. If one must be added, add it for a single named purpose and pin a test proving the
+  abuse-window queries ignore it.
+- **TTL expiry.** An expiry is a deletion scheduled in advance, and the record becomes unreadable the
+  moment it lapses — filtering predicates such as `expires_at > now()` apply whether or not cleanup
+  has run, so lengthening a cleanup grace period without changing the TTL changes nothing. The
+  rotation-receipt window described under session security is the case in this server currently least
+  in line with this rule.
+
+For any of the three:
+
+- The retention or expiry site carries a comment naming the decision that depends on it.
+- A test pins **both directions** — record present, and record absent, each to its intended outcome.
+  A test covering only the present case cannot fail when someone later deletes too eagerly.
+- When setting an expiry, state what happens to a client that returns *after* it on a 100-500 kbps
+  congested link with sudden disconnects, which is the target network rather than a fast one. **If
+  that outcome is destructive rather than benign, the expiry is wrong.** A client retrying an
+  idempotent operation must find its receipt and receive the same answer; it must never be punished
+  for arriving late.
+
 ## Session security and two-step verification rollout
 
 Authentication v2 and two-step verification are additive and dark by default. Run the migration and
@@ -64,8 +109,15 @@ rejecting legacy tokens. Enable two-step enrollment only after the v2 ramp is st
 disabling enrollment first and then auth-v2 advertisement; retain the additive database objects,
 continue accepting credentials already issued to upgraded clients, and continue enforcing existing
 two-step enrollments. A rollback closes only new admission: already-created login challenges can be
-completed and already-enrolled accounts can inspect, disable, or recover their protection. Rotation
-receipts are fenced to the session generation so a late retry can never restore superseded credentials.
+completed and already-enrolled accounts can inspect, disable, or recover their protection.
+
+Rotation receipts are fenced to the session generation, so a late retry can never restore superseded
+credentials. Read that as the narrow statement it is, not as a guarantee that late retries are safe
+in general: the receipt window (`ROTATION_RECEIPT_TTL_MS`) bounds how long a retry can still be
+matched to its original rotation, and a retry arriving after it is not treated as the same request.
+Assess that window against the retention rule under Maintenance before relying on retry behaviour
+here, and treat a rising `refresh_replay_revocation` count as a client-retry problem until proven
+otherwise.
 
 Alert on sustained increases in `refresh_failure`, `refresh_replay_revocation`, or `session_expired`
 within `toj_auth_security_events_total`. Track `second_factor_failure`, `second_factor_locked`,
