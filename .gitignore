@@ -42,3 +42,8 @@ __pycache__/
 
 # Scratch space for unrelated local artifacts (screenshots, scratch PDFs, fixtures)
 tmp/
+
+# Local-only working notes, not for publication. Rationale in CLAUDE.md.
+OPEN_FINDINGS.md
+AUTH_OTP_ECONOMICS.md
+VERIFICATION_CHANNELS_PLAN.md
