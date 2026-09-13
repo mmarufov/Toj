@@ -250,6 +250,69 @@ describe("auth protocol v2 and two-step verification", () => {
       .rejects.toMatchObject({ code: "device_revoked" });
   });
 
+  test("revoking another device is gated by two-step, and never silent", async () => {
+    const originalFactor = process.env.TOJ_TWO_FACTOR_ENABLED;
+    process.env.TOJ_TWO_FACTOR_ENABLED = "1";
+    const legacy = await legacyAccount("+16505557131");
+    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const doomed = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
+    const alsoDoomed = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
+
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const base = `http://127.0.0.1:${server.port}`;
+    const revoke = (deviceId: string, accessToken: string, stepUpToken?: string) =>
+      fetch(`${base}/v1/devices/${deviceId}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify(stepUpToken ? { stepUpToken } : {}),
+      });
+    try {
+      // Without a second factor there is nothing to demand, so this stays possible — but it must
+      // still leave a durable trace the owner can find.
+      expect((await revoke(doomed.deviceId, upgraded.accessToken)).status).toBe(200);
+      expect(await db`
+        SELECT type FROM account_events
+        WHERE account_id = ${legacy.accountId} AND data->>'event' = 'device_revoked'`).toHaveLength(1);
+
+      const security = await startSecurityChange(db, legacy.accountId);
+      const stepUp = await completeSecurityStepUp(db, legacy.accountId, security.code!);
+      await configureTwoFactor(db, {
+        accountId: legacy.accountId,
+        currentDeviceId: legacy.deviceId,
+        stepUpToken: stepUp.stepUpToken,
+        password: "device revocation gate password",
+      });
+
+      // Enrolling revokes the other devices, so re-issue one to aim at.
+      const target = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
+      const current = await issueV2Session(db, {
+        accountId: legacy.accountId, platform: "ios", existingDeviceId: legacy.deviceId,
+      });
+
+      // A bearer alone used to be enough. The bulk revoke was two-factor gated; iterating the
+      // single-device route reached the same end state ungated.
+      const ungated = await revoke(target.deviceId, current.accessToken);
+      expect(ungated.status).toBe(401);
+      expect((await ungated.json() as any).code).toBe("step_up_expired");
+      expect(await db`
+        SELECT id FROM devices WHERE id = ${target.deviceId} AND revoked_at IS NULL`).toHaveLength(1);
+
+      await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+      const second = await startSecurityChange(db, legacy.accountId);
+      const ticket = await completeSecurityStepUp(db, legacy.accountId, second.code!);
+      expect((await revoke(target.deviceId, current.accessToken, ticket.stepUpToken)).status).toBe(200);
+
+      // One intent, one verification: the ticket is validated but not spent, so tidying up a
+      // second stale device inside its TTL does not re-prompt.
+      const another = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
+      expect((await revoke(another.deviceId, current.accessToken, ticket.stepUpToken)).status).toBe(200);
+    } finally {
+      await server.stop(true);
+      if (originalFactor === undefined) delete process.env.TOJ_TWO_FACTOR_ENABLED;
+      else process.env.TOJ_TWO_FACTOR_ENABLED = originalFactor;
+    }
+  });
+
   test("rollout rollback keeps enrolled login and issued refresh credentials usable", async () => {
     const originalAuth = process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
     const originalFactor = process.env.TOJ_TWO_FACTOR_ENABLED;

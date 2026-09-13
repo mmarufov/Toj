@@ -11,6 +11,7 @@ import {
   configureTwoFactor,
   regenerateTwoFactorRecoveryCodes,
   disableTwoFactor,
+  requireDeviceRevocationStepUp,
   sendSecurityChangeAlert,
   resolveDevice,
   lookupAccountByPhone,
@@ -2221,6 +2222,7 @@ export function startCloudServer(
           if (targetDeviceId === session.deviceId) {
             throw new AuthError("use sign out for the current device", 400);
           }
+          await requireDeviceRevocationStepUp(db, session.accountId, body.stepUpToken);
           const result = await revokeDeviceAndTerminateCalls(
             db,
             session.accountId,
@@ -2231,6 +2233,9 @@ export function startCloudServer(
           disconnectDevice(sockets, session.accountId, targetDeviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
+          // Losing a device must never be silent. The account_events row is the durable half and
+          // rides the existing sync path, so it survives push being unconfigured.
+          await sendSecurityChangeAlert(db, session.accountId, "device_revoked", otpDelivery);
           response = json({ revoked: result.revoked });
         }
 
