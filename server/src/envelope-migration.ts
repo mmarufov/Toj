@@ -863,7 +863,7 @@ export async function migrateEnvelopeBatch(
       ${`envelope-migration:${domain}:${fromKeyId}`}, 0
     ))`;
     await tx`INSERT INTO crypto_migration_cursors(domain, cursor, state)
-      VALUES (${`${domain}:${fromKeyId}`}, ${JSON.stringify({ fromKeyId })}::jsonb, 'running')
+      VALUES (${`${domain}:${fromKeyId}`}, ${JSON.stringify({ fromKeyId })}::text::jsonb, 'running')
       ON CONFLICT (domain) DO UPDATE SET state = 'running', updated_at = now()`;
     const requiredIndexes = MIGRATION_INDEXES[domain];
     const indexRows = await tx`
@@ -898,7 +898,7 @@ export async function migrateEnvelopeBatch(
           rows_migrated = rows_migrated + ${migrated},
           cursor = ${JSON.stringify({
             fromKeyId, remaining: left, lastBatch: migrated, retryable,
-          })}::jsonb,
+          })}::text::jsonb,
           updated_at = now()
       WHERE domain = ${`${domain}:${fromKeyId}`}`;
     return { domain, migrated, remaining: left, retryable };

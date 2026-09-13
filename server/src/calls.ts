@@ -536,7 +536,7 @@ async function appendControlEvent(
     INSERT INTO call_events
       (call_id, event_seq, event_type, sender_account_id, sender_device_id, data)
     VALUES (${row.id}, ${eventSeq}, ${eventType}, ${senderAccountId}, ${senderDeviceId},
-      ${JSON.stringify(data)}::jsonb)`;
+      ${JSON.stringify(data)}::text::jsonb)`;
   await notify(sql, updated);
   return updated;
 }
