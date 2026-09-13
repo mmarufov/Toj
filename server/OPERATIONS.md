@@ -112,14 +112,17 @@ two-step enrollments. A rollback closes only new admission: already-created logi
 completed and already-enrolled accounts can inspect, disable, or recover their protection.
 
 Rotation receipts are fenced to the session generation, so a late retry can never restore superseded
-credentials. Read that as the narrow statement it is, not as a guarantee that late retries are safe
-in general: the receipt window (`ROTATION_RECEIPT_TTL_MS`) bounds how long a retry can still be
-matched to its original rotation, and a retry arriving after it is not treated as the same request.
-Assess that window against the retention rule under Maintenance before relying on retry behaviour
-here, and treat a rising `refresh_replay_revocation` count as a client-retry problem until proven
-otherwise. Revisit this paragraph when that window changes: once a late retry resolves to re-claiming
-its original rotation, the behaviour can and should be described here in full. The narrow phrasing
-above is provisional, not the settled wording.
+credentials. Retries are safe on any timescale: receipts are retained by rotation depth rather than
+age (`ROTATION_RECEIPT_RETAINED_GENERATIONS`), and a client stuck waiting on a lost response cannot
+advance its own generation, so the receipt it needs is still present whenever it returns. `expires_at`
+is a storage backstop for sessions that stop rotating entirely and tracks the idle TTL; past it the
+session is itself expired, so the client is told `session_expired` rather than accused of replay.
+
+Only another party rotating the session past the retained depth buries a receipt, and that is the
+case that must not replay — it resolves to `refresh_reuse_detected`, correctly. A rising
+`refresh_replay_revocation` count is therefore a real signal again and should be investigated as
+possible token theft, not dismissed as client retries. Before this was fixed the same counter fired
+on ordinary lost responses, so readings predating it are not comparable.
 
 Alert on sustained increases in `refresh_failure`, `refresh_replay_revocation`, or `session_expired`
 within `toj_auth_security_events_total`. Track `second_factor_failure`, `second_factor_locked`,

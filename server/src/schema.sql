@@ -302,8 +302,9 @@ ALTER TABLE session_rotation_receipts ADD COLUMN IF NOT EXISTS request_token_dig
   TEXT NOT NULL DEFAULT 'legacy-v1';
 ALTER TABLE session_rotation_receipts
   ADD COLUMN IF NOT EXISTS response_generation BIGINT;
--- Rotation receipts live for only five minutes. Receipts written by the pre-generation binary
--- cannot safely be replayed after a newer refresh, so discard them instead of guessing a value.
+-- Receipts written by the pre-generation binary cannot safely be replayed after a newer refresh,
+-- so discard them instead of guessing a value. (Receipts are now pruned by rotation depth rather
+-- than age; expires_at is only a storage backstop. See session-security.ts.)
 DELETE FROM session_rotation_receipts WHERE response_generation IS NULL;
 ALTER TABLE session_rotation_receipts
   ALTER COLUMN response_generation SET NOT NULL;
