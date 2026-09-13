@@ -236,7 +236,7 @@ async function completeMutation(
 ): Promise<void> {
   await sql`
     UPDATE messaging_feature_mutations
-    SET response = ${JSON.stringify(response)}::jsonb, completed_at = now()
+    SET response = ${JSON.stringify(response)}::text::jsonb, completed_at = now()
     WHERE actor_account_id = ${identity.actorAccountId}
       AND operation_id = ${identity.operationId}`;
 }
@@ -275,7 +275,7 @@ async function insertFeatureServiceMessage(
     ) VALUES (
       ${dialogId}, ${msgId}, ${actorAccountId}, ${clientMsgId}, 'service',
       ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${serviceType},
-      ${JSON.stringify(serviceData)}::jsonb
+      ${JSON.stringify(serviceData)}::text::jsonb
     )`;
   return msgId;
 }
@@ -725,7 +725,7 @@ async function appendPrivatePreferenceEvent(
     INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
     VALUES (
       ${accountId}, ${pts}, 'sticker_preferences.updated', ${accountId},
-      ${JSON.stringify(data)}::jsonb
+      ${JSON.stringify(data)}::text::jsonb
     )`;
   await sql`
     INSERT INTO push_deliveries (account_id, pts, device_id, alert)

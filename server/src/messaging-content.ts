@@ -350,7 +350,7 @@ export async function insertGiphyContent(
       dialog_id, msg_id, provider, provider_item_id, rendition
     ) VALUES (
       ${dialogId}, ${msgId}, 'giphy', ${reference.providerId},
-      ${JSON.stringify(reference.rendition)}::jsonb
+      ${JSON.stringify(reference.rendition)}::text::jsonb
     )`;
 }
 
@@ -388,7 +388,7 @@ export async function insertStickerContent(
         height: sticker.height,
         format: sticker.format,
         sha256: sticker.sha256,
-      })}::jsonb
+      })}::text::jsonb
     )`;
 }
 

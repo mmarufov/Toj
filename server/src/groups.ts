@@ -254,7 +254,7 @@ async function insertServiceMessage(
     ) VALUES (
       ${dialogId}, ${msgId}, ${actorAccountId}, ${clientMsgId}, 'service',
       ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext},
-      ${serviceType}, ${JSON.stringify(serviceData)}::jsonb
+      ${serviceType}, ${JSON.stringify(serviceData)}::text::jsonb
     )`;
   return msgId;
 }

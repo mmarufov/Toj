@@ -561,7 +561,7 @@ export async function putDraft(sql: SQL, input: {
       VALUES (
         ${input.accountId}, ${dialogId}, ${normalized.state}, ${sealed.keyId},
         ${sealed.nonce}, ${sealed.ciphertext}, ${normalized.replyToMsgId},
-        ${JSON.stringify(normalized.mentions)}::jsonb, ${revision}, ${operationId}, ${input.deviceId}
+        ${JSON.stringify(normalized.mentions)}::text::jsonb, ${revision}, ${operationId}, ${input.deviceId}
       )
       ON CONFLICT (account_id, dialog_id) DO UPDATE SET
         state = excluded.state,

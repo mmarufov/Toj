@@ -146,6 +146,43 @@ describe("Groups v1", () => {
     })).rejects.toThrow("mention target is not an active member");
   });
 
+  test("jsonb payloads are stored as objects, not double-encoded strings", async () => {
+    const { owner, alice, bob } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      groupId,
+      title: "Encoding group",
+      memberIds: [alice.accountId, bob.accountId],
+    });
+    await removeGroupMember(db, {
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
+      dialogId: groupId,
+      targetAccountId: bob.accountId,
+      clientMutationId: crypto.randomUUID(),
+    });
+
+    // Bun binds `${JSON.stringify(x)}::jsonb` as a JSON *string*, so the column ends up holding a
+    // scalar and every SQL-side accessor (`->>`, jsonb_to_recordset, expression indexes) silently
+    // returns NULL. The read paths parse defensively, so round-trips hide it — only SQL notices.
+    // The cast that stores an object is `::text::jsonb`.
+    expect(await db`
+      SELECT 1 FROM messages
+      WHERE service_data IS NOT NULL AND jsonb_typeof(service_data) <> 'object'`).toHaveLength(0);
+    expect(await db`
+      SELECT 1 FROM account_events WHERE jsonb_typeof(data) <> 'object'`).toHaveLength(0);
+
+    // Both assertions above pass trivially against an empty table, so prove the rows exist and
+    // that a key is actually reachable from SQL rather than buried inside a string.
+    expect((await db`SELECT 1 FROM messages WHERE service_data IS NOT NULL`).length)
+      .toBeGreaterThan(0);
+    expect((await db`
+      SELECT 1 FROM account_events
+      WHERE type = 'dialog.access_revoked' AND data->>'dialog_type' IS NOT NULL`).length)
+      .toBeGreaterThan(0);
+  });
+
   test("removed members receive revocation only and lose history access immediately", async () => {
     const { owner, alice, bob } = await threeAccounts();
     const groupId = crypto.randomUUID();

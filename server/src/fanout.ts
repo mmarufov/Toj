@@ -204,7 +204,7 @@ export async function appendAccessRevokedEvent(
     INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id, data)
     VALUES (
       ${accountId}, ${pts}, 'dialog.access_revoked', ${dialogId}, ${actorAccountId},
-      ${JSON.stringify({ dialog_type: dialogType })}::jsonb
+      ${JSON.stringify({ dialog_type: dialogType })}::text::jsonb
     )`;
   await sql`
     INSERT INTO push_deliveries (account_id, pts, device_id, alert)
