@@ -159,9 +159,14 @@ export async function startVerification(
   const hosted = hostedAuthentication();
   const delivery = options.delivery ?? null;
   if (delivery?.channel === "telegram") {
-    // Stated plainly: the pilot is login-only, and an operator staring at a 503 should not have to
-    // guess whether account deletion or a two-step change is broken or simply not wired up yet.
-    if (purpose !== "login") {
+    // Account deletion stays unavailable, and deliberately so rather than for tidiness: deleteAccount
+    // hard-deletes this phone's otp_challenges, which is the table the Telegram request budget counts.
+    // Minting a deletion code would reopen that budget as a resettable one. Security-change codes
+    // carry no such coupling and are mechanically identical to login codes — same allowlist, same
+    // generation, same expiry/attempt/reuse controls — so withholding them only blocked two-step
+    // enrollment, which is the single mitigation for SIM swap against phone-number identity.
+    // An operator staring at a 503 should not have to guess which of these applies.
+    if (purpose === "account_deletion") {
       throw new AuthError("this verification step is unavailable in the Telegram pilot", 503,
         undefined, "capability_unavailable");
     }
@@ -170,7 +175,13 @@ export async function startVerification(
     if (process.env.TOJ_RETURN_OTP !== "0" || !delivery.allows?.(normalizedPhone)) {
       throw new AuthError("verification service temporarily unavailable", 503);
     }
-    if (options.deliveryChannel !== "telegram") {
+    // Consent is owed for the *first* disclosure of a number to Telegram, which is the login. By
+    // the time an authenticated account asks for a security-change code, that number has already
+    // received a Telegram login code — the marginal disclosure is nil, and demanding a channel
+    // choice inside the app would be friction without privacy benefit.
+    // Revisit when a second channel exists: consent then becomes per-number-per-provider, and
+    // routing a step-up to Telegram for someone who logged in by SMS would be a new disclosure.
+    if (purpose === "login" && options.deliveryChannel !== "telegram") {
       throw new AuthError("choose Telegram code delivery to continue", 400);
     }
   } else if (options.deliveryChannel !== undefined) {

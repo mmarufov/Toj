@@ -53,7 +53,11 @@ export class TelegramOTPDelivery implements OTPDelivery {
   allows(phone: string): boolean { return this.phones.has(phone); }
 
   async send(phone: string, code: string, purpose: "login" | "account_deletion" | "security_change"): Promise<void> {
-    if (!this.allows(phone) || !PHONE.test(phone) || !/^\d{6}$/.test(code) || purpose !== "login") {
+    // Second, independent enforcement of the purpose scope decided in startVerification: deletion
+    // codes would reopen the request budget as resettable, because deleteAccount clears the very
+    // otp_challenges rows the budget counts.
+    if (!this.allows(phone) || !PHONE.test(phone) || !/^\d{6}$/.test(code)
+      || (purpose !== "login" && purpose !== "security_change")) {
       throw new Error("Telegram OTP request rejected");
     }
     // Stays "transport_error" until a response is classified, so a thrown reason below is never

@@ -993,7 +993,7 @@ describe("M3 cloud sync", () => {
     }
   });
 
-  test("Telegram pilot refuses non-login verification explicitly and keeps deletion shut", async () => {
+  test("Telegram pilot delivers security-change codes but keeps account deletion shut", async () => {
     const previous = process.env.TOJ_RETURN_OTP;
     process.env.TOJ_RETURN_OTP = "0";
     const phone = testPhone(198);
@@ -1004,14 +1004,18 @@ describe("M3 cloud sync", () => {
       return Response.json({ ok: true, result: { request_id: "t", phone_number: phone, request_cost: 0 } });
     });
     try {
-      for (const start of [startAccountDeletion, startSecurityChange]) {
-        await expect(start(db, account.accountId, { delivery }))
-          .rejects.toMatchObject({ status: 503, code: "capability_unavailable" });
-      }
+      await expect(startAccountDeletion(db, account.accountId, { delivery }))
+        .rejects.toMatchObject({ status: 503, code: "capability_unavailable" });
       expect(sends).toBe(0);
       // deleteAccount hard-deletes this phone's challenges, so it would reset the budget. That
       // path stays closed only because no account_deletion challenge can be minted here.
-      expect(await db`SELECT id FROM otp_challenges WHERE purpose <> 'login'`).toHaveLength(0);
+      expect(await db`SELECT id FROM otp_challenges WHERE purpose = 'account_deletion'`).toHaveLength(0);
+
+      // Security-change codes must go through, or two-step enrollment — the only SIM-swap
+      // mitigation against phone-number identity — is unreachable for every user.
+      await startSecurityChange(db, account.accountId, { delivery });
+      expect(sends).toBe(1);
+      expect(await db`SELECT id FROM otp_challenges WHERE purpose = 'security_change'`).toHaveLength(1);
     } finally {
       if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
     }
