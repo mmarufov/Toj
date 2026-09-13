@@ -45,14 +45,22 @@ test("Telegram uses one fixed HTTPS POST, header auth, supplied OTP, bounded TTL
   expect(calls).toBe(1);
 });
 
-test("unapproved recipients and non-login purposes never reach Telegram", async () => {
+test("unapproved recipients, bad codes, and deletion codes never reach Telegram", async () => {
   let calls = 0;
   const delivery = new TelegramOTPDelivery(token, [phone], async () => { calls++; return accepted(); });
   await expect(delivery.send("+12025550102", "123456", "login")).rejects.toThrow();
   await expect(delivery.send(phone, "bad", "login")).rejects.toThrow();
+  // Deletion stays out: deleteAccount clears the otp_challenges rows the request budget counts,
+  // so minting a deletion code would make that budget resettable.
   await expect(delivery.send(phone, "123456", "account_deletion")).rejects.toThrow();
-  await expect(delivery.send(phone, "123456", "security_change")).rejects.toThrow();
   expect(calls).toBe(0);
+});
+
+test("security-change codes are delivered, so two-step enrollment is reachable", async () => {
+  let sent = 0;
+  const delivery = new TelegramOTPDelivery(token, [phone], async () => { sent++; return accepted(); });
+  await delivery.send(phone, "123456", "security_change");
+  expect(sent).toBe(1);
 });
 
 test("HTTP/API/JSON/timeout failures are sanitized and never retried", async () => {

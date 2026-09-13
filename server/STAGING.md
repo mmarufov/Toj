@@ -89,7 +89,8 @@ content, never real private conversations. Real SMS and stronger private access 
 
 ## Optional private Telegram OTP pilot
 
-Implemented for **staging login only**; token presence alone does not activate it.
+Implemented for **staging login and two-step enrollment only**; token presence alone does not
+activate it. Account deletion stays excluded.
 Publish/deploy the reviewed integration first, then configure these privately in Render:
 
 | Variable | Value |
@@ -117,8 +118,11 @@ adapter is wired, not that Telegram accepted the token or delivered a message.
 The iOS **Toj Staging** Debug build offers an unchecked "Receive my code in Telegram" toggle.
 The test user must opt in; login sends `deliveryChannel: "telegram"` to `/v1/auth/start`.
 Missing/other channels, non-allowlisted recipients, and non-login purposes fail closed before
-creating a challenge. Account-deletion and security-change OTP flows are not enabled in this
-pilot and need separate work before broader use; they answer `503` with code
+creating a challenge. Security-change codes **are** delivered, because two-step enrollment needs one
+and it is the only mitigation for SIM swap against phone-number identity; withholding them left 2FA
+unreachable for every user. Account deletion stays excluded on purpose rather than for tidiness:
+`deleteAccount` hard-deletes this phone's `otp_challenges`, the very rows the request budget counts,
+so minting a deletion code would make that budget resettable. Account deletion answers `503` with code
 `capability_unavailable` so an operator can tell "not wired up" from "broken", while recipient
 scope and the OTP-return interlock share one generic `503` so the endpoint cannot be used to test
 allowlist membership. Security-change SMS alerts are simply not sent on this provider.
