@@ -32,7 +32,11 @@ const CONTACT_LOOKUP_WINDOW_LIMIT = 20;
 const CONTACT_LOOKUP_DAILY_LIMIT = 100;
 const ALLOWED_PLATFORMS = new Set(["ios", "android", "web", "desktop"]);
 type OTPPurpose = "login" | "account_deletion" | "security_change";
-export type SecurityChangeEvent = "two_factor_enabled" | "two_factor_changed" | "two_factor_disabled";
+export type SecurityChangeEvent =
+  | "two_factor_enabled"
+  | "two_factor_changed"
+  | "two_factor_disabled"
+  | "device_revoked";
 
 export interface OTPDelivery {
   readonly channel?: "telegram";
@@ -853,6 +857,36 @@ async function requireStepUp(
   return { id: String(ticket.id) };
 }
 
+/**
+ * Revoking another device is destructive and, until now, needed nothing but a bearer token: the
+ * bulk revoke is two-factor gated, but iterating `DELETE /v1/devices/{id}` reached the same end
+ * state ungated. Whenever an aggregate operation is security-gated, check whether iterating its
+ * single-item equivalent gets there too.
+ *
+ * The gate is a step-up ticket, demanded only when the account actually has a second factor —
+ * without one there is nothing to ask for, and requiring a phone code instead would put a paid
+ * OTP in front of an ordinary action. That is the argument for enrolling two-step, not for
+ * inventing a weaker gate here.
+ *
+ * The ticket is validated but deliberately **not** consumed. Cleaning up several stale devices is
+ * one intent, and its own TTL already bounds the window; spending a ticket per device would make
+ * an honest user re-verify for each one.
+ */
+export async function requireDeviceRevocationStepUp(
+  sql: SQL,
+  accountId: string,
+  stepUpToken: unknown,
+): Promise<void> {
+  const result = await sql.begin(async (tx) => {
+    const factor = (await tx`
+      SELECT account_id FROM account_two_factor WHERE account_id = ${accountId}`)[0];
+    if (!factor) return null;
+    const ticket = await requireStepUp(tx, accountId, stepUpToken);
+    return ticket instanceof AuthError ? ticket : null;
+  });
+  if (result instanceof AuthError) throw result;
+}
+
 async function verifyCurrentFactor(
   sql: SQL,
   accountId: string,
@@ -1005,7 +1039,7 @@ export async function sendSecurityChangeAlert(
         INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
         VALUES (
           ${accountId}, ${pts}, 'security.changed', ${accountId},
-          ${JSON.stringify({ event })}::jsonb
+          ${JSON.stringify({ event })}::text::jsonb
         )`;
       await enqueuePushDeliveries(tx, {
         accountId,
