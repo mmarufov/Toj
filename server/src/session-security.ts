@@ -9,7 +9,23 @@ import { revokePushBindingsForDevice } from "./push";
 export const ACCESS_TOKEN_TTL_MS = 15 * 60_000;
 export const SESSION_IDLE_TTL_MS = 30 * 24 * 60 * 60_000;
 export const SESSION_ABSOLUTE_TTL_MS = 180 * 24 * 60 * 60_000;
-export const ROTATION_RECEIPT_TTL_MS = 5 * 60_000;
+/**
+ * Rotation receipts are the only thing separating "the client is retrying a request whose response
+ * was lost" from "someone is replaying a stolen token". Their absence is therefore load-bearing and
+ * destructive: a miss revokes the session as `refresh_reuse_detected`, drops push bindings and
+ * forces a phone re-verification.
+ *
+ * They are consequently pruned by rotation depth, not age (see `cleanupExpiredData`). A client
+ * stuck mid-rotation cannot advance its own generation, so on a 100-500 kbps congested link — or an
+ * iOS app suspended for a weekend — the receipt it needs is still there when it returns. Only
+ * another party rotating the session buries it, which is exactly the case that should not replay.
+ *
+ * `expires_at` is a storage backstop for sessions that stop rotating entirely, never a replay gate.
+ * It tracks the idle TTL because a receipt cannot be needed once its session has itself expired;
+ * tying the two together stops them drifting apart.
+ */
+export const ROTATION_RECEIPT_RETAINED_GENERATIONS = 10;
+export const ROTATION_RECEIPT_BACKSTOP_TTL_MS = SESSION_IDLE_TTL_MS;
 const SESSION_REVOCATION_CHANNEL = "toj_session_revocations";
 const ACCESS_TOKEN_PREFIX = "toj.v2.access.";
 const REFRESH_TOKEN_PREFIX = "toj.v2.refresh.";
@@ -260,8 +276,7 @@ export async function refreshV2Session(
         JOIN devices device ON device.id = session.device_id
         WHERE receipt.session_id = ${used.session_id} AND receipt.rotation_id = ${rotationId}
           AND receipt.request_token_digest = ${used.token_digest}
-          AND receipt.request_token_digest_key_id = ${used.token_digest_key_id}
-          AND receipt.expires_at > ${now}`)[0];
+          AND receipt.request_token_digest_key_id = ${used.token_digest_key_id}`)[0];
       if (receipt) {
         if (Number(receipt.response_generation) !== Number(receipt.current_generation)) {
           return new AuthError(
@@ -354,7 +369,7 @@ export async function refreshV2Session(
         ${current.id}, ${rotationId}, ${current.refresh_token_hash},
         ${current.refresh_token_hash_key_id}, ${sealed.ciphertext},
         ${sealed.nonce}, ${sealed.keyId}, ${Number(current.rotation_generation) + 1},
-        ${new Date(now.getTime() + ROTATION_RECEIPT_TTL_MS)}
+        ${new Date(now.getTime() + ROTATION_RECEIPT_BACKSTOP_TTL_MS)}
       )`;
     return response;
   });

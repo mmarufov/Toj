@@ -17,6 +17,7 @@ import { expireAcceptedMessages, expiredMessageBacklog } from "./message-expiry"
 import { cleanupMessagingFeatureReceipts } from "./messaging-features";
 import { messagingFeatureSchemaState } from "./messaging-feature-readiness";
 import { cloudProductivitySchemaState } from "./cloud-productivity-readiness";
+import { ROTATION_RECEIPT_RETAINED_GENERATIONS } from "./session-security";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -472,12 +473,24 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     )
     DELETE FROM session_access_tokens WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
+  // Receipt absence is destructive — a miss revokes the session as refresh_reuse_detected — so
+  // these are pruned by rotation depth rather than age. A client stuck mid-rotation cannot advance
+  // its own generation, so its receipt survives any delay; only another party rotating the session
+  // buries it, which is the case that must not replay. The expires_at arm is a storage backstop for
+  // sessions that stopped rotating, and tracks the idle TTL: past it the session is itself dead, so
+  // the client gets session_expired rather than a false reuse alarm. See session-security.ts.
   const rotationReceipts = await sql`
     WITH doomed AS (
-      SELECT session_id, rotation_id FROM session_rotation_receipts
-      WHERE expires_at < now()
-      ORDER BY expires_at LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED
+      SELECT receipt.session_id, receipt.rotation_id
+      FROM session_rotation_receipts receipt
+      JOIN device_sessions session ON session.id = receipt.session_id
+      WHERE receipt.response_generation
+              <= session.rotation_generation - ${ROTATION_RECEIPT_RETAINED_GENERATIONS}
+         OR receipt.expires_at < now()
+      ORDER BY receipt.expires_at LIMIT ${batchSize}
+      -- Lock only the receipts. A bare FOR UPDATE would also lock the joined device_sessions row
+      -- and put this worker in contention with live refreshes.
+      FOR UPDATE OF receipt SKIP LOCKED
     )
     DELETE FROM session_rotation_receipts receipt USING doomed
     WHERE receipt.session_id = doomed.session_id AND receipt.rotation_id = doomed.rotation_id

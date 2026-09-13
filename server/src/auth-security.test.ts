@@ -19,12 +19,14 @@ import {
 import { startCloudServer } from "./cloud";
 import {
   ACCESS_TOKEN_TTL_MS,
+  ROTATION_RECEIPT_RETAINED_GENERATIONS,
   SESSION_ABSOLUTE_TTL_MS,
   issueV2Session,
   refreshV2Session,
   resolveV2Access,
   upgradeLegacySession,
 } from "./session-security";
+import { cleanupExpiredData } from "./ops";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
@@ -59,6 +61,68 @@ describe("auth protocol v2 and two-step verification", () => {
       .rejects.toMatchObject({ code: "refresh_reuse_detected" });
     await expect(resolveDevice(db, rotated.accessToken))
       .rejects.toMatchObject({ code: "refresh_reuse_detected" });
+  });
+
+  test("age decides neither replay nor pruning for a client stuck mid-rotation", async () => {
+    const legacy = await legacyAccount("+16505557121");
+    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const rotationId = crypto.randomUUID();
+    const rotated = await refreshV2Session(db, upgraded.refreshToken, rotationId);
+
+    // The response was lost and the client returns well past the old five-minute window: a dropped
+    // connection on a 100-500 kbps link, or iOS suspending the app. This used to revoke the session
+    // as refresh_reuse_detected, drop its push bindings and force a phone re-verification.
+    await db`UPDATE session_rotation_receipts SET expires_at = now() - interval '1 minute'`;
+    expect(await refreshV2Session(db, upgraded.refreshToken, rotationId)).toEqual(rotated);
+
+    // And maintenance must not bury it either, at a realistic backstop and days of delay.
+    await db`UPDATE session_rotation_receipts
+      SET expires_at = now() + interval '23 days', created_at = now() - interval '7 days'`;
+    await cleanupExpiredData(db);
+
+    expect(await db`SELECT rotation_id FROM session_rotation_receipts`).toHaveLength(1);
+    expect(await refreshV2Session(db, upgraded.refreshToken, rotationId)).toEqual(rotated);
+    await expect(resolveV2Access(db, rotated.accessToken)).resolves.toMatchObject({
+      deviceId: legacy.deviceId,
+    });
+  });
+
+  test("receipts are pruned by rotation depth, and burial past it is superseded not reuse", async () => {
+    const legacy = await legacyAccount("+16505557122");
+    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const rotationId = crypto.randomUUID();
+    let session = await refreshV2Session(db, upgraded.refreshToken, rotationId);
+
+    // Only another party rotating the session can bury a stuck client's receipt. Drive the
+    // generation past the retained depth, which is the one case that must not replay.
+    for (let i = 0; i < ROTATION_RECEIPT_RETAINED_GENERATIONS; i += 1) {
+      session = await refreshV2Session(db, session.refreshToken, crypto.randomUUID());
+    }
+    await cleanupExpiredData(db);
+
+    const surviving = await db`
+      SELECT rotation_id FROM session_rotation_receipts WHERE rotation_id = ${rotationId}`;
+    expect(surviving).toHaveLength(0);
+    await expect(refreshV2Session(db, upgraded.refreshToken, rotationId))
+      .rejects.toMatchObject({ code: "refresh_reuse_detected" });
+  });
+
+  test("cleanup prunes receipts without locking the live sessions they belong to", async () => {
+    const legacy = await legacyAccount("+16505557123");
+    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    await refreshV2Session(db, upgraded.refreshToken, crypto.randomUUID());
+
+    // A bare FOR UPDATE across the join would lock device_sessions and contend with refreshes.
+    const holder = new Client({ connectionString: TEST_URL });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM device_sessions FOR UPDATE");
+      await expect(cleanupExpiredData(db)).resolves.toBeDefined();
+    } finally {
+      await holder.query("ROLLBACK");
+      await holder.end();
+    }
   });
 
   test("refresh rejects malformed and cross-generation rotation identifiers without mutation", async () => {
