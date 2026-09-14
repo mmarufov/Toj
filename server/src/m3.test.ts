@@ -9,7 +9,7 @@ import {
   updateProfile,
   startAccountDeletion,
   startSecurityChange,
-  otpDeliveryFromEnvironment,
+  otpDeliveryRegistryFromEnvironment,
   deleteAccount,
   requireActiveDevice,
   resolveDevice,
@@ -121,6 +121,11 @@ async function waitForBackendLock(client: Client, pid: number): Promise<void> {
   throw new Error(`backend ${pid} did not block on the account lock`);
 }
 
+/** One-channel registry, so a test can keep naming a single delivery object. */
+function registryOf(delivery: OTPDelivery) {
+  return new Map([[delivery.channel, delivery]]);
+}
+
 function testPhone(suffix: number): string {
   return ["+", "1650", "555", String(suffix).padStart(4, "0")].join("");
 }
@@ -191,6 +196,7 @@ class PausedPushSender implements PushSender {
 }
 
 class FailingOTPDelivery implements OTPDelivery {
+  readonly channel = "sms" as const;
   async send(_phone: string, _code: string, _purpose: "login" | "account_deletion"): Promise<void> {
     throw new Error("provider unavailable");
   }
@@ -898,7 +904,7 @@ describe("M3 cloud sync", () => {
       deliveredCode = JSON.parse(init.body as string).code;
       return Response.json({ ok: true, result: { request_id: "test", phone_number: phone, request_cost: 0 } });
     });
-    const server = startCloudServer(0, db, null, delivery, { backgroundWorkers: false });
+    const server = startCloudServer(0, db, null, registryOf(delivery), { backgroundWorkers: false });
     const base = `http://127.0.0.1:${server.port}`;
     const request = (body: unknown) => fetch(`${base}/v1/auth/start`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -936,13 +942,14 @@ describe("M3 cloud sync", () => {
       allows: () => true, async send() { sends++; } };
     try {
       const results = await Promise.allSettled([192, 193].map((suffix) => startVerification(db, testPhone(suffix), {
-        delivery, deliveryChannel: "telegram",
+        deliveries: registryOf(delivery), deliveryChannel: "telegram",
       })));
       expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
       expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
       expect(sends).toBe(1);
       expect(await db`SELECT id FROM otp_challenges`).toHaveLength(1);
-      await expect(startVerification(db, testPhone(194), { delivery: { ...delivery }, deliveryChannel: "telegram" }))
+      await expect(startVerification(db, testPhone(194),
+        { deliveries: registryOf({ ...delivery }), deliveryChannel: "telegram" }))
         .rejects.toMatchObject({ status: 429 });
     } finally {
       if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
@@ -958,7 +965,7 @@ describe("M3 cloud sync", () => {
       return Response.json({ ok: false, error: "provider details must stay private" });
     });
     try {
-      await expect(startVerification(db, testPhone(195), { delivery, deliveryChannel: "telegram" }))
+      await expect(startVerification(db, testPhone(195), { deliveries: registryOf(delivery), deliveryChannel: "telegram" }))
         .rejects.toMatchObject({ status: 503 });
       expect(sends).toBe(1);
       expect((await db`SELECT consumed_at FROM otp_challenges`)[0].consumed_at).not.toBeNull();
@@ -976,18 +983,18 @@ describe("M3 cloud sync", () => {
       UPDATE otp_challenges SET created_at = now() - (${hours} * interval '1 hour'),
         expires_at = now() - (${hours} * interval '1 hour') + interval '5 minutes'`;
     try {
-      await startVerification(db, testPhone(196), { delivery, deliveryChannel: "telegram" });
+      await startVerification(db, testPhone(196), { deliveries: registryOf(delivery), deliveryChannel: "telegram" });
       await backdate(23);
       await cleanupExpiredData(db);
       expect(await db`SELECT id FROM otp_challenges`).toHaveLength(1);
-      await expect(startVerification(db, testPhone(197), { delivery, deliveryChannel: "telegram" }))
+      await expect(startVerification(db, testPhone(197), { deliveries: registryOf(delivery), deliveryChannel: "telegram" }))
         .rejects.toMatchObject({ status: 429 });
 
       // Past the window the same maintenance does drop the row and the budget legitimately refills.
       await backdate(25);
       await cleanupExpiredData(db);
       expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
-      await startVerification(db, testPhone(197), { delivery, deliveryChannel: "telegram" });
+      await startVerification(db, testPhone(197), { deliveries: registryOf(delivery), deliveryChannel: "telegram" });
     } finally {
       if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
     }
@@ -1004,7 +1011,7 @@ describe("M3 cloud sync", () => {
       return Response.json({ ok: true, result: { request_id: "t", phone_number: phone, request_cost: 0 } });
     });
     try {
-      await expect(startAccountDeletion(db, account.accountId, { delivery }))
+      await expect(startAccountDeletion(db, account.accountId, { deliveries: registryOf(delivery), deliveryChannel: delivery.channel }))
         .rejects.toMatchObject({ status: 503, code: "capability_unavailable" });
       expect(sends).toBe(0);
       // deleteAccount hard-deletes this phone's challenges, so it would reset the budget. That
@@ -1013,7 +1020,7 @@ describe("M3 cloud sync", () => {
 
       // Security-change codes must go through, or two-step enrollment — the only SIM-swap
       // mitigation against phone-number identity — is unreachable for every user.
-      await startSecurityChange(db, account.accountId, { delivery });
+      await startSecurityChange(db, account.accountId, { deliveries: registryOf(delivery), deliveryChannel: delivery.channel });
       expect(sends).toBe(1);
       expect(await db`SELECT id FROM otp_challenges WHERE purpose = 'security_change'`).toHaveLength(1);
     } finally {
@@ -1031,14 +1038,14 @@ describe("M3 cloud sync", () => {
       return Response.json({ ok: true, result: { request_id: "t", phone_number: phone, request_cost: 0 } });
     });
     try {
-      await startVerification(db, phone, { delivery, deliveryChannel: "telegram" });
+      await startVerification(db, phone, { deliveries: registryOf(delivery), deliveryChannel: "telegram" });
       expect(delivered).toMatch(/^\d{6}$/);
       expect((await checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).accountId).toBeTruthy();
       await expect(checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).rejects.toThrow();
 
       // Age the consumed challenge past the resend cooldown, then expire the replacement.
       await db`UPDATE otp_challenges SET created_at = now() - interval '1 hour'`;
-      await startVerification(db, phone, { delivery, deliveryChannel: "telegram" });
+      await startVerification(db, phone, { deliveries: registryOf(delivery), deliveryChannel: "telegram" });
       await db`UPDATE otp_challenges SET expires_at = now() - interval '1 second' WHERE consumed_at IS NULL`;
       await expect(checkVerification(db, phone, delivered, "ios", "Test", "Pilot")).rejects.toThrow();
     } finally {
@@ -1048,26 +1055,91 @@ describe("M3 cloud sync", () => {
 
   test("provider selection is explicit: a stored Telegram token alone stays inert", () => {
     const keys = ["TOJ_OTP_PROVIDER", "TOJ_TELEGRAM_GATEWAY_TOKEN", "TOJ_TELEGRAM_TEST_ALLOWLIST",
-      "TOJ_SMS_WEBHOOK_URL", "TOJ_SMS_WEBHOOK_TOKEN"] as const;
+      "TOJ_SMS_WEBHOOK_URL", "TOJ_SMS_WEBHOOK_TOKEN", "NODE_ENV", "TOJ_RETURN_OTP"] as const;
     const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     try {
       for (const key of keys) delete process.env[key];
       process.env.TOJ_TELEGRAM_GATEWAY_TOKEN = "synthetic";
       process.env.TOJ_TELEGRAM_TEST_ALLOWLIST = testPhone(200);
-      expect(otpDeliveryFromEnvironment()).toBeNull();
+      expect(otpDeliveryRegistryFromEnvironment().size).toBe(0);
 
       process.env.TOJ_OTP_PROVIDER = "sms";
-      expect(() => otpDeliveryFromEnvironment()).toThrow();
+      expect(() => otpDeliveryRegistryFromEnvironment()).toThrow();
 
-      // An explicit webhook selection must keep using the webhook, never the stored token.
+      // A webhook alone registers only SMS; the stored Telegram token stays inert without its
+      // explicit provider switch.
       process.env.TOJ_OTP_PROVIDER = "webhook";
       process.env.TOJ_SMS_WEBHOOK_URL = "https://example.test/hook";
       process.env.TOJ_SMS_WEBHOOK_TOKEN = "synthetic";
-      expect(otpDeliveryFromEnvironment()?.channel).toBeUndefined();
+      expect([...otpDeliveryRegistryFromEnvironment().keys()]).toEqual(["sms"]);
+
+      // Both configured is now the supported picker shape, not a startup error.
+      process.env.TOJ_OTP_PROVIDER = "telegram";
+      process.env.NODE_ENV = "staging";
+      process.env.TOJ_RETURN_OTP = "0";
+      expect([...otpDeliveryRegistryFromEnvironment().keys()].sort()).toEqual(["sms", "telegram"]);
     } finally {
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]!;
       }
+    }
+  });
+
+  test("the picker sends only on the chosen channel and never substitutes", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const phone = testPhone(201);
+    const sent: string[] = [];
+    const make = (channel: "telegram" | "sms"): OTPDelivery => ({
+      channel, allows: () => true, async send() { sent.push(channel); },
+    });
+    const deliveries = new Map([["telegram", make("telegram")], ["sms", make("sms")]]);
+    try {
+      // Naming no channel is a 400, not a server-side choice. This is the property the old
+      // single-delivery interlock was standing in for.
+      await expect(startVerification(db, phone, { deliveries }))
+        .rejects.toMatchObject({ status: 400, code: "channel_required" });
+      expect(sent).toEqual([]);
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
+
+      // An unconfigured channel fails rather than falling back to a configured one.
+      await expect(startVerification(db, phone, { deliveries, deliveryChannel: "whatsapp" }))
+        .rejects.toMatchObject({ status: 400, code: "channel_required" });
+      expect(sent).toEqual([]);
+
+      await startVerification(db, phone, { deliveries, deliveryChannel: "sms" });
+      expect(sent).toEqual(["sms"]);
+
+      await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+      await startVerification(db, phone, { deliveries, deliveryChannel: "telegram" });
+      expect(sent).toEqual(["sms", "telegram"]);
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
+  test("advertised channels are global and carry no phone-specific information", async () => {
+    const deliveries = new Map<"telegram" | "sms", OTPDelivery>([
+      ["telegram", { channel: "telegram", allows: (p) => p === testPhone(202), async send() {} }],
+      ["sms", { channel: "sms", async send() {} }],
+    ]);
+    const server = startCloudServer(0, db, null, deliveries as never, { backgroundWorkers: false });
+    try {
+      const body = await (await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`)).json() as any;
+      expect(body.capabilities).toContain("otp_channel_telegram");
+      expect(body.capabilities).toContain("otp_channel_sms");
+      expect(body.capabilities).not.toContain("otp_channel_whatsapp");
+
+      // A per-number answer here would reveal allowlist membership on a public endpoint, undoing
+      // the single generic 503 that startVerification uses to deny exactly that question.
+      const allowed = await (await fetch(
+        `http://127.0.0.1:${server.port}/v1/capabilities?phone=${encodeURIComponent(testPhone(202))}`)).json() as any;
+      const outsider = await (await fetch(
+        `http://127.0.0.1:${server.port}/v1/capabilities?phone=${encodeURIComponent(testPhone(203))}`)).json() as any;
+      expect(allowed.capabilities).toEqual(outsider.capabilities);
+      expect(JSON.stringify(body)).not.toContain(testPhone(202).slice(-6));
+    } finally {
+      await server.stop(true);
     }
   });
 
@@ -1077,7 +1149,9 @@ describe("M3 cloud sync", () => {
     const logged: string[] = [];
     console.error = (...parts: unknown[]) => logged.push(parts.map(String).join(" "));
     try {
-      await startVerification(db, testPhone(123), { delivery: new FailingOTPDelivery() });
+      const failing = new FailingOTPDelivery();
+      await startVerification(db, testPhone(123),
+        { deliveries: registryOf(failing), deliveryChannel: failing.channel });
     } catch (value) {
       error = value;
     } finally {

@@ -105,7 +105,11 @@ overwrites them afterwards. `TOJ_RETURN_OTP` in particular must not be pinned in
 the pilot needs `0` and the synthetic bypass needs `1`, so a pinned value would be restored on the
 next Blueprint sync and crash-loop the service against this runbook.
 
-Remove/unset SMS webhook configuration if present; it cannot run alongside this pilot.
+An SMS webhook may now be configured **alongside** Telegram — that combination used to throw on
+startup, which also made a Telegram+SMS picker unbootable. Each configured channel is registered
+independently and the user picks one; the server sends on exactly that channel or fails, and never
+substitutes. `/v1/capabilities` advertises which channels exist, globally and with no phone in the
+request or response, so it can never answer "is this number allowlisted on X".
 The old synthetic allowlist has no effect while direct code return is disabled. Do not put
 real numbers in that old bypass. No keys, TLS configuration, or database schema need changing.
 The pilot fails startup outside staging, with a missing/malformed token, with an invalid/empty

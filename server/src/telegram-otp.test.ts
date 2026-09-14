@@ -13,11 +13,10 @@ test("storing a token alone does not activate Telegram", () => {
   expect(telegramOTPFromEnvironment({ TOJ_TELEGRAM_GATEWAY_TOKEN: token })).toBeNull();
 });
 
-test("Telegram config rejects production, OTP bypass, webhook overlap, and invalid secrets/allowlists", () => {
+test("Telegram config rejects production, OTP bypass, and invalid secrets/allowlists", () => {
   for (const change of [
     { NODE_ENV: "production" }, { NODE_ENV: "development" }, { TOJ_RETURN_OTP: "1" },
-    { TOJ_RETURN_OTP: undefined }, { TOJ_SMS_WEBHOOK_URL: "https://example.test" },
-    { TOJ_SMS_WEBHOOK_TOKEN: "synthetic" }, { TOJ_TELEGRAM_GATEWAY_TOKEN: "" },
+    { TOJ_RETURN_OTP: undefined }, { TOJ_TELEGRAM_GATEWAY_TOKEN: "" },
     { TOJ_TELEGRAM_GATEWAY_TOKEN: "bad\ntoken" }, { TOJ_TELEGRAM_TEST_ALLOWLIST: "" },
     { TOJ_TELEGRAM_TEST_ALLOWLIST: "*" }, { TOJ_TELEGRAM_TEST_ALLOWLIST: `${phone},` },
     { TOJ_TELEGRAM_TEST_ALLOWLIST: Array(6).fill(phone).join(",") },
@@ -131,4 +130,16 @@ test("failures log one actionable tag and never the token, phone, or code", asyn
   } finally {
     console.error = original;
   }
+});
+
+test("an SMS webhook alongside Telegram no longer blocks configuration", () => {
+  // The old interlock threw here so only one unproven provider could send. It also made the
+  // Telegram+SMS picker unbootable — the very feature it was protecting. Coexistence is now the
+  // point; per-channel consent in startVerification is what stops a silent substitution.
+  const delivery = telegramOTPFromEnvironment({
+    ...fixture(),
+    TOJ_SMS_WEBHOOK_URL: "https://example.test/sms",
+    TOJ_SMS_WEBHOOK_TOKEN: "synthetic",
+  });
+  expect(delivery?.channel).toBe("telegram");
 });

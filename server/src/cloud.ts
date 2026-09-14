@@ -18,7 +18,9 @@ import {
   lookupAccountByUsername,
   getProfile,
   updateProfile,
-  otpDeliveryFromEnvironment,
+  otpDeliveryRegistryFromEnvironment,
+  type OTPChannel,
+  type OTPDeliveryRegistry,
   listDevices,
   startAccountDeletion,
   privateBetaOTPConfigured,
@@ -333,8 +335,13 @@ function cloudCapabilities(
   abuseReports: boolean,
   messaging: MessagingFeatureFlags,
   twoFactorAvailable = twoFactorConfigured(),
+  otpChannels: readonly OTPChannel[] = [],
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
+  // Which channels the picker may offer. Deliberately GLOBAL and phone-free: a per-number response
+  // would answer "is this number allowlisted / reachable on X", turning a public endpoint into the
+  // membership oracle that the single generic 503 in startVerification exists to deny.
+  for (const channel of otpChannels) capabilities.push(`otp_channel_${channel}`);
   if (authSessionsV2Configured()) capabilities.push("auth_sessions_v2");
   if (twoFactorAvailable) capabilities.push("two_factor_v1");
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -671,9 +678,12 @@ export function startCloudServer(
   port = Number(process.env.PORT ?? 8788),
   db: Db = defaultSql,
   pushSender: PushSender | null = APNsClient.fromEnvironment(),
-  otpDelivery: OTPDelivery | null = otpDeliveryFromEnvironment(),
+  // `null` is accepted and means "no channel configured" — the shape tests and embedders used
+  // before this was a registry.
+  otpDeliveryRegistry: OTPDeliveryRegistry | null = otpDeliveryRegistryFromEnvironment(),
   options: CloudServerOptions = {},
 ) {
+  const otpDeliveries: OTPDeliveryRegistry = otpDeliveryRegistry ?? new Map();
   assertCryptoConfiguration();
   assertBlindIndexConfiguration();
   // Refuse unsafe media configuration before the process begins accepting traffic. The current
@@ -934,9 +944,10 @@ export function startCloudServer(
 
         else if (url.pathname === "/ready") {
           const baseState = await readiness(db, {
-            sms: otpDelivery?.channel === "telegram" ? "disabled"
-              : otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
-            ...(otpDelivery?.channel === "telegram" ? { telegram: "configured" as const } : {}),
+            sms: otpDeliveries.has("sms") ? "configured"
+              : privateBetaOTPConfigured() ? "development" : "disabled",
+            ...(otpDeliveries.has("telegram") ? { telegram: "configured" as const } : {}),
+            ...(otpDeliveries.has("whatsapp") ? { whatsapp: "configured" as const } : {}),
             push: pushSender ? "configured" : "disabled",
           });
           const reportSchema = await abuseReportSchemaReadiness(db);
@@ -1033,6 +1044,7 @@ export function startCloudServer(
             await abuseReportAvailability(),
             messagingFeatures,
             accountTwoFactorAvailable,
+            [...otpDeliveries.keys()],
           ));
         }
 
@@ -1082,7 +1094,7 @@ export function startCloudServer(
           const body = await readJson(req);
           if (!body.phone) throw new AuthError("phone required", 400);
           response = json(await startVerification(db, body.phone, {
-            networkKey: networkKey(req, server), delivery: otpDelivery,
+            networkKey: networkKey(req, server), deliveries: otpDeliveries,
             deliveryChannel: body.deliveryChannel,
           }));
         }
@@ -2106,7 +2118,8 @@ export function startCloudServer(
           if (!twoFactorConfigured() && !state.enabled) {
             response = new Response("not found", { status: 404 });
           } else response = json(await startSecurityChange(db, session.accountId, {
-              networkKey: networkKey(req, server), delivery: otpDelivery,
+              networkKey: networkKey(req, server), deliveries: otpDeliveries,
+              deliveryChannel: body.deliveryChannel,
             }));
         }
 
@@ -2132,7 +2145,7 @@ export function startCloudServer(
               db,
               session.accountId,
               wasEnabled ? "two_factor_changed" : "two_factor_enabled",
-              otpDelivery,
+              otpDeliveries.get("sms") ?? null,
             );
             metrics.recordAuthSecurity("two_factor_configured");
             response = json(result);
@@ -2152,7 +2165,7 @@ export function startCloudServer(
             for (const deviceId of result.revokedDeviceIds) {
               disconnectDevice(sockets, session.accountId, deviceId);
             }
-            await sendSecurityChangeAlert(db, session.accountId, "two_factor_disabled", otpDelivery);
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_disabled", otpDeliveries.get("sms") ?? null);
             metrics.recordAuthSecurity("two_factor_disabled");
             response = json(result);
           }
@@ -2171,7 +2184,7 @@ export function startCloudServer(
             for (const deviceId of result.revokedDeviceIds) {
               disconnectDevice(sockets, session.accountId, deviceId);
             }
-            await sendSecurityChangeAlert(db, session.accountId, "two_factor_changed", otpDelivery);
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_changed", otpDeliveries.get("sms") ?? null);
             metrics.recordAuthSecurity("recovery_codes_regenerated");
             response = json(result);
           }
@@ -2193,7 +2206,8 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/account/deletion/start" && req.method === "POST") {
           response = json(await startAccountDeletion(db, session.accountId, {
-            networkKey: networkKey(req, server), delivery: otpDelivery,
+            networkKey: networkKey(req, server), deliveries: otpDeliveries,
+            deliveryChannel: body.deliveryChannel,
           }));
         }
 
@@ -2235,7 +2249,7 @@ export function startCloudServer(
           pushHints(sockets, result.syncPushes);
           // Losing a device must never be silent. The account_events row is the durable half and
           // rides the existing sync path, so it survives push being unconfigured.
-          await sendSecurityChangeAlert(db, session.accountId, "device_revoked", otpDelivery);
+          await sendSecurityChangeAlert(db, session.accountId, "device_revoked", otpDeliveries.get("sms") ?? null);
           response = json({ revoked: result.revoked });
         }
 
