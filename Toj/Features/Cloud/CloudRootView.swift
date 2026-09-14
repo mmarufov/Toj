@@ -250,6 +250,45 @@ private struct CloudLocalRecoveryView: View {
 
 // MARK: - Authentication
 
+/// Cheap channels read as the primary choice and SMS as the quieter alternative. The ordering is
+/// the only thing nudging cost here — every option stays one tap away, because the channel a person
+/// actually reads is worth more than the few cents between them.
+private struct OTPChannelPicker: View {
+    @Bindable var model: CloudAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("How should we send your code?")
+                .font(.footnote)
+                .foregroundStyle(TojTheme.secondaryText)
+
+            ForEach(model.orderedOTPChannels) { channel in
+                Button {
+                    model.selectedOTPChannel = channel
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: model.selectedOTPChannel == channel
+                            ? "largecircle.fill.circle" : "circle")
+                            .foregroundStyle(model.selectedOTPChannel == channel
+                                ? TojTheme.accent : TojTheme.secondaryText)
+                        Text(channel.title)
+                            .font(channel == .sms ? .subheadline : .headline)
+                            .foregroundStyle(channel == .sms ? TojTheme.secondaryText : TojTheme.text)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("otp-channel-\(channel.rawValue)")
+                .accessibilityAddTraits(model.selectedOTPChannel == channel ? [.isSelected] : [])
+            }
+        }
+        .disabled(model.authRequestInFlight)
+        .padding(.top, 4)
+    }
+}
+
+
 private struct CloudAuthView: View {
     @Bindable var model: CloudAppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -341,15 +380,9 @@ private struct CloudAuthView: View {
                             keyboard: .default
                         )
                         .focused($focusedField, equals: .name)
-                        #if DEBUG
-                        if model.telegramOTPAvailable {
-                            Toggle("Receive my code in Telegram", isOn: $model.useTelegramOTP)
-                                .disabled(model.authRequestInFlight)
-                            Text("Private staging test. Sends a Toj code to the Telegram account for this number, not by SMS.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
+                        if !model.orderedOTPChannels.isEmpty {
+                            OTPChannelPicker(model: model)
                         }
-                        #endif
                     }
                 }
                 .padding(.top, 34)
@@ -478,11 +511,14 @@ private struct CloudAuthView: View {
                 ? "Enter one saved recovery code and choose a replacement password."
                 : "Enter the account password you set in Privacy and Security."
         }
-        #if DEBUG
-        if model.requestedCode && model.telegramOTPAvailable && model.useTelegramOTP {
-            return "Check Telegram for your six-digit Toj code."
+        if model.requestedCode, let channel = model.selectedOTPChannel,
+           !model.orderedOTPChannels.isEmpty {
+            switch channel {
+            case .whatsapp: return "Check WhatsApp for your six-digit Toj code."
+            case .telegram: return "Check Telegram for your six-digit Toj code."
+            case .sms: return "We sent a six-digit code to your phone."
+            }
         }
-        #endif
         return model.requestedCode
             ? "We sent a six-digit code to your phone."
             : "Fast, private messaging made for your people."
