@@ -12,6 +12,7 @@ import { notifySyncWakeups } from "./sync-wakeup";
 import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
 import { telegramOTPFromEnvironment } from "./telegram-otp";
+import { infobipOTPFromEnvironment } from "./infobip-otp";
 export { AuthError } from "./auth-error";
 import {
   isV2AccessToken,
@@ -125,6 +126,17 @@ export function otpDeliveryRegistryFromEnvironment(): OTPDeliveryRegistry {
     }
     const webhook = new WebhookOTPDelivery(url, token);
     registry.set(webhook.channel, webhook);
+  }
+
+  // Infobip and the generic webhook are both "sms". Two transports claiming one channel is
+  // ambiguous, and letting the later registration silently win is the class of bug this file has
+  // spent its history removing. Fail loudly and make the operator choose.
+  const infobip = infobipOTPFromEnvironment();
+  if (infobip) {
+    if (registry.has(infobip.channel)) {
+      throw new Error("Configure either the SMS webhook or Infobip as the sms channel, not both");
+    }
+    registry.set(infobip.channel, infobip);
   }
 
   // TOJ_OTP_PROVIDER survives as a deliberate activation switch for Telegram (telegram-otp.ts reads

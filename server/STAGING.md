@@ -171,6 +171,30 @@ References: [Gateway API](https://core.telegram.org/gateway/api),
 [testing guide](https://core.telegram.org/gateway/verification-tutorial),
 [Gateway terms](https://telegram.org/tos/gateway).
 
+## Optional private Infobip SMS pilot
+
+A second channel for the picker, restricted the same way as Telegram. Credentials alone do nothing:
+`TOJ_INFOBIP_ENABLED=1` is a separate, deliberate switch, and the pilot additionally requires
+`NODE_ENV=staging` and `TOJ_RETURN_OTP=0`.
+
+| Variable | Value |
+| --- | --- |
+| `TOJ_INFOBIP_ENABLED` | `1` (activation; absent means the adapter never constructs) |
+| `TOJ_INFOBIP_BASE_URL` | The account's personalised base URL, e.g. `https://xxxxx.api.infobip.com`. HTTPS, no port/path/credentials, `*.api.infobip.com` only |
+| `TOJ_INFOBIP_API_KEY` | From the Infobip dashboard; **viewable for 2 days only** — store privately, never in chat/Git/logs |
+| `TOJ_INFOBIP_SENDER` | `ServiceSMS` for the trial. A custom `Toj` sender needs separate registration (3-5 business days) |
+| `TOJ_INFOBIP_TEST_ALLOWLIST` | 1-5 exact numbers, each verified in the Infobip account |
+
+**Only one transport may claim the `sms` channel.** Configuring both `TOJ_SMS_WEBHOOK_*` and
+Infobip throws on startup rather than letting the later registration silently decide which provider
+bills and sends. Pick one.
+
+One send is one SMS at list price (portal showed $0.35 for the Tajik operators, unconfirmed by
+sales). The daily request budget is a request cap, **not** a cap on trial credits — check the
+balance before any real send. Provider acceptance is not handset delivery, and Tajikistan returns no
+delivery receipts on any provider, so a resolved send proves dispatch and nothing more. Failures log
+one sanitized tag, `auth.otp.infobip_failed <reason>`, carrying no key, number or code.
+
 ## Fresh database bootstrap
 
 The canonical implementation is `src/migrate.ts`, including every SQL phase, TypeScript backfill,
