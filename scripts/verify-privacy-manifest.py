@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "Toj" / "PrivacyInfo.xcprivacy"
-INVENTORY = ROOT / "PRIVACY_DATA_MAP.md"
+INVENTORY = ROOT / "docs" / "privacy-data-map.md"
 PURPOSE = "NSPrivacyCollectedDataTypePurposeAppFunctionality"
 LOCATION_TYPES = {
     "NSPrivacyCollectedDataTypePreciseLocation",

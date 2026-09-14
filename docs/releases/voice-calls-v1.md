@@ -141,7 +141,7 @@ The `WebRTC XCFramework` tag workflow must then:
 - The immutable release contains the expected revision, checksum, SBOM, and
   attestation.
 - Local Release compilation and signed iOS tests pass with the fetched XCFramework.
-- Deferred work is recorded in `VOICE_CALLS_FOLLOW_UP.md` with explicit rollout
+- Deferred work is recorded in `voice-calls-v1-follow-up.md` with explicit rollout
   gates.
 
 ## User-owned prerequisites

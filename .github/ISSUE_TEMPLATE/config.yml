@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/mmarufov/Toj/security/advisories/new
+    about: Please report security problems privately, never as a public issue.
+  - name: Support and general questions
+    url: mailto:support@tojchat.tech
+    about: Questions about Toj that are not a defect in this repository.

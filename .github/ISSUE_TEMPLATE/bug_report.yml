@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in the client or the backend behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Not for security problems.** If this is a vulnerability, report it
+        privately instead — see the [security policy](https://github.com/mmarufov/Toj/blob/main/.github/SECURITY.md).
+
+        Please do not paste real phone numbers or real message content.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - iOS client
+        - Backend (server/)
+        - Build, scripts, or CI
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The commit SHA you reproduced this against.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Device or simulator, iOS version, Xcode version — whichever apply.
+      placeholder: iPhone 17 Pro simulator, iOS 26.5, Xcode 26.5
+  - type: textarea
+    id: network
+    attributes:
+      label: Network conditions
+      description: >
+        Toj targets slow, lossy links. If the bug involves a weak connection,
+        dropped connection, or airplane mode, describe it here — it is often
+        the whole reproduction.
