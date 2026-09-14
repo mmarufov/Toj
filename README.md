@@ -317,9 +317,12 @@ anything security-related.
 
 ## License
 
-No license has been granted. Until a `LICENSE` file is added to this repository,
-the source is published for inspection and review only, and all rights are
-reserved by default.
+**Source-available, not open source.** Toj is published so it can be inspected
+and audited; publication is not a grant of rights. See [LICENSE](LICENSE).
+
+Third-party dependencies keep their own licenses, listed in [NOTICE.md](NOTICE.md)
+— which also records an unresolved question worth knowing about before any build
+is distributed: libsignal is AGPL-3.0 and is linked into the app.
 
 <div align="center">
 <sub>Toj — messaging, closer to home.</sub>
