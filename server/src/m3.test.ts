@@ -1143,6 +1143,44 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("two transports claiming the sms channel is a loud failure, not a silent winner", () => {
+    const keys = ["TOJ_OTP_PROVIDER", "TOJ_TELEGRAM_GATEWAY_TOKEN", "TOJ_TELEGRAM_TEST_ALLOWLIST",
+      "TOJ_SMS_WEBHOOK_URL", "TOJ_SMS_WEBHOOK_TOKEN", "NODE_ENV", "TOJ_RETURN_OTP",
+      "TOJ_INFOBIP_ENABLED", "TOJ_INFOBIP_BASE_URL", "TOJ_INFOBIP_API_KEY",
+      "TOJ_INFOBIP_SENDER", "TOJ_INFOBIP_TEST_ALLOWLIST"] as const;
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      for (const key of keys) delete process.env[key];
+      process.env.NODE_ENV = "staging";
+      process.env.TOJ_RETURN_OTP = "0";
+      process.env.TOJ_INFOBIP_ENABLED = "1";
+      process.env.TOJ_INFOBIP_BASE_URL = "https://55n4vx.api.infobip.com";
+      process.env.TOJ_INFOBIP_API_KEY = "synthetic-key-not-a-credential";
+      process.env.TOJ_INFOBIP_SENDER = "ServiceSMS";
+      process.env.TOJ_INFOBIP_TEST_ALLOWLIST = testPhone(204);
+      expect([...otpDeliveryRegistryFromEnvironment().keys()]).toEqual(["sms"]);
+
+      // Infobip and the generic webhook are both "sms". Letting the later registration win would
+      // silently decide which provider bills and sends — the exact class of bug this file exists to
+      // keep out. It must refuse to start instead.
+      process.env.TOJ_SMS_WEBHOOK_URL = "https://example.test/hook";
+      process.env.TOJ_SMS_WEBHOOK_TOKEN = "synthetic";
+      expect(() => otpDeliveryRegistryFromEnvironment()).toThrow(/either the SMS webhook or Infobip/);
+
+      // Telegram alongside one SMS transport is the supported picker shape.
+      delete process.env.TOJ_SMS_WEBHOOK_URL;
+      delete process.env.TOJ_SMS_WEBHOOK_TOKEN;
+      process.env.TOJ_OTP_PROVIDER = "telegram";
+      process.env.TOJ_TELEGRAM_GATEWAY_TOKEN = "synthetic";
+      process.env.TOJ_TELEGRAM_TEST_ALLOWLIST = testPhone(204);
+      expect([...otpDeliveryRegistryFromEnvironment().keys()].sort()).toEqual(["sms", "telegram"]);
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]!;
+      }
+    }
+  });
+
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
     const originalConsoleError = console.error;

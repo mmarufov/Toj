@@ -289,12 +289,43 @@ final class CloudAppModel {
     private(set) var replicaUpdatePhase: ReplicaUpdatePhase = .idle
     private(set) var lastSuccessfulServerContact: Date?
     private(set) var requestedCode = false
-    #if DEBUG
-    var useTelegramOTP = false
-    // Matched on host so a trailing slash or path on the configured endpoint cannot silently
-    // hide the staging toggle with no explanation.
-    var telegramOTPAvailable: Bool { api.config.baseURL.host?.lowercased() == "api.tojchat.tech" }
-    #endif
+    /// How the user wants their code delivered. They choose; the server never substitutes, so a tap
+    /// here is the consent — which is why a picker is safe where a server-side fallback was not.
+    enum OTPChannel: String, CaseIterable, Identifiable, Sendable {
+        case whatsapp, telegram, sms
+        var id: String { rawValue }
+
+        /// Cost-ascending. A free choice does not optimise spend on its own, so the cheap channels
+        /// are simply the obvious ones: SMS costs ~20-60x either alternative and is the only one
+        /// that reaches everybody, so it belongs last rather than removed.
+        static let displayOrder: [OTPChannel] = [.whatsapp, .telegram, .sms]
+
+        var capabilityName: String { "otp_channel_\(rawValue)" }
+
+        var title: String {
+            switch self {
+            case .whatsapp: "WhatsApp"
+            case .telegram: "Telegram"
+            case .sms: "SMS"
+            }
+        }
+    }
+
+    /// Only what the server says it can actually send on, so the picker never offers a dead button.
+    private(set) var availableOTPChannels: [OTPChannel] = []
+    var selectedOTPChannel: OTPChannel?
+
+    /// Cheapest-first, and never a channel the server did not advertise.
+    var orderedOTPChannels: [OTPChannel] {
+        OTPChannel.displayOrder.filter { availableOTPChannels.contains($0) }
+    }
+
+    func applyOTPChannels(_ capabilities: [String]) {
+        let advertised = OTPChannel.allCases.filter { capabilities.contains($0.capabilityName) }
+        availableOTPChannels = advertised
+        if let selected = selectedOTPChannel, advertised.contains(selected) { return }
+        selectedOTPChannel = OTPChannel.displayOrder.first { advertised.contains($0) }
+    }
     private(set) var authRequestInFlight = false
     private(set) var authVerifyInFlight = false
     private(set) var twoFactorChallengeId: String?
@@ -912,13 +943,17 @@ final class CloudAppModel {
         authRequestInFlight = true
         defer { authRequestInFlight = false }
         do {
-            var deliveryChannel: String?
-            #if DEBUG
-            if telegramOTPAvailable && useTelegramOTP { deliveryChannel = "telegram" }
-            #endif
+            // Refresh first: the picker must never offer a channel the server cannot send on, and
+            // this is the one place the answer is cheap to get and always needed.
+            if let capabilities = try? await api.capabilities() {
+                applyOTPChannels(capabilities.capabilities)
+            }
+            let deliveryChannel = availableOTPChannels.isEmpty ? nil : selectedOTPChannel?.rawValue
             let response = try await api.startAuth(phone: trimmed, deliveryChannel: deliveryChannel)
             requestedCode = true
             if deliveryChannel != nil {
+                // A real channel was used, so any code in the response is a development artefact
+                // and must not be pre-filled as though the user had received it.
                 code = ""
             } else if let devCode = response.code {
                 code = devCode

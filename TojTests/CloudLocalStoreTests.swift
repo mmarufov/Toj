@@ -2233,51 +2233,49 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.baseURL, expected)
     }
 
-    #if DEBUG
     @MainActor
-    func testTelegramStagingLoginRequiresExplicitChoiceAndNeverAutofillsReturnedCode() async throws {
+    func testPickerOffersOnlyAdvertisedChannelsCheapestFirst() throws {
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+        let model = CloudAppModel(config: config, useDefaultLocalStore: false)
+
+        // Nothing advertised means no picker at all, rather than dead buttons.
+        model.applyOTPChannels(["core_text"])
+        XCTAssertEqual(model.orderedOTPChannels, [])
+        XCTAssertNil(model.selectedOTPChannel)
+
+        // Cost-ascending regardless of the order the server lists them in.
+        model.applyOTPChannels(["otp_channel_sms", "otp_channel_whatsapp", "otp_channel_telegram"])
+        XCTAssertEqual(model.orderedOTPChannels, [.whatsapp, .telegram, .sms])
+        XCTAssertEqual(model.selectedOTPChannel, .whatsapp)
+
+        // A deliberate choice survives a refresh that still offers it.
+        model.selectedOTPChannel = .sms
+        model.applyOTPChannels(["otp_channel_sms", "otp_channel_telegram"])
+        XCTAssertEqual(model.selectedOTPChannel, .sms)
+
+        // But a choice the server withdrew must fall back to the cheapest still available, never
+        // to a channel that would now fail.
+        model.applyOTPChannels(["otp_channel_telegram"])
+        XCTAssertEqual(model.orderedOTPChannels, [.telegram])
+        XCTAssertEqual(model.selectedOTPChannel, .telegram)
+    }
+
+    @MainActor
+    func testLoginSendsTheChosenChannelAndNeverAutofillsAReturnedCode() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
         CloudAPIMockURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.tojchat.tech/v1/auth/start")
+            let ok = { (json: String) in
+                (try! XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
+                    httpVersion: "HTTP/1.1", headerFields: nil)), Data(json.utf8))
+            }
+            if request.url?.path.contains("capabilities") == true {
+                return ok("{\"api_version\":6,\"capabilities\":[\"otp_channel_telegram\",\"otp_channel_sms\"]}")
+            }
             let data = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
             let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
             XCTAssertEqual(body["deliveryChannel"], "telegram")
-            return (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
-                httpVersion: "HTTP/1.1", headerFields: nil)),
-                Data("{\"code\":\"123456\",\"retryAfter\":30}".utf8))
-        }
-        defer { CloudAPIMockURLProtocol.handler = nil }
-        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
-        let api = CloudAPI(config: config, session: URLSession(configuration: configuration))
-        let model = CloudAppModel(config: config, api: api, useDefaultLocalStore: false)
-        XCTAssertTrue(model.telegramOTPAvailable)
-        XCTAssertFalse(model.useTelegramOTP)
-        model.phone = "+12025550101"
-        model.displayName = "Synthetic"
-        model.useTelegramOTP = true
-        await model.requestCode()
-        XCTAssertTrue(model.requestedCode)
-        XCTAssertEqual(model.code, "")
-        let other = CloudAppModel(config: CloudConfig(baseURL: try XCTUnwrap(
-            URL(string: "https://api.sandstrm.online/cloud"))), useDefaultLocalStore: false)
-        XCTAssertFalse(other.telegramOTPAvailable)
-    }
-    #endif
-
-    #if DEBUG
-    @MainActor
-    func testLoginWithoutTheTelegramToggleNeverRequestsAChannel() async throws {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
-        CloudAPIMockURLProtocol.handler = { request in
-            let data = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
-            XCTAssertEqual(body["phone"], "+12025550101")
-            XCTAssertNil(body["deliveryChannel"])
-            return (try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
-                httpVersion: "HTTP/1.1", headerFields: nil)),
-                Data("{\"code\":\"123456\",\"retryAfter\":30}".utf8))
+            return ok("{\"code\":\"123456\",\"retryAfter\":30}")
         }
         defer { CloudAPIMockURLProtocol.handler = nil }
         let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
@@ -2285,9 +2283,42 @@ final class CloudLocalStoreTests: XCTestCase {
             session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
         model.phone = "+12025550101"
         model.displayName = "Synthetic"
-        XCTAssertFalse(model.useTelegramOTP)
         await model.requestCode()
-        // The untouched toggle leaves the existing synthetic-code path exactly as it was.
+
+        // Telegram is cheapest of the two advertised, so it is the default selection and the one
+        // named on the wire.
+        XCTAssertEqual(model.selectedOTPChannel, .telegram)
+        XCTAssertTrue(model.requestedCode)
+        // A real channel carried the code, so a development code in the response must not be
+        // pre-filled as though the user had received it.
+        XCTAssertEqual(model.code, "")
+    }
+
+    @MainActor
+    func testLoginWithoutAnAdvertisedChannelNeverNamesOne() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            let ok = { (json: String) in
+                (try! XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
+                    httpVersion: "HTTP/1.1", headerFields: nil)), Data(json.utf8))
+            }
+            if request.url?.path.contains("capabilities") == true {
+                return ok("{\"api_version\":6,\"capabilities\":[\"core_text\"]}")
+            }
+            let data = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+            XCTAssertNil(body["deliveryChannel"])
+            return ok("{\"code\":\"123456\",\"retryAfter\":30}")
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://api.tojchat.tech")))
+        let model = CloudAppModel(config: config, api: CloudAPI(config: config,
+            session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
+        model.phone = "+12025550101"
+        model.displayName = "Synthetic"
+        await model.requestCode()
+        // No channel advertised means the synthetic development path, which still autofills.
         XCTAssertEqual(model.code, "123456")
     }
 
@@ -2306,7 +2337,6 @@ final class CloudLocalStoreTests: XCTestCase {
             session: URLSession(configuration: configuration)), useDefaultLocalStore: false)
         model.phone = "+12025550101"
         model.displayName = "Synthetic"
-        model.useTelegramOTP = true
         await model.requestCode()
 
         XCTAssertFalse(model.requestedCode)
@@ -2337,7 +2367,6 @@ final class CloudLocalStoreTests: XCTestCase {
             XCTAssertEqual(model.resendCountdown, expected, "retryAfter \(retryAfter)")
         }
     }
-    #endif
 
     func testStagingEndpointPersistsAndUsesRootV1Routes() throws {
         let suiteName = "CloudConfigTests.\(UUID().uuidString)"
