@@ -2,6 +2,30 @@ import type { OTPDelivery } from "./auth";
 import { normalizePhone } from "./crypto";
 
 const PHONE = /^\+[1-9]\d{7,14}$/;
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
+// A shape check alone would also admit CODE_012345 or PHONE_12025550101. Only emit known
+// diagnostic constants, never arbitrary provider strings, even when they resemble an enum.
+// https://www.infobip.com/docs/essentials/api-essentials/api-authentication
+// https://www.infobip.com/docs/essentials/api-essentials/api-authorization
+const SERVICE_ERRORS = new Set(["UNAUTHORIZED", "FORBIDDEN", "BAD_REQUEST", "TOO_MANY_REQUESTS"]);
+
+function serviceErrorCode(body: unknown): string {
+  const value = (body as { requestError?: { serviceException?: { messageId?: unknown } } } | null)
+    ?.requestError?.serviceException?.messageId;
+  return typeof value === "string" && ERROR_CODE.test(value) && SERVICE_ERRORS.has(value)
+    ? value : "unrecognized";
+}
+
+// SMS-level rejection can arrive inside an HTTP 200. Map numeric IDs to local constants rather
+// than trusting status.name/description; a missing mapping stays generic and fails closed.
+const SMS_REJECTIONS: Readonly<Record<number, string>> = {
+  11: "REJECTED_SOURCE",
+  12: "REJECTED_NOT_ENOUGH_CREDITS",
+  13: "REJECTED_SENDER",
+  17: "REJECTED_PREPAID_PACKAGE_EXPIRED",
+  18: "REJECTED_DESTINATION_NOT_REGISTERED",
+  19: "REJECTED_ROUTE_NOT_AVAILABLE",
+};
 const PURPOSE_TEXT = {
   login: "sign-in",
   security_change: "security change",
@@ -81,11 +105,11 @@ export class InfobipOTPDelivery implements OTPDelivery {
         signal: AbortSignal.timeout(10_000),
         redirect: "error",
       });
+      const body = await response.json().catch(() => null);
       if (!response.ok) {
-        reason = `http_${response.status}`;
+        reason = `http_${response.status}:${serviceErrorCode(body)}`;
         throw new Error(reason);
       }
-      const body = await response.json().catch(() => null);
       const messages = body?.messages;
       const message = Array.isArray(messages) && messages.length === 1 ? messages[0] : null;
       const status = message?.status;
@@ -103,7 +127,8 @@ export class InfobipOTPDelivery implements OTPDelivery {
       const delivered = status.groupId === 3 && status.groupName === "DELIVERED" && [2, 5].includes(status.id);
       if (!pending && !delivered) {
         // Never echo provider descriptions/names/body: they may contain the recipient or OTP.
-        reason = "provider_status_rejected";
+        const diagnostic = status.groupId === 5 ? SMS_REJECTIONS[status.id] : undefined;
+        reason = diagnostic ? `provider_status_rejected:${diagnostic}` : "provider_status_rejected";
         throw new Error(reason);
       }
       // Do not poll reports here: accepted sends must not become failures just because a slow

@@ -195,6 +195,36 @@ balance before any real send. Provider acceptance is not handset delivery, and T
 delivery receipts on any provider, so a resolved send proves dispatch and nothing more. Failures log
 one sanitized tag, `auth.otp.infobip_failed <reason>`, carrying no key, number or code.
 
+## Optional private WhatsApp OTP pilot
+
+The third picker channel, gated the same way as the others: `TOJ_WHATSAPP_ENABLED=1` is its own
+switch, plus `NODE_ENV=staging` and `TOJ_RETURN_OTP=0`. An access token sitting in the environment
+never starts sending on its own.
+
+| Variable | Value |
+| --- | --- |
+| `TOJ_WHATSAPP_ENABLED` | `1` (activation; absent means the adapter never constructs) |
+| `TOJ_WHATSAPP_ACCESS_TOKEN` | Cloud API token; never paste into chat/Git/logs |
+| `TOJ_WHATSAPP_PHONE_NUMBER_ID` | The WABA phone number ID |
+| `TOJ_WHATSAPP_TEMPLATE` | Approved authentication template name |
+| `TOJ_WHATSAPP_TEMPLATE_LANGUAGE` | Template language, e.g. `ru`. Tajik is not a supported template language |
+| `TOJ_WHATSAPP_TEST_ALLOWLIST` | 1-5 exact numbers |
+| `TOJ_WHATSAPP_GRAPH_VERSION` | Optional override; defaults to a pinned version |
+
+**Direct Cloud API, not a BSP.** A BSP is a second party that sees every OTP in plaintext. That is
+accepted for SMS because there is no alternative; WhatsApp has one, at lower cost. The Graph host is
+pinned in code with no base-URL variable, because a configurable host on this channel would be a way
+to ship the access token *and* the code to someone else's server.
+
+**Business Verification is not required to send** — it raises limits. An unverified account reaches
+250 unique recipients per rolling 24 hours, which covers testing and early launch. Whether
+authentication templates are available at that tier is unconfirmed (`OPEN_FINDINGS` D7): Meta's own
+documentation states no such gate, several BSP docs claim one, and the cheapest resolution is to
+create the template and see whether it is approved.
+
+`sendSecurityAlert` is deliberately unimplemented: an authentication template's body is fixed and
+carries only a code, so sending one where an alert was meant would be worse than sending nothing.
+
 ## Fresh database bootstrap
 
 The canonical implementation is `src/migrate.ts`, including every SQL phase, TypeScript backfill,

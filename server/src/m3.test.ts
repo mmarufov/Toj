@@ -1078,6 +1078,16 @@ describe("M3 cloud sync", () => {
       process.env.NODE_ENV = "staging";
       process.env.TOJ_RETURN_OTP = "0";
       expect([...otpDeliveryRegistryFromEnvironment().keys()].sort()).toEqual(["sms", "telegram"]);
+
+      // And all three at once, which is the shape the picker exists for.
+      process.env.TOJ_WHATSAPP_ENABLED = "1";
+      process.env.TOJ_WHATSAPP_ACCESS_TOKEN = "synthetic-token-not-a-credential";
+      process.env.TOJ_WHATSAPP_PHONE_NUMBER_ID = "123456789012345";
+      process.env.TOJ_WHATSAPP_TEMPLATE = "toj_verification";
+      process.env.TOJ_WHATSAPP_TEMPLATE_LANGUAGE = "ru";
+      process.env.TOJ_WHATSAPP_TEST_ALLOWLIST = testPhone(204);
+      expect([...otpDeliveryRegistryFromEnvironment().keys()].sort())
+        .toEqual(["sms", "telegram", "whatsapp"]);
     } finally {
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]!;
@@ -1147,7 +1157,9 @@ describe("M3 cloud sync", () => {
     const keys = ["TOJ_OTP_PROVIDER", "TOJ_TELEGRAM_GATEWAY_TOKEN", "TOJ_TELEGRAM_TEST_ALLOWLIST",
       "TOJ_SMS_WEBHOOK_URL", "TOJ_SMS_WEBHOOK_TOKEN", "NODE_ENV", "TOJ_RETURN_OTP",
       "TOJ_INFOBIP_ENABLED", "TOJ_INFOBIP_BASE_URL", "TOJ_INFOBIP_API_KEY",
-      "TOJ_INFOBIP_SENDER", "TOJ_INFOBIP_TEST_ALLOWLIST"] as const;
+      "TOJ_INFOBIP_SENDER", "TOJ_INFOBIP_TEST_ALLOWLIST", "TOJ_WHATSAPP_ENABLED",
+      "TOJ_WHATSAPP_ACCESS_TOKEN", "TOJ_WHATSAPP_PHONE_NUMBER_ID", "TOJ_WHATSAPP_TEMPLATE",
+      "TOJ_WHATSAPP_TEMPLATE_LANGUAGE", "TOJ_WHATSAPP_TEST_ALLOWLIST"] as const;
     const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     try {
       for (const key of keys) delete process.env[key];
