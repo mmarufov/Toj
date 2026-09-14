@@ -21,9 +21,6 @@ export function telegramOTPFromEnvironment(env: NodeJS.ProcessEnv = process.env)
   if (env.TOJ_OTP_PROVIDER !== "telegram") return null;
   if (env.NODE_ENV !== "staging") throw new Error("Telegram OTP is restricted to staging");
   if (env.TOJ_RETURN_OTP !== "0") throw new Error("Telegram OTP requires TOJ_RETURN_OTP=0");
-  if (env.TOJ_SMS_WEBHOOK_URL || env.TOJ_SMS_WEBHOOK_TOKEN) {
-    throw new Error("Telegram OTP cannot be combined with the SMS webhook");
-  }
   const token = env.TOJ_TELEGRAM_GATEWAY_TOKEN ?? "";
   if (!token || /\s/.test(token)) throw new Error("TOJ_TELEGRAM_GATEWAY_TOKEN is missing or malformed");
   // Separators are normalized exactly as the login path normalizes them, so a privately pasted

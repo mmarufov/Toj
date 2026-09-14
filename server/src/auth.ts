@@ -38,15 +38,32 @@ export type SecurityChangeEvent =
   | "two_factor_disabled"
   | "device_revoked";
 
+/**
+ * The channels a user can pick between on the verification screen. The user chooses; the server
+ * never substitutes. That is what makes the picker safe where a server-side fallback ladder was
+ * not: a tap is the consent, so there is no silent routing and no probing a number on a provider
+ * the user did not select.
+ */
+export const OTP_CHANNELS = ["telegram", "sms", "whatsapp"] as const;
+export type OTPChannel = (typeof OTP_CHANNELS)[number];
+
+export function isOTPChannel(value: unknown): value is OTPChannel {
+  return typeof value === "string" && (OTP_CHANNELS as readonly string[]).includes(value);
+}
+
 export interface OTPDelivery {
-  readonly channel?: "telegram";
+  readonly channel: OTPChannel;
   readonly dailyRequestLimit?: number;
   allows?(phone: string): boolean;
   send(phone: string, code: string, purpose: OTPPurpose): Promise<void>;
   sendSecurityAlert?(phone: string, event: SecurityChangeEvent): Promise<void>;
 }
 
+/** Every channel configured on this deployment, keyed by the value the client names in its pick. */
+export type OTPDeliveryRegistry = ReadonlyMap<OTPChannel, OTPDelivery>;
+
 class WebhookOTPDelivery implements OTPDelivery {
+  readonly channel = "sms" as const;
   constructor(private readonly url: URL, private readonly bearerToken: string) {}
 
   async send(phone: string, code: string, purpose: OTPPurpose): Promise<void> {
@@ -80,30 +97,51 @@ function hostedAuthentication(): boolean {
   return process.env.NODE_ENV === "production" || process.env.NODE_ENV === "staging";
 }
 
-export function otpDeliveryFromEnvironment(): OTPDelivery | null {
+/**
+ * Every configured channel, not one. The server used to hold a single delivery object and
+ * telegram-otp.ts threw on startup if an SMS webhook was also configured — a pilot-era interlock
+ * that guaranteed only one unproven provider could send. It also made the Telegram+SMS picker
+ * unbootable in any configuration, which is the feature it was protecting.
+ *
+ * Removing that interlock is only safe together with per-channel consent in startVerification: the
+ * gap between "more than one channel can be configured" and "the caller must name which one" is
+ * precisely the silent substitution the interlock prevented. They ship as one change, never two.
+ */
+export function otpDeliveryRegistryFromEnvironment(): OTPDeliveryRegistry {
+  const registry = new Map<OTPChannel, OTPDelivery>();
+
+  const telegram = telegramOTPFromEnvironment();
+  if (telegram) registry.set(telegram.channel, telegram);
+
+  const rawUrl = process.env.TOJ_SMS_WEBHOOK_URL;
+  const token = process.env.TOJ_SMS_WEBHOOK_TOKEN;
+  if (rawUrl || token) {
+    if (!rawUrl || !token) {
+      throw new Error("TOJ_SMS_WEBHOOK_URL and TOJ_SMS_WEBHOOK_TOKEN must be set together");
+    }
+    const url = new URL(rawUrl);
+    if (hostedAuthentication() && url.protocol !== "https:") {
+      throw new Error("TOJ_SMS_WEBHOOK_URL must use HTTPS in production or staging");
+    }
+    const webhook = new WebhookOTPDelivery(url, token);
+    registry.set(webhook.channel, webhook);
+  }
+
+  // TOJ_OTP_PROVIDER survives as a deliberate activation switch for Telegram (telegram-otp.ts reads
+  // it), not as a selector between mutually exclusive providers.
   const provider = process.env.TOJ_OTP_PROVIDER;
   if (provider && provider !== "telegram" && provider !== "webhook") {
     throw new Error("TOJ_OTP_PROVIDER must be telegram or webhook when set");
   }
-  const telegram = telegramOTPFromEnvironment();
-  if (telegram) return telegram;
-  const rawUrl = process.env.TOJ_SMS_WEBHOOK_URL;
-  const token = process.env.TOJ_SMS_WEBHOOK_TOKEN;
-  if (!rawUrl && !token) return null;
-  if (!rawUrl || !token) {
-    throw new Error("TOJ_SMS_WEBHOOK_URL and TOJ_SMS_WEBHOOK_TOKEN must be set together");
-  }
-  const url = new URL(rawUrl);
-  if (hostedAuthentication() && url.protocol !== "https:") {
-    throw new Error("TOJ_SMS_WEBHOOK_URL must use HTTPS in production or staging");
-  }
-  return new WebhookOTPDelivery(url, token);
+  return registry;
 }
 
 type StartVerificationOptions = {
   networkKey?: string | null;
-  delivery?: OTPDelivery | null;
+  /** Every channel this deployment can send on. The caller picks one; the server never picks. */
+  deliveries?: OTPDeliveryRegistry | null;
   purpose?: OTPPurpose;
+  /** The channel the user tapped. Required whenever any channel is configured. */
   deliveryChannel?: unknown;
 };
 
@@ -161,38 +199,42 @@ export async function startVerification(
     ? tokenHashCandidates(networkInput).map((candidate) => candidate.digest)
     : [];
   const hosted = hostedAuthentication();
-  const delivery = options.delivery ?? null;
-  if (delivery?.channel === "telegram") {
-    // Account deletion stays unavailable, and deliberately so rather than for tidiness: deleteAccount
-    // hard-deletes this phone's otp_challenges, which is the table the Telegram request budget counts.
-    // Minting a deletion code would reopen that budget as a resettable one. Security-change codes
-    // carry no such coupling and are mechanically identical to login codes — same allowlist, same
-    // generation, same expiry/attempt/reuse controls — so withholding them only blocked two-step
-    // enrollment, which is the single mitigation for SIM swap against phone-number identity.
-    // An operator staring at a 503 should not have to guess which of these applies.
-    if (purpose === "account_deletion") {
+  const registry = options.deliveries ?? null;
+  const configured = registry && registry.size > 0 ? registry : null;
+  let delivery: OTPDelivery | null = null;
+
+  if (configured) {
+    // The user picks the channel and the server sends on exactly that one, or fails honestly. There
+    // is no fallback ladder and no server-side routing: a tap is the consent, which is what makes a
+    // picker safe where substitution was not. It also means no channel is ever probed for a number
+    // whose owner did not choose it, so the disclosure a preflight would leak cannot happen here.
+    if (!isOTPChannel(options.deliveryChannel) || !configured.has(options.deliveryChannel)) {
+      throw new AuthError("choose how to receive your code", 400, undefined, "channel_required");
+    }
+    delivery = configured.get(options.deliveryChannel)!;
+
+    // Account deletion stays unavailable on Telegram, deliberately rather than for tidiness:
+    // deleteAccount hard-deletes this phone's otp_challenges, the very rows the Telegram request
+    // budget counts, so minting a deletion code would reopen that budget as a resettable one.
+    if (delivery.channel === "telegram" && purpose === "account_deletion") {
       throw new AuthError("this verification step is unavailable in the Telegram pilot", 503,
         undefined, "capability_unavailable");
     }
     // Recipient scope and the OTP-return interlock share one generic message on purpose: a
     // distinct reply would turn this endpoint into an allowlist-membership oracle.
-    if (process.env.TOJ_RETURN_OTP !== "0" || !delivery.allows?.(normalizedPhone)) {
+    if (delivery.channel === "telegram" && process.env.TOJ_RETURN_OTP !== "0") {
       throw new AuthError("verification service temporarily unavailable", 503);
     }
-    // Consent is owed for the *first* disclosure of a number to Telegram, which is the login. By
-    // the time an authenticated account asks for a security-change code, that number has already
-    // received a Telegram login code — the marginal disclosure is nil, and demanding a channel
-    // choice inside the app would be friction without privacy benefit.
-    // Revisit when a second channel exists: consent then becomes per-number-per-provider, and
-    // routing a step-up to Telegram for someone who logged in by SMS would be a new disclosure.
-    if (purpose === "login" && options.deliveryChannel !== "telegram") {
-      throw new AuthError("choose Telegram code delivery to continue", 400);
+    if (delivery.allows && !delivery.allows(normalizedPhone)) {
+      throw new AuthError("verification service temporarily unavailable", 503);
     }
   } else if (options.deliveryChannel !== undefined) {
-    // Never silently substitute SMS or synthetic codes after a Telegram choice.
+    // Nothing is configured, so a named channel cannot be honoured. Never fall back to returning a
+    // synthetic code to a caller who asked for a real one.
     throw new AuthError("requested verification channel unavailable", 503);
   }
-  const returnOTP = delivery?.channel !== "telegram" && (!hosted || privateBetaOTPAllowed(normalizedPhone));
+
+  const returnOTP = !delivery && (!hosted || privateBetaOTPAllowed(normalizedPhone));
   if (hosted && !delivery && !returnOTP) {
     throw new AuthError("verification service temporarily unavailable", 503);
   }
@@ -1456,7 +1498,8 @@ export async function revokeDevice(
 
 type AccountDeletionStartOptions = {
   networkKey?: string | null;
-  delivery?: OTPDelivery | null;
+  deliveries?: OTPDeliveryRegistry | null;
+  deliveryChannel?: unknown;
 };
 
 export async function startAccountDeletion(
@@ -1483,7 +1526,8 @@ export async function startAccountDeletion(
   }
   return await startVerification(sql, phone, {
     networkKey: options.networkKey,
-    delivery: options.delivery,
+    deliveries: options.deliveries,
+    deliveryChannel: options.deliveryChannel,
     purpose: "account_deletion",
   });
 }
