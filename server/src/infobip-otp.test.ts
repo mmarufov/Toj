@@ -140,7 +140,7 @@ test("Infobip rejects malformed, mismatched and failed responses without leaking
   const secret = `${apiKey} ${phone} ${code}`;
   const failures: [string, () => Response][] = [
     ...[302, 400, 401, 403, 429, 500].map((status): [string, () => Response] =>
-      [`http_${status}`, () => new Response(secret, { status })]),
+      [`http_${status}:unrecognized`, () => new Response(secret, { status })]),
     ...[null, {}, { messages: [] }, { messages: [null] },
       { messages: [...acceptedBody().messages, ...acceptedBody().messages] },
       { messages: [{ ...acceptedBody().messages[0], messageId: " " }] },
@@ -176,6 +176,105 @@ test("Infobip rejects malformed, mismatched and failed responses without leaking
     }
   } finally {
     console.error = original;
+  }
+});
+
+test("Infobip validates the v3 response envelope, not the superseded v2 destination fields", async () => {
+  // Official v3 response uses destination/details; v2 uses to/smsCount. The nested status fields
+  // match, but accepting the old envelope would mask a wrong endpoint or unexpected API change.
+  const status = { groupId: 1, groupName: "PENDING", id: 26, name: "PENDING_ACCEPTED" };
+  const logging = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    let calls = 0;
+    const v2 = new InfobipOTPDelivery(fixture(), async () => {
+      calls++;
+      return Response.json({ messages: [{ messageId: "synthetic-id", status, to: phone.slice(1), smsCount: 1 }] });
+    });
+    await expect(v2.send(phone, code, "login")).rejects.toThrow("Infobip OTP delivery unavailable");
+    expect(calls).toBe(1);
+    expect(logging).toHaveBeenCalledWith(expect.any(String), "auth.otp.infobip_failed", "malformed_response");
+    const v3 = new InfobipOTPDelivery(fixture(), async () => Response.json({
+      bulkId: "synthetic-bulk", messages: [{ messageId: "synthetic-id", status,
+        destination: phone.slice(1), details: { messageCount: 1 } }],
+    }));
+    await v3.send(phone, code, "login");
+  } finally {
+    logging.mockRestore();
+  }
+});
+
+test("Infobip exposes only known service error codes, never free text or enum-shaped secrets", async () => {
+  const logged: unknown[][] = [];
+  const logging = spyOn(console, "error").mockImplementation((...args) => { logged.push(args); });
+  try {
+    const cases: [number, unknown, string][] = [
+      [401, "UNAUTHORIZED", "UNAUTHORIZED"],
+      [403, "FORBIDDEN", "FORBIDDEN"],
+      [400, "BAD_REQUEST", "BAD_REQUEST"],
+      [429, "TOO_MANY_REQUESTS", "TOO_MANY_REQUESTS"],
+      ...[apiKey, phone, phone.slice(1), code, `CODE_${code}`, `PHONE_${phone.slice(1)}`,
+        "UNKNOWN_FUTURE_ERROR", "forbidden", "FORBIDDEN\n", "FORBIDDEN injected", "A".repeat(65),
+        123456, null, ["FORBIDDEN"], { messageId: "FORBIDDEN" },
+      ].map((value): [number, unknown, string] => [400, value, "unrecognized"]),
+    ];
+    for (const [status, messageId, expected] of cases) {
+      logged.length = 0;
+      let calls = 0;
+      const delivery = new InfobipOTPDelivery(fixture(), async () => {
+        calls++;
+        return Response.json({ requestError: { serviceException: {
+          messageId, text: `${apiKey} ${phone} ${code}`, variables: [apiKey, phone, code],
+        } } }, { status });
+      });
+      await expect(delivery.send(phone, code, "login")).rejects.toThrow("Infobip OTP delivery unavailable");
+      expect(calls).toBe(1);
+      expect(logged).toEqual([[expect.any(String), "auth.otp.infobip_failed", `http_${status}:${expected}`]]);
+      for (const secret of [apiKey, phone, phone.slice(1), code]) {
+        expect(JSON.stringify(logged)).not.toContain(secret);
+      }
+    }
+    for (const body of [null, {}, { requestError: null }, { requestError: { serviceException: null } },
+      { requestError: { serviceException: "FORBIDDEN" } }, { messageId: "FORBIDDEN" }]) {
+      logged.length = 0;
+      const delivery = new InfobipOTPDelivery(fixture(), async () => Response.json(body, { status: 403 }));
+      await expect(delivery.send(phone, code, "login")).rejects.toThrow();
+      expect(logged[0]?.[2]).toBe("http_403:unrecognized");
+    }
+    logged.length = 0;
+    const unreadable = new Response(null, { status: 401 });
+    unreadable.json = async () => { throw new Error(`${apiKey} ${phone} ${code}`); };
+    const delivery = new InfobipOTPDelivery(fixture(), async () => unreadable);
+    await expect(delivery.send(phone, code, "login")).rejects.toThrow();
+    expect(logged[0]?.[2]).toBe("http_401:unrecognized");
+  } finally {
+    logging.mockRestore();
+  }
+});
+
+test("Infobip diagnoses credit and configuration rejections even inside HTTP 200", async () => {
+  const logging = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (const [id, diagnostic] of [
+      [11, "REJECTED_SOURCE"], [12, "REJECTED_NOT_ENOUGH_CREDITS"], [13, "REJECTED_SENDER"],
+      [17, "REJECTED_PREPAID_PACKAGE_EXPIRED"], [18, "REJECTED_DESTINATION_NOT_REGISTERED"],
+      [19, "REJECTED_ROUTE_NOT_AVAILABLE"],
+    ] as const) {
+      logging.mockClear();
+      let calls = 0;
+      const delivery = new InfobipOTPDelivery(fixture(), async () => {
+        calls++;
+        return Response.json({ messages: [{ ...acceptedBody().messages[0],
+          status: { groupId: 5, groupName: "REJECTED", id, name: `${apiKey} ${phone} ${code}` },
+        }] });
+      });
+      await expect(delivery.send(phone, code, "login")).rejects.toThrow("Infobip OTP delivery unavailable");
+      expect(calls).toBe(1);
+      expect(logging).toHaveBeenCalledTimes(1);
+      expect(logging).toHaveBeenCalledWith(expect.any(String), "auth.otp.infobip_failed",
+        `provider_status_rejected:${diagnostic}`);
+    }
+  } finally {
+    logging.mockRestore();
   }
 });
 

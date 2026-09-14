@@ -13,6 +13,7 @@ import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
 import { telegramOTPFromEnvironment } from "./telegram-otp";
 import { infobipOTPFromEnvironment } from "./infobip-otp";
+import { whatsappOTPFromEnvironment } from "./whatsapp-otp";
 export { AuthError } from "./auth-error";
 import {
   isV2AccessToken,
@@ -138,6 +139,9 @@ export function otpDeliveryRegistryFromEnvironment(): OTPDeliveryRegistry {
     }
     registry.set(infobip.channel, infobip);
   }
+
+  const whatsapp = whatsappOTPFromEnvironment();
+  if (whatsapp) registry.set(whatsapp.channel, whatsapp);
 
   // TOJ_OTP_PROVIDER survives as a deliberate activation switch for Telegram (telegram-otp.ts reads
   // it), not as a selector between mutually exclusive providers.
