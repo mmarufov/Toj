@@ -219,6 +219,13 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
   consumed_at       TIMESTAMPTZ,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- The channel a challenge was sent on, used for EXACTLY ONE thing: exempting a genuine channel
+-- switch from the resend cooldown. Under a picker, tapping a second channel is the expected flow,
+-- not an edge case, so the 30s anti-annoyance timer would otherwise ship the second button broken.
+-- It must never narrow the abuse windows (5/15min per phone, 20/15min per network). Those stayed
+-- cross-channel by accident of schema until now; a test pins that they ignore this column, because
+-- filtering them by channel would multiply the ceiling by the number of channels.
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS channel TEXT;
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_salt BYTEA;
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS phone_lookup_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_key_id TEXT NOT NULL DEFAULT 'legacy-v1';
