@@ -44,6 +44,11 @@ __pycache__/
 tmp/
 
 # Local-only working notes, not for publication. Rationale in CLAUDE.md.
+# notes/ is the default home for new ones: anything dropped there is ignored
+# without needing a new rule here, so a note cannot be committed by forgetting.
+# The named files below predate it and stay listed so they remain ignored
+# wherever they still sit at the root.
+notes/
 OPEN_FINDINGS.md
 AUTH_OTP_ECONOMICS.md
 VERIFICATION_CHANNELS_PLAN.md

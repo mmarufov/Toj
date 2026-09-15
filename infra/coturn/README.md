@@ -102,7 +102,7 @@ Before advertising `video_calls_v1`, complete every voice gate above, then prove
 audio/video load remains below 60% of allocation and egress capacity at the intended rollout
 percentage. External allocation probes must continue passing independently over UDP, TCP, and TLS
 443 throughout the test. Complete the repository's
-[Video Calls v1 release report](../../VIDEO_CALLS_RELEASE_REPORT.md) before setting video readiness.
+[Video Calls v1 release report](../../docs/releases/video-calls-v1.md) before setting video readiness.
 
 The control plane should return both regions in measured-preference order. WebRTC connectivity
 checks, not GeoIP alone, select the final route.

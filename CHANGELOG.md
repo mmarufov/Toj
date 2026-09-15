@@ -163,7 +163,7 @@ First versioned release. Establishes the visual identity, design system, and
 messaging presentation layer on top of the milestone M1–M4 cloud skeleton.
 
 ### Added
-- **Design system** (`Toj/DesignSystem/TojTheme.swift`, `DESIGN.md`): black-only
+- **Design system** (`Toj/DesignSystem/TojTheme.swift`, `docs/design-system.md`): black-only
   interface with matte conversation content, floating Liquid Glass controls, a
   restrained crown mark, and a documented color, typography, spacing, and motion
   language.

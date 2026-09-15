@@ -1,0 +1,65 @@
+Copyright (c) 2026 Muhammadjon Marufov. All rights reserved.
+
+Toj — proprietary, source-available license
+===========================================
+
+This repository is published so that Toj can be inspected, audited and
+discussed. Publication is not a grant of rights.
+
+1. Source-available, not open source
+
+   The source code in this repository is made available for the sole purposes
+   of reading, review, security analysis and academic study. No license is
+   granted under this notice to use, copy, modify, merge, publish, distribute,
+   sublicense or sell this software, in whole or in part, for any other
+   purpose.
+
+2. Reserved rights
+
+   All rights in the original work in this repository are reserved by the
+   copyright holder. In particular, no right is granted to:
+
+     a. run or deploy this software as a service, whether or not for a fee;
+     b. distribute this software or a derivative of it, in source or binary
+        form, including through any app store or package registry;
+     c. use the names "Toj", the Toj wordmark, or the Toj crown mark to
+        identify any product not published by the copyright holder.
+
+3. Contributions
+
+   Contributions submitted to this repository are licensed to the copyright
+   holder for use in Toj and its derivatives. See .github/CONTRIBUTING.md.
+
+4. Third-party components
+
+   This repository incorporates and depends on third-party software that is
+   licensed separately and is NOT covered by this notice. Each such component
+   remains subject to its own license, and some of those licenses grant you
+   rights that this notice does not.
+
+   Of particular note, Toj links LibSignalClient, which is licensed under the
+   GNU Affero General Public License v3.0. Nothing in this notice limits,
+   overrides or is intended to conflict with the terms of the AGPL or of any
+   other third-party license. Where this notice and a third-party license
+   cannot both be satisfied, the third-party license governs that component.
+
+   See NOTICE.md for the inventory.
+
+5. No warranty
+
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+   OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+6. Licensing enquiries
+
+   To ask about a use this notice does not permit, contact
+   support@tojchat.tech.
+
+This notice states a position that already applied by default: without a
+license, copyright reserves these rights automatically. It is written down so
+that readers do not have to guess.
