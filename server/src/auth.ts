@@ -278,7 +278,7 @@ export async function startVerification(
     for (const lock of locks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
 
     const latest = (await tx`
-      SELECT created_at FROM otp_challenges
+      SELECT created_at, channel FROM otp_challenges
       WHERE phone_lookup_hash IN (
         SELECT decode(value, 'hex') FROM unnest(
           ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
@@ -288,7 +288,15 @@ export async function startVerification(
       ORDER BY created_at DESC LIMIT 1`)[0];
     if (latest) {
       const ageSeconds = Math.floor((Date.now() - new Date(latest.created_at).getTime()) / 1000);
-      if (ageSeconds < OTP_RESEND_COOLDOWN_SECONDS) {
+      // "I didn't get the WhatsApp one, send me a text" is the flow the picker exists for, so a
+      // genuine channel change skips the cooldown. The cooldown is anti-annoyance and
+      // anti-double-billing; the abuse control is the window limits below, which this never
+      // touches — an exempted switch still counts toward them, so cycling channels cannot raise
+      // the ceiling. Repeats on the same channel still wait.
+      const switchedChannel = delivery !== null
+        && latest.channel !== null
+        && String(latest.channel) !== delivery.channel;
+      if (ageSeconds < OTP_RESEND_COOLDOWN_SECONDS && !switchedChannel) {
         throw new AuthError(
           "please wait before requesting another code",
           429,
@@ -335,9 +343,10 @@ export async function startVerification(
     return (await tx`
       INSERT INTO otp_challenges
         (phone_lookup_hash, phone_lookup_key_id, code_hash, code_key_id, code_salt,
-         network_hash, network_key_id, purpose, expires_at)
+         network_hash, network_key_id, purpose, expires_at, channel)
       VALUES (${lookup}, ${lookupIndex.keyId}, ${codeIndex.digest}, ${codeIndex.keyId}, ${salt},
-              ${networkHash}, ${networkIndex?.keyId ?? null}, ${purpose}, ${expires})
+              ${networkHash}, ${networkIndex?.keyId ?? null}, ${purpose}, ${expires},
+              ${delivery?.channel ?? null})
       RETURNING id`)[0].id;
   });
 

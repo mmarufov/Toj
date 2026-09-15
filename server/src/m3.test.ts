@@ -1193,6 +1193,43 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("a channel switch skips the cooldown, a repeat does not, and the windows ignore both", async () => {
+    const previous = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_RETURN_OTP = "0";
+    const phone = testPhone(205);
+    const sent: string[] = [];
+    const make = (channel: "telegram" | "sms"): OTPDelivery => ({
+      channel, allows: () => true, async send() { sent.push(channel); },
+    });
+    const deliveries = new Map([["telegram", make("telegram")], ["sms", make("sms")]]);
+    try {
+      await startVerification(db, phone, { deliveries, deliveryChannel: "telegram" });
+
+      // Same channel inside the window still waits — the cooldown keeps doing its job.
+      await expect(startVerification(db, phone, { deliveries, deliveryChannel: "telegram" }))
+        .rejects.toMatchObject({ status: 429 });
+      expect(sent).toEqual(["telegram"]);
+
+      // "Didn't get it, send me a text" is the picker's expected flow, not an edge case.
+      await startVerification(db, phone, { deliveries, deliveryChannel: "sms" });
+      expect(sent).toEqual(["telegram", "sms"]);
+
+      // And the exempted switch still counted: cycling channels must not raise the ceiling.
+      // OTP_PHONE_WINDOW_LIMIT is 5 per 15 minutes, so three more attempts exhaust it whichever
+      // channel they name.
+      for (const channel of ["telegram", "sms", "telegram"]) {
+        await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+        await startVerification(db, phone, { deliveries, deliveryChannel: channel });
+      }
+      await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+      await expect(startVerification(db, phone, { deliveries, deliveryChannel: "sms" }))
+        .rejects.toMatchObject({ status: 429 });
+      expect(await db`SELECT id FROM otp_challenges`).toHaveLength(5);
+    } finally {
+      if (previous === undefined) delete process.env.TOJ_RETURN_OTP; else process.env.TOJ_RETURN_OTP = previous;
+    }
+  });
+
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
     const originalConsoleError = console.error;
