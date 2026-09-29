@@ -7,7 +7,7 @@ reimplementation of SearchTextNormalizer's rules, from the same probed tokenizer
 input/expected pairs.
 
 `SearchTextNormalizerTests` asserts Swift reproduces every vector, and `server/src/search.test.ts`
-will assert the same of Bun. Because the expectations here are produced by a *separate*
+asserts the same of Bun. Because the expectations here are produced by a *separate*
 implementation rather than by dumping Swift's output, agreement is evidence of correctness rather
 than a tautology.
 
@@ -63,24 +63,33 @@ def probe_tables():
     return classes, folds
 
 
-def main():
-    classes, folds = probe_tables()
+class Rules:
+    """The normalizer's rules, reimplemented from the probed classes and folds.
+
+    Shared with generate-search-parity-vectors.py, so the hand-listed and generated vectors come
+    from one Python reimplementation and never from the Swift or Bun code they check.
+    """
+
     TOKEN, IGNORED = 1, 2
 
-    def base_fold(text):
-        return "".join(chr(folds.get(ord(ch), ord(ch))) for ch in text)
+    def __init__(self, classes, folds):
+        self.classes, self.folds = classes, folds
 
+    def base_fold(self, text):
+        return "".join(chr(self.folds.get(ord(ch), ord(ch))) for ch in text)
+
+    @staticmethod
     def tajik_fold(text):
         return "".join(chr(TAJIK_FOLDS.get(ord(ch), ord(ch))) for ch in text)
 
-    def tokenize(text):
+    def tokenize(self, text):
         """The three-class state machine. Ignored diacritics neither extend nor end a token."""
         out, cur = [], []
         for ch in text:
-            kind = classes.get(ord(ch), TOKEN)
-            if kind == TOKEN:
+            kind = self.classes.get(ord(ch), self.TOKEN)
+            if kind == self.TOKEN:
                 cur.append(ch)
-            elif kind == IGNORED:
+            elif kind == self.IGNORED:
                 continue
             elif cur:
                 out.append("".join(cur)); cur = []
@@ -88,17 +97,21 @@ def main():
             out.append("".join(cur))
         return out
 
-    vectors = []
-    for case in CASES:
-        exact = base_fold(case)
-        folded = tajik_fold(exact)
-        vectors.append({
+    def vector(self, case):
+        exact = self.base_fold(case)
+        folded = self.tajik_fold(exact)
+        assert len(exact) == len(case), f"scalar count changed for {case!r}"
+        return {
             "input": case,
             "exact": exact,
             "folded": None if folded == exact else folded,
-            "tokens": tokenize(folded),
-        })
-        assert len(exact) == len(case), f"scalar count changed for {case!r}"
+            "tokens": self.tokenize(folded),
+        }
+
+
+def main():
+    rules = Rules(*probe_tables())
+    vectors = [rules.vector(case) for case in CASES]
 
     print(json.dumps({
         "normalizerVersion": NORMALIZER_VERSION,
