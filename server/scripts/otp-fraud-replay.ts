@@ -499,6 +499,23 @@ export function summarize(rows: Row[]) {
   ].join("\n");
 }
 
+/** The registered tuning objective (pre-registration amendment 2), over the rows given. */
+export function tuningScore(rows: Row[]): { score: number; blocked: number; refused: number } {
+  const rules = rows.filter((row) => row.config === "rules");
+  const shapes = [...new Set(rules.map((row) => row.shape))];
+  const meanOf = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+  const perShape = shapes.map((shape) => {
+    const members = rules.filter((row) => row.shape === shape);
+    return {
+      blocked: meanOf(members.map((row) => pct(row.attack.requests - row.attack.billedSms, row.attack.requests))),
+      refused: meanOf(members.map((row) => pct(row.legit.riskRefused, row.legit.users))),
+    };
+  });
+  const blocked = meanOf(perShape.map((shape) => shape.blocked));
+  const refused = meanOf(perShape.map((shape) => shape.refused));
+  return { score: blocked - 10 * refused, blocked, refused };
+}
+
 if (import.meta.main) {
   const [command, ...args] = process.argv.slice(2);
   if (command === "worker") await worker(args);
@@ -510,8 +527,13 @@ if (import.meta.main) {
     const output = summarize(rows);
     console.log(output);
     if (argument(args, "write")) writeFileSync(argument(args, "write")!, `${output}\n`);
+  } else if (command === "score") {
+    const seeds = argument(args, "seeds") ? new Set(parseSeeds(argument(args, "seeds"))) : null;
+    const rows = readFileSync(argument(args, "in")!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Row)
+      .filter((row) => !seeds || seeds.has(row.seed));
+    console.log(JSON.stringify(tuningScore(rows)));
   } else {
-    console.error("usage: otp-fraud-replay.ts run|report ...");
+    console.error("usage: otp-fraud-replay.ts run|report|score ...");
     process.exit(2);
   }
 }
