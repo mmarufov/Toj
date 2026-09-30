@@ -10,3 +10,4 @@ macOS 27.0.1, Bun 1.3.11, PostgreSQL 17.10.
 | Iteration | Code | Started (UTC) | Thresholds changed | Blocked % | Refused % | Score | Results |
 |---|---|---|---|---|---|---|---|
 | 0 | `a8e3bb2213b3d54355f41fa9d7f27cfc593b08a1` | 2026-09-30T20:17:18Z | none (registered table) | 45.54 | 1.445 | 31.08 | `iteration-0-tuning.jsonl` (all three configurations) |
+| 1 | `615fd6043c3cbf138a865dceeb6724cd2257b98c` | 2026-09-30T20:29:16Z | foreignPrefixPerHour 20 to 5, verifyRateMinSends 50 to 15 | 63.24 | 2.227 | 40.97 | `iteration-1-tuning.jsonl`, `rules-iteration-1.json` |
