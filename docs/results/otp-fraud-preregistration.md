@@ -119,3 +119,11 @@ Per shape, as the mean over seeds, with the minimum and maximum:
 1. 2026-09-30, before any replay ran. Section 5 gives `+7916` as an example prefix. By the
    registered definition (calling code plus two digits) the prefix of a Russian `+7 916` number is
    `+791`. The definition stands and the example was wrong. No number is affected.
+2. 2026-09-30, before any replay ran. Section 5 allows tuning but did not name its objective. It is:
+   maximise, over the tuning seeds and shapes A to D, the mean of (attack sends blocked, percent)
+   minus 10 x (real sign-ups blocked, percent). Iteration 0 is the registered table; at most 5
+   further iterations are allowed, each recorded with its thresholds and tuning-seed score, and the
+   last is not automatically the one frozen: the best-scoring iteration is.
+3. 2026-09-30, before any replay ran. Debugging the harness itself (does it run, is it fast enough,
+   are its counts consistent) uses seeds 900 to 909 only, never 0 to 19, and no threshold is chosen
+   from those runs.
