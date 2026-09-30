@@ -116,4 +116,6 @@ Per shape, as the mean over seeds, with the minimum and maximum:
 
 ## Amendments
 
-None.
+1. 2026-09-30, before any replay ran. Section 5 gives `+7916` as an example prefix. By the
+   registered definition (calling code plus two digits) the prefix of a Russian `+7 916` number is
+   `+791`. The definition stands and the example was wrong. No number is affected.

@@ -444,6 +444,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     status: savedMessages.ready && preferences.ready && draftMedia.ready
       && groupCallSchema.ready && authSecurityReady && messagingFeatures.ready
       && cloudProductivity.ready && presence.ready && profilePhotos.ready && mutationReceipts.ready
+      // Every OTP request writes these columns, so drift here breaks sign-in outright.
+      && otpSchema.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -530,6 +532,17 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     DELETE FROM session_rotation_receipts receipt USING doomed
     WHERE receipt.session_id = doomed.session_id AND receipt.rotation_id = doomed.rotation_id
     RETURNING receipt.rotation_id`;
+  // The OTP risk decision log is an audit trail for operators, not an input to any rule: the rules
+  // read otp_challenges. Its absence changes no decision, so a fixed 30-day window is safe.
+  const otpRiskDecisions = await sql`
+    WITH doomed AS (
+      SELECT id FROM otp_risk_decisions
+      WHERE created_at < now() - interval '30 days'
+      ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM otp_risk_decisions WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
   const authChallenges = await sql`
     WITH doomed AS (
       SELECT id FROM two_factor_login_challenges
@@ -1102,6 +1115,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     accessTokens: accessTokens.length,
     rotationReceipts: rotationReceipts.length,
     authChallenges: authChallenges.length,
+    otpRiskDecisions: otpRiskDecisions.length,
     stepUpTickets: stepUpTickets.length,
     twoFactorBudgets: twoFactorBudgets.length,
     snapshots: snapshots.length,
@@ -1137,7 +1151,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
   return value.otp + value.expiredMessages + value.messagingFeatureReceipts
-    + value.accessTokens + value.rotationReceipts + value.authChallenges
+    + value.accessTokens + value.rotationReceipts + value.authChallenges + value.otpRiskDecisions
     + value.stepUpTickets + value.twoFactorBudgets
     + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests

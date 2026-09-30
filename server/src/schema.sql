@@ -248,6 +248,35 @@ CREATE INDEX IF NOT EXISTS otp_active_idx ON otp_challenges(phone_lookup_hash, e
 CREATE INDEX IF NOT EXISTS otp_phone_requests_idx ON otp_challenges(phone_lookup_hash, created_at DESC);
 CREATE INDEX IF NOT EXISTS otp_network_requests_idx ON otp_challenges(network_hash, created_at DESC)
   WHERE network_hash IS NOT NULL;
+-- OTP fraud rules (otp-risk.ts). phone_prefix is the calling code plus two digits, never more of the
+-- number. verified_at is set only when the code is entered correctly, so it is distinct from
+-- consumed_at, which a resend or a failed delivery also sets. The rules read both over windows of at
+-- most 24 hours, which cleanupExpiredData outlives (see its OTP retention note).
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS phone_prefix TEXT;
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS otp_risk_decisions (
+  id          BIGSERIAL PRIMARY KEY,
+  created_at  TIMESTAMPTZ NOT NULL,
+  purpose     TEXT NOT NULL,
+  channel     TEXT NOT NULL,
+  phone_prefix TEXT NOT NULL,
+  action      TEXT NOT NULL CHECK (action IN ('allow','require_channel','block','shadow')),
+  would_action TEXT NOT NULL CHECK (would_action IN ('allow','require_channel','block')),
+  rule_id     TEXT NOT NULL,
+  reason      TEXT NOT NULL
+);
+
+-- Money reserved for OTP sends, per UTC day, in integer micro-dollars. A reservation is made before
+-- the provider is called and never released: Tajik routes return no delivery receipts, so a send
+-- can never be shown not to have been billed.
+CREATE TABLE IF NOT EXISTS otp_spend_reservations (
+  utc_day         DATE NOT NULL,
+  channel         TEXT NOT NULL,
+  reserved_micros BIGINT NOT NULL CHECK (reserved_micros >= 0),
+  sends           BIGINT NOT NULL CHECK (sends >= 0),
+  PRIMARY KEY (utc_day, channel)
+);
 
 -- Auth protocol v2 keeps short-lived access credentials separate from the rotating device grant.
 -- Only HMACs are retained. A bounded encrypted receipt makes a committed rotation safe to retry

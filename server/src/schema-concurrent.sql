@@ -53,7 +53,9 @@ WHERE namespace.nspname = 'public'
     'session_rotation_receipts_upgrade_digest_idx',
     'message_mutation_requests_open_idx',
     'group_create_requests_open_idx',
-    'group_mutation_requests_open_idx'
+    'group_mutation_requests_open_idx',
+    'otp_challenges_prefix_requests_idx',
+    'otp_risk_decisions_created_idx'
   )
   AND (NOT idx.indisvalid OR NOT idx.indisready)
 \gexec
@@ -178,6 +180,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS group_create_requests_open_idx
   ON group_create_requests(created_at) WHERE result_expired_at IS NULL;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_mutation_requests_open_idx
   ON group_mutation_requests(created_at) WHERE result_expired_at IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS otp_challenges_prefix_requests_idx
+  ON otp_challenges(phone_prefix, created_at) WHERE phone_prefix IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS otp_risk_decisions_created_idx
+  ON otp_risk_decisions(created_at);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_report_evidence_idx
   ON messages(dialog_id, sender_account_id, msg_id DESC)
