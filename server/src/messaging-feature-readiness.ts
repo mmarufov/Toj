@@ -149,7 +149,9 @@ export async function messagingFeatureSchemaState(
            AND conname = 'push_account_bindings_enabled_check')
          OR (conrelid = to_regclass('public.send_requests')
            AND conname = 'send_requests_fingerprint_size_check')`;
-    const byName = new Map(constraintRows.map((row: any) => [String(row.conname), row]));
+    const byName = new Map<string, { definition: string; convalidated: boolean }>(
+      constraintRows.map((row: any) => [String(row.conname), row]),
+    );
     const messageKinds = String(byName.get("messages_kind_check")?.definition ?? "");
     const serviceTypes = String(byName.get("messages_service_type_check")?.definition ?? "");
     const eventTypes = String(byName.get("account_events_type_check")?.definition ?? "");

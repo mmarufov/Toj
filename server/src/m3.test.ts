@@ -15,6 +15,7 @@ import {
   resolveDevice,
   revokeDevice,
   AuthError,
+  type OTPChannel,
   type OTPDelivery,
 } from "./auth";
 import { bodyAAD, hashToken, mediaFileNameAAD, pushTokenAAD } from "./crypto";
@@ -61,7 +62,6 @@ import {
   getMediaUpload,
   MEDIA_PART_SIZE,
   mediaLimits,
-  MediaError,
   uploadMediaChunk,
   uploadMediaPart,
   uploadMediaThumbnail,
@@ -122,6 +122,13 @@ async function waitForBackendLock(client: Client, pid: number): Promise<void> {
 }
 
 /** One-channel registry, so a test can keep naming a single delivery object. */
+// Every caller below reads `updates`, which only the non-too-long variants carry.
+async function getUpdates(...args: Parameters<typeof getDifference>) {
+  const difference = await getDifference(...args);
+  if (difference.kind === "difference_too_long") throw new Error("expected a difference with updates");
+  return difference;
+}
+
 function registryOf(delivery: OTPDelivery) {
   return new Map([[delivery.channel, delivery]]);
 }
@@ -407,7 +414,7 @@ describe("M3 cloud sync", () => {
       SELECT id FROM devices WHERE account_id = ${alice.accountId} AND revoked_at IS NULL`).toHaveLength(0);
     expect(await db`
       SELECT dialog_id FROM dialog_preferences WHERE account_id = ${alice.accountId}`).toHaveLength(0);
-    expect(await db`
+    expect(await db<{ client_mutation_id: string }[]>`
       SELECT client_mutation_id FROM dialog_preference_requests
       WHERE account_id = ${alice.accountId}`).toHaveLength(0);
     expect(await db`
@@ -794,7 +801,7 @@ describe("M3 cloud sync", () => {
     });
     expect(await db`SELECT id FROM bootstrap_snapshots`).toHaveLength(0);
     expect(await db`SELECT id FROM media_objects WHERE status = 'uploading'`).toHaveLength(0);
-    expect(await db`
+    expect(await db<{ client_mutation_id: string }[]>`
       SELECT client_mutation_id FROM dialog_preference_requests
       WHERE account_id = ${account.accountId}
       ORDER BY client_mutation_id`)
@@ -1103,7 +1110,7 @@ describe("M3 cloud sync", () => {
     const make = (channel: "telegram" | "sms"): OTPDelivery => ({
       channel, allows: () => true, async send() { sent.push(channel); },
     });
-    const deliveries = new Map([["telegram", make("telegram")], ["sms", make("sms")]]);
+    const deliveries = new Map<OTPChannel, OTPDelivery>([["telegram", make("telegram")], ["sms", make("sms")]]);
     try {
       // Naming no channel is a 400, not a server-side choice. This is the property the old
       // single-delivery interlock was standing in for.
@@ -1201,7 +1208,7 @@ describe("M3 cloud sync", () => {
     const make = (channel: "telegram" | "sms"): OTPDelivery => ({
       channel, allows: () => true, async send() { sent.push(channel); },
     });
-    const deliveries = new Map([["telegram", make("telegram")], ["sms", make("sms")]]);
+    const deliveries = new Map<OTPChannel, OTPDelivery>([["telegram", make("telegram")], ["sms", make("sms")]]);
     try {
       await startVerification(db, phone, { deliveries, deliveryChannel: "telegram" });
 
@@ -1617,7 +1624,7 @@ describe("M3 cloud sync", () => {
       WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`;
 
     await cleanupExpiredData(db, 100);
-    expect(await db`
+    expect(await db<{ status: string }[]>`
       SELECT status FROM send_requests
       WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)
       .toEqual([expect.objectContaining({ status: "completed" })]);
@@ -1728,7 +1735,7 @@ describe("M3 cloud sync", () => {
       replyToMsgId: original.msgId,
     });
 
-    const difference = await getDifference(db, bob.accountId, 0);
+    const difference = await getUpdates(db, bob.accountId, 0);
     const replyUpdate = difference.updates.find((update) => update.message?.msg_id === reply.msgId);
     expect(replyUpdate?.message?.reply_to_msg_id).toBe(original.msgId);
 
@@ -1785,7 +1792,7 @@ describe("M3 cloud sync", () => {
     });
     expect(replacement.message.reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
 
-    const difference = await getDifference(db, alice.accountId, 0);
+    const difference = await getUpdates(db, alice.accountId, 0);
     const reactionUpdates = difference.updates.filter((update) => update.type === "reaction.updated");
     expect(reactionUpdates).toHaveLength(2);
     expect(reactionUpdates.at(-1)?.message?.reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
@@ -1985,7 +1992,7 @@ describe("M3 cloud sync", () => {
     expect(deletion.message.state).toBe("deleted_for_all");
     expect(deletion.message.text).toBe("");
 
-    const bobDifference = await getDifference(db, bob.accountId, 0);
+    const bobDifference = await getUpdates(db, bob.accountId, 0);
     expect(bobDifference.updates.map((update) => update.type)).toContain("message.edited");
     const tombstone = bobDifference.updates.find((update) => update.type === "message.deleted");
     expect(tombstone?.message?.state).toBe("deleted_for_all");
@@ -2061,11 +2068,11 @@ describe("M3 cloud sync", () => {
       });
     }
 
-    const firstSlice = await getDifference(db, bob.accountId, 1, { maxEvents: 20, maxBytes: 900 });
+    const firstSlice = await getUpdates(db, bob.accountId, 1, { maxEvents: 20, maxBytes: 900 });
     expect(firstSlice.kind).toBe("difference_slice");
     expect(firstSlice.updates.length).toBeGreaterThanOrEqual(1);
 
-    const rest = await getDifference(db, bob.accountId, firstSlice.state.pts, { maxEvents: 20, maxBytes: 4096 });
+    const rest = await getUpdates(db, bob.accountId, firstSlice.state.pts, { maxEvents: 20, maxBytes: 4096 });
     expect(rest.kind).toBe("difference");
     expect(rest.state.pts).toBeGreaterThan(firstSlice.state.pts);
     expect(firstSlice.updates[0].pts).toBeLessThan(rest.updates.at(-1).pts);
@@ -2090,7 +2097,7 @@ describe("M3 cloud sync", () => {
         return Reflect.apply(target, target, argumentsList);
       },
     });
-    const difference = await getDifference(
+    const difference = await getUpdates(
       countedDB,
       bob.accountId,
       1,
@@ -2611,8 +2618,8 @@ describe("M3 cloud sync", () => {
 
   test("bootstrap snapshot does not duplicate or swallow messages sent during onboarding", async () => {
     const { alice, bob, dialogId } = await makePair();
-    const aliceCreation = await getDifference(db, alice.accountId, 0);
-    const bobCreation = await getDifference(db, bob.accountId, 0);
+    const aliceCreation = await getUpdates(db, alice.accountId, 0);
+    const bobCreation = await getUpdates(db, bob.accountId, 0);
     expect(aliceCreation.updates.find((u) => u.type === "dialog.created")?.dialog_title).toBe("Bob");
     expect(bobCreation.updates.find((u) => u.type === "dialog.created")?.dialog_title).toBe("Alice");
     await sendMessage(db, {
@@ -2640,7 +2647,7 @@ describe("M3 cloud sync", () => {
     expect(page.dialogs[0].messages.map((m) => m.text)).toEqual(["before snapshot"]);
     expect(page.dialogs[0].unread_count).toBe(1);
 
-    const diff = await getDifference(db, bob.accountId, bootstrap.state.pts);
+    const diff = await getUpdates(db, bob.accountId, bootstrap.state.pts);
     expect(diff.kind).toBe("difference");
     expect(diff.updates.map((u) => u.message?.text).filter(Boolean)).toEqual(["after snapshot"]);
   });
@@ -2687,7 +2694,7 @@ describe("M3 cloud sync", () => {
     expect(read.maxReadMsgId).toBe(sent.msgId);
     expect(read.unreadCount).toBe(0);
 
-    const diff = await getDifference(db, alice.accountId, sent.senderPts);
+    const diff = await getUpdates(db, alice.accountId, sent.senderPts);
     expect(diff.kind).toBe("difference");
     expect(diff.updates.some((u) => u.type === "read.updated"
       && u.max_read_msg_id === sent.msgId && u.unread_count === 0)).toBe(true);
@@ -2695,7 +2702,7 @@ describe("M3 cloud sync", () => {
     const repeat = await readHistory(db, { accountId: bob.accountId, dialogId, maxReadMsgId: sent.msgId });
     expect(repeat.pushes).toHaveLength(0);
     expect(repeat.unreadCount).toBe(0);
-    const afterRepeat = await getDifference(db, alice.accountId, diff.state.pts);
+    const afterRepeat = await getUpdates(db, alice.accountId, diff.state.pts);
     expect(afterRepeat.kind).toBe("difference");
     expect(afterRepeat.updates).toEqual([]);
   });
@@ -3092,7 +3099,7 @@ describe("M3 cloud sync", () => {
       }, mediaFileNameAAD(first.mediaId))).toString("utf8")).toBe("statement.pdf");
       await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
         kind: "file", contentType: "application/pdf", byteSize: 400, sha256: "11".repeat(32),
-      })).rejects.toEqual(expect.objectContaining<Partial<MediaError>>({ status: 413 }));
+      })).rejects.toEqual(expect.objectContaining({ status: 413 }));
     } finally {
       if (oldQuota == null) delete process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES;
       else process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES = oldQuota;

@@ -691,6 +691,8 @@ export async function sendMessage(sql: SQL, p: {
         clientMsgId: p.clientMsgId,
         msgId,
         senderPts,
+        // Internal service sends never consume a draft, so a replay has none to report.
+        clearedDraftRevision: null,
         duplicate: true,
         pushes: [],
         serverTs: msg?.server_ts,
@@ -1361,7 +1363,9 @@ export async function sendMediaGroup(sql: SQL, p: {
     await tx`
       UPDATE media_objects SET last_accessed_at = now()
       WHERE id = ANY(${tx.array(sortedMediaIds, "uuid")}::uuid[])`;
-    const mediaById = new Map(mediaRows.map((row: any) => [String(row.id), row]));
+    const mediaById = new Map<string, { kind: string }>(
+      mediaRows.map((row: any) => [String(row.id), row]),
+    );
 
     const access = await lockDialogForMutation(tx, p.senderAccountId, dialogId);
     const blocked = await tx`
@@ -2068,7 +2072,7 @@ export async function getDifference(
     : null;
   const scheduledDeliveries = new Map<string, Awaited<ReturnType<typeof getScheduledDelivery>>>();
   if (opts.scheduledDeliveryEnabled !== false) {
-    const ids = [...new Set(rows
+    const ids = [...new Set<string>(rows
       .filter((event: any) => String(event.type).startsWith("scheduled."))
       .map((event: any) => String(eventData(event.data).scheduled_delivery_id ?? ""))
       .filter(Boolean))];

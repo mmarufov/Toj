@@ -241,8 +241,9 @@ test("Infobip exposes only known service error codes, never free text or enum-sh
       expect(logged[0]?.[2]).toBe("http_403:unrecognized");
     }
     logged.length = 0;
-    const unreadable = new Response(null, { status: 401 });
-    unreadable.json = async () => { throw new Error(`${apiKey} ${phone} ${code}`); };
+    const unreadable = new (class extends Response {
+      override json = async (): Promise<never> => { throw new Error(`${apiKey} ${phone} ${code}`); };
+    })(null, { status: 401 });
     const delivery = new InfobipOTPDelivery(fixture(), async () => unreadable);
     await expect(delivery.send(phone, code, "login")).rejects.toThrow();
     expect(logged[0]?.[2]).toBe("http_401:unrecognized");

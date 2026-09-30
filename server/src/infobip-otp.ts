@@ -9,6 +9,14 @@ const ERROR_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
 // https://www.infobip.com/docs/essentials/api-essentials/api-authorization
 const SERVICE_ERRORS = new Set(["UNAUTHORIZED", "FORBIDDEN", "BAD_REQUEST", "TOO_MANY_REQUESTS"]);
 
+type InfobipSendResponse = {
+  messages?: Array<{
+    messageId?: unknown;
+    destination?: unknown;
+    status?: { groupId?: number; groupName?: unknown; id?: number };
+  }>;
+};
+
 function serviceErrorCode(body: unknown): string {
   const value = (body as { requestError?: { serviceException?: { messageId?: unknown } } } | null)
     ?.requestError?.serviceException?.messageId;
@@ -110,7 +118,7 @@ export class InfobipOTPDelivery implements OTPDelivery {
         reason = `http_${response.status}:${serviceErrorCode(body)}`;
         throw new Error(reason);
       }
-      const messages = body?.messages;
+      const messages = (body as InfobipSendResponse | null)?.messages;
       const message = Array.isArray(messages) && messages.length === 1 ? messages[0] : null;
       const status = message?.status;
       if (typeof message?.messageId !== "string" || !message.messageId.trim()

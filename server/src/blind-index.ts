@@ -253,7 +253,7 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     "push_installations.normal_token_hash_key_id",
     "push_installations.voip_token_hash_key_id",
   ];
-  const defaults = new Map(columns.map((row: any) => [
+  const defaults = new Map<string, string>(columns.map((row: any) => [
     `${row.table_name}.${row.column_name}`, String(row.column_default ?? ""),
   ]));
   for (const column of requiredLegacyDefaults) {
@@ -349,7 +349,7 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     ) all_references
     WHERE key_id IS NOT NULL AND key_id NOT IN ('random-deleted', 'expired')
     GROUP BY domain, key_id ORDER BY domain, key_id`;
-  const references = rows.map((row: any) => ({
+  const references: Array<{ domain: string; keyId: string; count: number }> = rows.map((row: any) => ({
     domain: String(row.domain), keyId: String(row.key_id), count: Number(row.count),
   }));
   const readable = new Set(configured.readableKeyIds);

@@ -273,7 +273,7 @@ export async function draftMediaSchemaState(
       )
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped`;
-  const actualColumns = new Map(
+  const actualColumns = new Map<string, { type: string; notNull: boolean; default: string | null }>(
     columnRows.map((row: any) => [
       `${row.table_name}.${row.column_name}`,
       {

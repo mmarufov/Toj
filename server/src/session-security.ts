@@ -159,7 +159,7 @@ export async function upgradeLegacySession(
   deviceId: string,
 ): Promise<AuthV2Session> {
   return await sql.begin(async (tx) => issueV2Session(tx, {
-    accountId, deviceId, existingDeviceId: deviceId, platform: "ios",
+    accountId, existingDeviceId: deviceId, platform: "ios",
   }));
 }
 

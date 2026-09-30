@@ -198,7 +198,7 @@ nonisolated struct GroupCallHint: Codable, Equatable, Sendable {
 
 /// Narrow transport seam for deterministic coordinator tests. The production implementation is
 /// `CloudAPI`; no SFU administrative credential crosses this client interface.
-protocol GroupCallAPITransport {
+nonisolated protocol GroupCallAPITransport {
     func startGroupCall(
         _ body: StartCloudGroupCallRequest,
         token: String
