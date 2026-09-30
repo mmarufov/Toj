@@ -351,6 +351,20 @@ describe("the generated set cannot be passed by memorising the hand-listed one",
   });
 
   test("a runtime-ICU port fails in blocks the hand list never visits", () => {
+    // Deliberately loose: an inequality and a shape, never a count. This reference reads the
+    // runtime's own Unicode data (toLowerCase, normalize, \p{...}), and that data differs between
+    // the macOS and Linux builds of the same Bun release. On Bun 1.3.11 it passes 1,728 of 3,634
+    // on macOS and 1,732 on Linux, so an exact count passes locally and fails in CI.
+    //
+    // The four vectors that flip each hold one capital letter the macOS runtime lowercases and
+    // the Linux one leaves alone: U+10D51, U+10D57 and U+10D5E (Garay, new in Unicode 16.0) and
+    // U+16EA9 (Beria Erfe, new in 17.0). The FTS5 tokenizer leaves them alone too, so macOS
+    // fails them. Across all scalars the two runtimes differ on 75: 55 lowercase mappings and
+    // 20 NFD decompositions, every one a character unassigned before Unicode 16.0; \p{Mn}, \p{L}
+    // and \p{N} agree. Measured by a one-off Actions run, 36668966330, diffing a per-scalar profile.
+    //
+    // Do not pin this reference to a vendored table to make it exact. It exists to show what
+    // relying on runtime Unicode data costs, and the cross-platform drift is part of that cost.
     const failingShapes = new Set(scores.icu.generated.failures.map((f) => f.shape));
     expect(scores.icu.generated.agreed).toBeLessThan(scores.icu.generated.total);
     expect(failingShapes.has("token-per-block")).toBe(true);
