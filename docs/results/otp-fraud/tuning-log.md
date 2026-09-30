@@ -13,3 +13,4 @@ macOS 27.0.1, Bun 1.3.11, PostgreSQL 17.10.
 | 1 | `615fd6043c3cbf138a865dceeb6724cd2257b98c` | 2026-09-30T20:29:16Z | foreignPrefixPerHour 20 to 5, verifyRateMinSends 50 to 15 | 63.24 | 2.227 | 40.97 | `iteration-1-tuning.jsonl`, `rules-iteration-1.json` |
 | 2 | `0519b70b937d78cff3ead3a2a5687a76fe3564db` | 2026-09-30T20:35:43Z | verifyRateFloor 0.6 to 0.5 | 58.18 | 1.676 | 41.42 | `iteration-2-tuning.jsonl`, `rules-iteration-2.json` |
 | 3 | `9656ec940fd098a54ff78a8851d8b7e354083eb2` | 2026-09-30T20:41:24Z | foreignPrefixPerHour 5 to 3 | 58.95 | 1.680 | 42.14 | `iteration-3-tuning.jsonl`, `rules-iteration-3.json` |
+| 4 | `ecac89d9eb1b4c5e73df8acdd2bd04aa834e6fe1` | 2026-09-30T20:47:38Z | verifyRateMinSends 15 to 10 | 64.88 | 1.773 | 47.15 | `iteration-4-tuning.jsonl`, `rules-iteration-4.json` |
