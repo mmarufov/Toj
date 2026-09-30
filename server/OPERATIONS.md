@@ -179,6 +179,9 @@ it, so its retention changes no decision.
   the rules in `shadow` for at least a day after launch or after any database restore.
 - `require_channel` fails a user who has no Telegram or WhatsApp. It is the cheaper failure, not a
   free one; read the replay results in `docs/results/otp-fraud-replay.md` before enforcing.
+- The thresholds are absolute and do not transfer across traffic volume: in the replay, rules tuned
+  at 2,000 sign-ups a day stopped none of the in-country pumping at 5,000 a day. Re-derive them from
+  shadow-mode data whenever volume changes by a large factor.
 
 Every paid send reserves its price in `otp_spend_reservations`, integer micro-dollars per UTC day
 and channel, before the provider is called (`TOJ_OTP_PRICE_MICROS_SMS`, `_TELEGRAM`, `_WHATSAPP`
