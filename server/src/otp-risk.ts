@@ -57,10 +57,23 @@ export type OtpRiskDecision = {
 export const HOME_COUNTRY_CODE = "992";
 
 /**
- * The evaluation ruleset, as registered in docs/results/otp-fraud-preregistration.md and then
- * tuned on seeds 0 to 14 only. Illustrative for a deployment: set TOJ_OTP_RISK_RULES instead.
+ * The evaluation ruleset: the table registered in docs/results/otp-fraud-preregistration.md after
+ * five tuning iterations on seeds 0 to 14 (docs/results/otp-fraud/tuning-log.md), frozen before the
+ * held-out seeds ran. Illustrative for a deployment: set TOJ_OTP_RISK_RULES instead.
  */
 export const EVALUATION_OTP_RISK_RULES: OtpRiskRules = {
+  foreignPrefixPerHour: 3,
+  verifyRateMinSends: 10,
+  verifyRateFloor: 0.5,
+  verifyRateWindowMinutes: 720,
+  verifyRateSettleMinutes: 10,
+  networkPerHour: 30,
+  surgeMultiplier: 3,
+  surgeFloor: 20,
+};
+
+/** The registered, untuned table (iteration 0), kept so the tuning log can be reproduced. */
+export const REGISTERED_OTP_RISK_RULES: OtpRiskRules = {
   foreignPrefixPerHour: 20,
   verifyRateMinSends: 50,
   verifyRateFloor: 0.6,

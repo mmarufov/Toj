@@ -166,15 +166,17 @@ describe("risk rules inside startVerification", () => {
   });
 
   test("a pumped home prefix is steered off SMS, Telegram still works, and both are logged", async () => {
-    // 50 settled SMS sends in +99292, 20 verified: 40%, under the 60% floor. Four minutes apart,
-    // so no hour holds more than 15 and the surge rule (floor 20 with no baseline) stays quiet.
+    // History written directly, so the setup cannot itself trip a rule: 50 settled SMS sends in
+    // +99292 over the past 200 minutes, 20 of them verified (40%, under the floor), none in the
+    // last 10 minutes, and no hour holding more than the surge floor.
     for (let i = 0; i < 50; i += 1) {
-      await start(`+99292${String(100000 + i)}`, "sms");
-      clock = new Date(clock.getTime() + 4 * 60_000);
+      const createdAt = new Date(clock.getTime() - (11 + 4 * i) * 60_000);
+      await db`
+        INSERT INTO otp_challenges (phone_lookup_hash, code_hash, purpose, expires_at, channel,
+          phone_prefix, created_at, consumed_at, verified_at)
+        VALUES (gen_random_bytes(32), gen_random_bytes(32), 'login', ${createdAt}, 'sms', '+99292',
+          ${createdAt}, ${createdAt}, ${i < 20 ? createdAt : null})`;
     }
-    await db`UPDATE otp_challenges SET verified_at = created_at
-      WHERE id IN (SELECT id FROM otp_challenges ORDER BY created_at LIMIT 20)`;
-    clock = new Date(clock.getTime() + 11 * 60_000);
 
     await expect(start("+992929999999", "sms")).rejects.toMatchObject({ status: 409, code: "sms_unavailable" });
     await expect(start("+992929999999", "telegram")).resolves.toBeDefined();
@@ -254,15 +256,18 @@ describe("risk rules inside startVerification", () => {
     const noisy = "10.0.0.9";
     // One a minute: 31 in the hour trips network_velocity, 15 per quarter hour stays under the
     // existing 20-per-15-minute network window.
+    // Round-robin over the eight ranges keeps every prefix under the verify-rate sample minimum, so
+    // only the network rule can fire.
+    const ranges = ["+99292", "+99293", "+99290", "+99288", "+99291", "+99255", "+99298", "+99250"];
     for (let i = 0; i <= rules.networkPerHour; i += 1) {
-      await start(`+99293${String(100000 + i)}`, "sms", config({ mode: "off" }), noisy);
+      await start(`${ranges[i % ranges.length]}${String(100000 + i)}`, "sms", config({ mode: "off" }), noisy);
       clock = new Date(clock.getTime() + 60_000);
     }
     expect(await db`SELECT id FROM otp_risk_decisions`).toHaveLength(0);
-    await expect(start("+992939999999", "sms", config({ mode: "shadow" }), noisy)).resolves.toBeDefined();
+    await expect(start("+992509999999", "sms", config({ mode: "shadow" }), noisy)).resolves.toBeDefined();
     const [logged] = await db`SELECT action, would_action, rule_id FROM otp_risk_decisions`;
     expect(logged).toEqual({ action: "shadow", would_action: "require_channel", rule_id: "network_velocity" });
-    await expect(start("+992939999998", "sms", config(), noisy)).rejects.toMatchObject({ code: "sms_unavailable" });
+    await expect(start("+992509999998", "sms", config(), noisy)).rejects.toMatchObject({ code: "sms_unavailable" });
   });
 
   test("the clock seam moves the cooldown and the windows together", async () => {

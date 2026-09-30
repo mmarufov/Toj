@@ -12,7 +12,7 @@ import { $, SQL } from "bun";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { AuthError, checkVerification, startVerification, type OTPDelivery } from "../src/auth";
 import { setOtpClock } from "../src/otp-clock";
-import { EVALUATION_OTP_RISK_RULES, parseOtpRiskRules, type OtpRiskConfig, type OtpRiskRules } from "../src/otp-risk";
+import { EVALUATION_OTP_RISK_RULES, parseOtpRiskRules, REGISTERED_OTP_RISK_RULES, type OtpRiskConfig, type OtpRiskRules } from "../src/otp-risk";
 
 // ---------------------------------------------------------------------------------------------
 // Registered constants (pre-registration sections 2 to 4)
@@ -412,7 +412,10 @@ function argument(args: string[], name: string): string | undefined {
 async function worker(args: string[]): Promise<void> {
   const database = argument(args, "database")!;
   const jobs = JSON.parse(argument(args, "jobs")!) as [number, Shape, ConfigName][];
-  const rules = argument(args, "rules") ? parseOtpRiskRules(readFileSync(argument(args, "rules")!, "utf8"))
+  // No --rules: the frozen evaluation set. "registered": the untuned iteration-0 table.
+  const rulesArgument = argument(args, "rules");
+  const rules = rulesArgument === "registered" ? REGISTERED_OTP_RISK_RULES
+    : rulesArgument ? parseOtpRiskRules(readFileSync(rulesArgument, "utf8"))
     : EVALUATION_OTP_RISK_RULES;
   const volume = Number(argument(args, "volume") ?? 2000);
   const telegramShare = Number(argument(args, "telegram") ?? 0.5);
