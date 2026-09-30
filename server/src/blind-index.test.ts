@@ -255,7 +255,7 @@ describe.serial("versioned blind-index keyring", () => {
       db, "+16505559303", (await startVerification(db, "+16505559303")).code,
       "ios", "Session iPhone", "Session",
     );
-    const session = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const session = await upgradeLegacySession(db, legacy.token);
 
     process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
       "lookup-v2": Buffer.alloc(32, 0x57).toString("base64"),

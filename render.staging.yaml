@@ -26,6 +26,8 @@ services:
         value: "0"
       - key: TOJ_TRUST_PROXY
         value: "0"
+      - key: TOJ_CLIENT_IP_HEADER
+        value: cf-connecting-ip
       # Dashboard-owned: the Telegram pilot requires exactly "0" and the synthetic bypass requires
       # "1". A pinned value here would be restored on every Blueprint sync and crash-loop the
       # service against its own runbook, so this stays unsynced. See server/STAGING.md.

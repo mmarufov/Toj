@@ -17,6 +17,7 @@ import {
   updateGroupProfile,
 } from "./groups";
 import { getDifference, getHistory, sendMessage } from "./sync";
+import { cleanupExpiredData } from "./ops";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
@@ -673,5 +674,52 @@ describe("Groups v1", () => {
       title: "Test",
       memberIds: [],
     })).rejects.toBeInstanceOf(GroupError);
+  });
+});
+
+describe("late group retries", () => {
+  beforeEach(resetDb);
+
+  test("a retry inside the window replays; after it, the change can never run again", async () => {
+    const { owner, alice, bob } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    const create = {
+      creatorAccountId: owner.accountId, creatorDeviceId: owner.deviceId,
+      groupId, title: "Late retries", memberIds: [alice.accountId],
+    };
+    await createGroup(db, create);
+    const addBob = {
+      actorAccountId: owner.accountId, actorDeviceId: owner.deviceId,
+      dialogId: groupId, memberIds: [bob.accountId], clientMutationId: crypto.randomUUID(),
+    };
+    await addGroupMembers(db, addBob);
+    await removeGroupMember(db, {
+      actorAccountId: owner.accountId, actorDeviceId: owner.deviceId,
+      dialogId: groupId, targetAccountId: bob.accountId, clientMutationId: crypto.randomUUID(),
+    });
+    const bobActive = async () => (await db`
+      SELECT 1 FROM dialog_members
+      WHERE dialog_id = ${groupId} AND account_id = ${bob.accountId} AND left_at IS NULL`).length === 1;
+    expect(await bobActive()).toBe(false);
+
+    // Receipt present: the retry is recognised and changes nothing.
+    expect((await addGroupMembers(db, addBob)).duplicate).toBe(true);
+    expect(await bobActive()).toBe(false);
+
+    // Past the window the receipt is a tombstone: the late add is refused, so it cannot undo the
+    // later removal.
+    await db`UPDATE group_mutation_requests SET created_at = now() - interval '25 hours'`;
+    await db`UPDATE group_create_requests SET created_at = now() - interval '25 hours'`;
+    await cleanupExpiredData(db);
+    await expect(addGroupMembers(db, addBob)).rejects.toMatchObject({
+      status: 409, code: "mutation_result_expired",
+    });
+    expect(await bobActive()).toBe(false);
+    await expect(createGroup(db, create)).rejects.toMatchObject({
+      status: 409, code: "mutation_result_expired",
+    });
+    const tombstones = await db`
+      SELECT count(*)::int AS count FROM group_mutation_requests WHERE result_expired_at IS NOT NULL`;
+    expect(tombstones[0].count).toBe(2);
   });
 });

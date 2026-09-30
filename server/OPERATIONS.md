@@ -39,7 +39,11 @@ resumable for 24 hours and are
 then removed with their encrypted chunks; expired upload-attempt rate records and unattached
 completed media are also removed. Completed dialog-preference idempotency records are retained until
 account deletion because an offline client can retry a lost response after any fixed cleanup window.
-Pending records are also never aged out. Message history and attached media are not deleted by this
+Pending records are also never aged out. Message-mutation, group-create, and group-mutation receipts
+replay for 24 hours and are then tombstoned, not deleted: the tombstone keeps only the key and its
+target, drops the keyed fingerprint, and answers a later retry with 409 `mutation_result_expired`, so
+a retry that surfaces days later can never run the edit, reaction, or membership change again.
+Tombstones are removed with the account. Message history and attached media are not deleted by this
 worker; account events follow the separately configured synchronization retention floor.
 
 ### Retention is a security decision
@@ -96,7 +100,9 @@ even while admission is disabled.
 
 - `TOJ_AUTH_SESSIONS_V2_ENABLED=1` advertises `auth_sessions_v2`, enables legacy in-place upgrade,
   and accepts rotating refresh credentials. Access tokens last 15 minutes, refresh activity lasts 30
-  days, and the device session has a non-extendable 180-day lifetime.
+  days, and the device session has a non-extendable 180-day lifetime. While it is set, a login that
+  asks for the legacy protocol gets 426 `auth_protocol_upgrade_required` instead of a new legacy
+  token; the iOS client only asks for it when v2 is not advertised.
 - `TOJ_TWO_FACTOR_ENABLED=1` advertises `two_factor_v1`. It is ignored unless auth v2 is also enabled.
   Do not set it until production SMS delivery, the migrated catalog, and v2 refresh metrics are healthy.
 - `TOJ_SECURITY_ALERT_SMS_WEBHOOK` is the optional provider adapter for non-secret security alerts.
@@ -117,6 +123,15 @@ age (`ROTATION_RECEIPT_RETAINED_GENERATIONS`), and a client stuck waiting on a l
 advance its own generation, so the receipt it needs is still present whenever it returns. `expires_at`
 is a storage backstop for sessions that stop rotating entirely and tracks the idle TTL; past it the
 session is itself expired, so the client is told `session_expired` rather than accused of replay.
+
+Legacy bearer tokens carry the same bounds as a v2 session, measured from the device row: 30 days
+without use or 180 days from sign-in, after which the token gets `session_expired` (sign in again,
+local replica kept), never a revocation. The legacy-to-v2 upgrade stores its response as a receipt
+keyed by the legacy token's digest, because the upgrade retires that token and the client sends no
+other key. A client whose upgrade response was lost retries with the same token and receives the
+same session for as long as the session is still at the generation the upgrade produced; after a
+refresh, the retry gets 409 `rotation_superseded`. Upgrade receipts follow the rotation-receipt
+retention below.
 
 Only another party rotating the session past the retained depth buries a receipt, and that is the
 case that must not replay — it resolves to `refresh_reuse_detected`, correctly. A rising

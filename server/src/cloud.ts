@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from "bun";
+import ipaddr from "ipaddr.js";
 import { sql as defaultSql } from "./db";
 import {
   startVerification,
@@ -620,10 +621,42 @@ export async function revalidateSocketSessions(
 }
 
 function networkKey(req: Request, server: { requestIP(request: Request): { address: string } | null }): string | null {
-  const forwarded = process.env.TOJ_TRUST_PROXY === "1"
-    ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-    : null;
-  return forwarded || server.requestIP(req)?.address || null;
+  return clientNetworkAddress(req.headers, server.requestIP(req)?.address ?? null);
+}
+
+/**
+ * The address the per-network OTP and two-step windows are keyed on.
+ *
+ * - `TOJ_CLIENT_IP_HEADER` names one header that the edge sets and a client cannot. On Render that
+ *   is `cf-connecting-ip`: Cloudflare answers 403 to a request that already carries it, and
+ *   overwrites it on every other request (verification in server/STAGING.md).
+ * - `TOJ_TRUST_PROXY=1` is for a single reverse proxy that appends the peer it saw. The trusted
+ *   entry is therefore the rightmost one; everything to its left arrived from the client.
+ * - Otherwise the socket peer.
+ *
+ * A configured header that is missing or malformed falls back to the socket peer. Behind a proxy
+ * that peer is shared, so the failure is a tighter limit, never a bypass.
+ */
+export function clientNetworkAddress(
+  headers: Headers,
+  peer: string | null,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const header = env.TOJ_CLIENT_IP_HEADER?.trim().toLowerCase();
+  if (header) {
+    return strictAddress(headers.get(header)) ?? peer;
+  }
+  if (env.TOJ_TRUST_PROXY === "1") {
+    return strictAddress(headers.get("x-forwarded-for")?.split(",").at(-1)) ?? peer;
+  }
+  return peer;
+}
+
+function strictAddress(raw: string | null | undefined): string | null {
+  const value = raw?.trim() ?? "";
+  // isValid alone also accepts shorthand IPv4 such as "1.2.3" or "0x7f.1".
+  if (!ipaddr.IPv4.isValidFourPartDecimal(value) && !ipaddr.IPv6.isValid(value)) return null;
+  return ipaddr.process(value).toString();
 }
 
 export function productivityNeedsForPath(pathname: string): {
@@ -1118,6 +1151,13 @@ export function startCloudServer(
             response = json(await checkVerificationV2(
               db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
             ));
+          } else if (authSessionsV2Configured()) {
+            // Clients pick v1 only when v2 is not advertised (CloudAppModel's login path), so once it
+            // is advertised a v1 request is either a stale build or a deliberate downgrade to the
+            // scheme without refresh rotation. Neither should mint a new legacy credential.
+            throw new AuthError(
+              "update Toj to sign in", 426, undefined, "auth_protocol_upgrade_required",
+            );
           } else {
             response = json(await checkVerification(
               db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
@@ -1149,6 +1189,18 @@ export function startCloudServer(
           }
           response = json(await refreshV2Session(db, body.refreshToken, body.rotationId));
           metrics.recordAuthSecurity("refresh_success");
+        }
+
+        else if (url.pathname === "/v1/session/upgrade" && req.method === "POST") {
+          // Resolved here rather than behind ordinary bearer authentication: the upgrade retires the
+          // legacy token, so a client retrying a lost response presents a token that no longer
+          // authenticates anything else. upgradeLegacySession answers that retry from its receipt.
+          if (!authSessionsV2Configured()) response = new Response("not found", { status: 404 });
+          else {
+            const token = bearer(req);
+            if (!token) throw new AuthError("missing bearer token");
+            response = json({ session: await upgradeLegacySession(db, token) });
+          }
         }
 
         else if (
@@ -2108,11 +2160,6 @@ export function startCloudServer(
             bitrateBucket: body.bitrateBucket, recoveryCount: body.recoveryCount,
             appVersion: body.appVersion, region: body.region,
           }), 202);
-        }
-
-        if (url.pathname === "/v1/session/upgrade" && req.method === "POST") {
-          if (!authSessionsV2Configured()) response = new Response("not found", { status: 404 });
-          else response = json({ session: await upgradeLegacySession(db, session.accountId, session.deviceId) });
         }
 
         if (url.pathname === "/v1/security/two-factor" && req.method === "GET") {

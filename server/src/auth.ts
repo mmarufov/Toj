@@ -19,6 +19,7 @@ import {
   isV2AccessToken,
   issueV2Session,
   notifySessionRevocation,
+  legacyTokenExpired,
   resolveV2Access,
   type AuthV2Session,
 } from "./session-security";
@@ -1453,9 +1454,10 @@ export async function lookupAccountByUsername(
 export async function resolveDevice(
   sql: SQL,
   token: string,
+  now = new Date(),
 ): Promise<{ accountId: string; deviceId: string; accessExpiresAt?: string }> {
   if (isV2AccessToken(token)) {
-    const v2 = await resolveV2Access(sql, token);
+    const v2 = await resolveV2Access(sql, token, now);
     if (!v2) throw new AuthError("invalid device token", 401, undefined, "device_revoked");
     return {
       accountId: v2.accountId,
@@ -1465,21 +1467,27 @@ export async function resolveDevice(
   }
   const tokenHashes = tokenHashCandidates(token).map((candidate) => candidate.digest);
   const rows = await sql`
-    SELECT d.id, d.account_id, d.auth_token_hash, d.auth_token_key_id FROM devices d
+    SELECT d.id, d.account_id, d.auth_token_hash, d.auth_token_key_id,
+           d.created_at, COALESCE(d.last_seen_at, d.created_at) AS last_seen_at
+    FROM devices d
     JOIN accounts a ON a.id = d.account_id
     WHERE d.auth_token_hash IN (
       SELECT decode(value, 'hex') FROM unnest(
         ${sql.array(tokenHashes.map((hash) => hash.toString("hex")), "text")}::text[]
       ) AS candidate(value)
     )
+      AND d.auth_scheme = 'legacy'
       AND d.revoked_at IS NULL
       AND a.status IN ('active','limited')`;
   // An ambiguous match across rotation candidates is rejected rather than resolved arbitrarily.
   if (rows.length !== 1) throw new AuthError("invalid device token", 401, undefined, "device_revoked");
+  if (legacyTokenExpired(rows[0], now)) {
+    throw new AuthError("session expired", 401, undefined, "session_expired");
+  }
   // Re-key the stored digest on use so legacy-keyed rows drain onto the active blind-index key.
   const active = tokenHashIndex(token);
   await sql`UPDATE devices SET auth_token_hash = ${active.digest},
-    auth_token_key_id = ${active.keyId}, last_seen_at = now()
+    auth_token_key_id = ${active.keyId}, last_seen_at = ${now}
     WHERE id = ${rows[0].id} AND auth_token_hash = ${rows[0].auth_token_hash}`;
   return { accountId: rows[0].account_id, deviceId: rows[0].id };
 }

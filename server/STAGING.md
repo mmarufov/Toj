@@ -67,8 +67,16 @@ Review and replace it from the official source when Supabase rotates its CA; do 
 certificate merely because an unverified server sent it. The regression test checks provenance
 fingerprint, expiry, and startup trust loading. Never set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
-`TOJ_TRUST_PROXY=0` is deliberate until the edge's forwarded-header handling has been verified.
-It can group staging OTP rate limits by proxy IP; use only a few test accounts and respect cooldowns.
+The per-network OTP and two-step windows key on `TOJ_CLIENT_IP_HEADER=cf-connecting-ip`. On Render
+the socket peer is Render's own proxy, and `X-Forwarded-For` keeps whatever the client sent and
+appends to it, so neither can key a limit. `CF-Connecting-IP` is set by Cloudflare in front of Render:
+a request that already carries one is refused at the edge with 403 (error 1000), and every other
+request arrives with the real client address. Both properties were checked with curl on 2026-09-30,
+the first against `api.tojchat.tech` itself; see `docs/results/step1-hardening.md`. Keep
+`TOJ_TRUST_PROXY=0`: its single-proxy rule reads the rightmost `X-Forwarded-For` entry, which on
+Render is the proxy. If the header is ever absent the server falls back to the socket peer, a
+tighter shared limit rather than a bypass. Re-check both properties after any change of edge or
+custom domain.
 The template lowers media to 5 MiB per object and 20 MiB per account because the Free database is
 small. Those are per-account limits, not a global database cap; monitor total storage.
 

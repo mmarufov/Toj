@@ -1579,6 +1579,58 @@ export type MessageMutationResult = {
   message: MessageDTO; pushes: Push[];
 };
 
+type MessageMutationClaim = {
+  actorAccountId: string; mutationId: string; operation: "edit" | "delete" | "reaction";
+  dialogId: string; msgId: number; input: Record<string, unknown>;
+};
+
+/**
+ * Claims a message mutation id, or returns the stored receipt for a retry. A receipt that is past
+ * its replay window is a tombstone (see cleanupExpiredData): the retry gets 409
+ * `mutation_result_expired` and the mutation never runs twice, however late the retry arrives.
+ */
+async function claimMessageMutation(
+  tx: SQL,
+  claim: MessageMutationClaim,
+): Promise<{ status: string; actor_pts: unknown } | null> {
+  const canonical = JSON.stringify([
+    claim.operation, claim.dialogId, claim.msgId, claim.input,
+  ]);
+  const digest = requestFingerprintIndex("message-mutation", canonical);
+  const inserted = await tx`
+    INSERT INTO message_mutation_requests
+      (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status,
+       fingerprint, fingerprint_key_id)
+    VALUES (${claim.actorAccountId}, ${claim.mutationId}, ${claim.operation}, ${claim.dialogId},
+            ${claim.msgId}, 'pending', ${digest.digest}, ${digest.keyId})
+    ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING
+    RETURNING status`;
+  if (inserted.length) return null;
+  const existing = (await tx`
+    SELECT operation, dialog_id, msg_id, status, actor_pts, fingerprint, fingerprint_key_id,
+           result_expired_at
+    FROM message_mutation_requests
+    WHERE actor_account_id = ${claim.actorAccountId} AND client_mutation_id = ${claim.mutationId}
+    FOR UPDATE`)[0];
+  if (existing.result_expired_at != null) {
+    throw new SyncError("message mutation result has expired", 409, "mutation_result_expired");
+  }
+  let sameInput = existing.operation === claim.operation
+    && existing.dialog_id === claim.dialogId && n(existing.msg_id) === claim.msgId;
+  // Receipts written before fingerprints existed can only be matched on their target.
+  if (sameInput && existing.fingerprint != null) {
+    const stored = Buffer.from(existing.fingerprint as Uint8Array);
+    const expected = requestFingerprintIndex(
+      "message-mutation", canonical, String(existing.fingerprint_key_id ?? "legacy-v1"),
+    ).digest;
+    sameInput = stored.length === expected.length && timingSafeEqual(stored, expected);
+  }
+  if (!sameInput) {
+    throw new SyncError("client mutation id already used with different input", 409, "idempotency_conflict");
+  }
+  return existing;
+}
+
 async function mutateMessage(sql: SQL, p: {
   actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; operation: "edit" | "delete"; body?: string;
@@ -1590,21 +1642,14 @@ async function mutateMessage(sql: SQL, p: {
     const mutationId = String(p.clientMutationId ?? "");
     if (!UUID_PATTERN.test(mutationId)) throw new SyncError("invalid client mutation id");
 
-    const claim = await tx`
-      INSERT INTO message_mutation_requests
-        (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status)
-      VALUES (${p.actorAccountId}, ${mutationId}, ${p.operation}, ${p.dialogId}, ${msgId}, 'pending')
-      ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING
-      RETURNING status`;
-    if (claim.length === 0) {
-      const existing = (await tx`
-        SELECT operation, dialog_id, msg_id, status, actor_pts
-        FROM message_mutation_requests
-        WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}
-        FOR UPDATE`)[0];
-      if (existing.operation !== p.operation || existing.dialog_id !== p.dialogId || n(existing.msg_id) !== msgId) {
-        throw new SyncError("client mutation id already used");
-      }
+    const existing = await claimMessageMutation(tx, {
+      actorAccountId: p.actorAccountId, mutationId, operation: p.operation,
+      dialogId: p.dialogId, msgId,
+      input: p.operation === "edit"
+        ? { body: p.body ?? null, expectedEditVersion: p.expectedEditVersion ?? null }
+        : {},
+    });
+    if (existing) {
       if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
       const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
       if (!message) throw new SyncError("message not found");
@@ -1744,19 +1789,11 @@ export async function setReaction(sql: SQL, p: {
     const emoji = p.emoji == null ? null : String(p.emoji).trim();
     if (emoji != null && (emoji.length < 1 || [...emoji].length > 8)) throw new SyncError("invalid reaction");
 
-    const claim = await tx`
-      INSERT INTO message_mutation_requests
-        (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status)
-      VALUES (${p.actorAccountId}, ${p.clientMutationId}, 'reaction', ${p.dialogId}, ${msgId}, 'pending')
-      ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING RETURNING status`;
-    if (claim.length === 0) {
-      const existing = (await tx`
-        SELECT operation, dialog_id, msg_id, status, actor_pts FROM message_mutation_requests
-        WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}
-        FOR UPDATE`)[0];
-      if (existing.operation !== "reaction" || existing.dialog_id !== p.dialogId || n(existing.msg_id) !== msgId) {
-        throw new SyncError("client mutation id already used");
-      }
+    const existing = await claimMessageMutation(tx, {
+      actorAccountId: p.actorAccountId, mutationId: p.clientMutationId, operation: "reaction",
+      dialogId: p.dialogId, msgId, input: { emoji },
+    });
+    if (existing) {
       if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
       const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
       if (!message) throw new SyncError("message not found");

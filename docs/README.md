@@ -37,6 +37,15 @@ startup.
 | [Voice calls v1 — follow-up](releases/voice-calls-v1-follow-up.md) | Deferred work and pre-beta rollout gates |
 | [Video calls v1](releases/video-calls-v1.md) | Release report, automated evidence, open external gates |
 
+## Measured results
+
+Numbers with the exact command, commit, date and machine that produced them. Local measurements,
+not production traffic.
+
+| Document | What it covers |
+| --- | --- |
+| [Session, receipt, client-address and fan-out hardening](results/step1-hardening.md) | Render client-address verification, statements per group send, overlapping-send deadlock test, negative controls |
+
 ## Implementation plans
 
 Historical design documents for features that have since shipped. Kept because

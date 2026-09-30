@@ -199,6 +199,11 @@ export function sessionRotationAAD(sessionId: string, rotationId: string): Buffe
   return Buffer.from(`toj/session-rotation|${sessionId}|${rotationId}`, "utf8");
 }
 
+/** Distinct from rotation so an upgrade receipt can never be opened as a refresh receipt. */
+export function sessionUpgradeAAD(sessionId: string, rotationId: string): Buffer {
+  return Buffer.from(`toj/session-upgrade|${sessionId}|${rotationId}`, "utf8");
+}
+
 /** Binds an encrypted media chunk to its upload and exact plaintext offset. */
 export function mediaChunkAAD(mediaId: string, offset: number | bigint): Buffer {
   return Buffer.from(`toj/media|${mediaId}|${offset}`, "utf8");
@@ -248,7 +253,8 @@ export function requestFingerprintHMAC(
     | "chat-folder-mutation"
     | "scheduled-delivery-mutation"
     | "abuse-report"
-    | "messaging-feature",
+    | "messaging-feature"
+    | "message-mutation",
   canonicalPayload: Uint8Array | string,
 ): Buffer {
   return requestFingerprintIndex(domain, canonicalPayload).digest;
@@ -262,7 +268,8 @@ export function requestFingerprintIndex(
     | "chat-folder-mutation"
     | "scheduled-delivery-mutation"
     | "abuse-report"
-    | "messaging-feature",
+    | "messaging-feature"
+    | "message-mutation",
   canonicalPayload: Uint8Array | string,
   keyId?: string,
 ): VersionedBlindIndex {

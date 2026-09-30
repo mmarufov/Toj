@@ -333,6 +333,16 @@ CREATE INDEX IF NOT EXISTS session_rotation_receipts_expiry_idx
   ON session_rotation_receipts(expires_at);
 INSERT INTO schema_migrations(name) VALUES ('session-rotation-generation-v1')
 ON CONFLICT (name) DO NOTHING;
+-- Legacy-to-v2 upgrades store their response here too, keyed by the retired legacy token's digest
+-- (session-security.ts upgradeLegacySession). The refresh path only ever opens 'refresh' rows and the
+-- upgrade path only 'upgrade' rows, and each kind is sealed under its own AAD.
+ALTER TABLE session_rotation_receipts
+  ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'refresh';
+DO $$ BEGIN
+  ALTER TABLE session_rotation_receipts ADD CONSTRAINT session_rotation_receipts_purpose_check
+    CHECK (purpose IN ('refresh','upgrade')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+ALTER TABLE session_rotation_receipts VALIDATE CONSTRAINT session_rotation_receipts_purpose_check;
 
 CREATE TABLE IF NOT EXISTS account_two_factor (
   account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -1007,6 +1017,14 @@ DO $$ BEGIN
 END $$;
 
 -- Group creation uses the final client UUID as both the dialog id and the idempotency key.
+-- Receipts outlive their replay window as tombstones (ops.ts cleanupExpiredData). A tombstone
+-- answers 409 mutation_result_expired, so a retry that arrives after the window can never execute
+-- the mutation a second time. Deleting the row instead would let it, which is why these rows are
+-- kept until the account is deleted.
+ALTER TABLE message_mutation_requests ADD COLUMN IF NOT EXISTS fingerprint BYTEA;
+ALTER TABLE message_mutation_requests ADD COLUMN IF NOT EXISTS fingerprint_key_id TEXT;
+ALTER TABLE message_mutation_requests ADD COLUMN IF NOT EXISTS result_expired_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS group_create_requests (
   creator_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   client_group_id UUID NOT NULL,
@@ -1041,6 +1059,10 @@ DO $$ BEGIN
       )) NOT VALID;
   END IF;
 END $$;
+
+-- Tombstoned rather than deleted, for the reason given above message_mutation_requests' columns.
+ALTER TABLE group_create_requests ADD COLUMN IF NOT EXISTS result_expired_at TIMESTAMPTZ;
+ALTER TABLE group_mutation_requests ADD COLUMN IF NOT EXISTS result_expired_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS group_action_budgets (
   id BIGSERIAL PRIMARY KEY,
