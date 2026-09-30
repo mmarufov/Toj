@@ -18,6 +18,8 @@ Requires `pod install` to have run. Keep TOKENIZE in step with SearchIndexSchema
 it changes what tokens exist and requires bumping SearchTextNormalizer.version.
 
     python3 scripts/generate-search-unicode-tables.py > Toj/Core/Search/SearchUnicodeTables.swift
+
+`--oracle` prints the probe's raw per-scalar TSV instead, for scoring an implementation against it.
 """
 
 import json
@@ -39,7 +41,12 @@ def manifest():
 TOKENIZE = manifest()["tokenizer"]
 
 
-def build_and_run():
+def probe_output():
+    """Compiles and runs the probe, returning its raw TSV: codepoint, class, folded-or-minus.
+
+    This raw form is the oracle `scripts/score-search-parity.sh` scores implementations against,
+    one verdict per scalar. The tables below are a lossless compression of it.
+    """
     amalgamation = os.path.join(ROOT, "Pods", "SQLCipher", "sqlite3.c")
     if not os.path.exists(amalgamation):
         sys.exit("Pods/SQLCipher/sqlite3.c missing — run `pod install` first")
@@ -58,10 +65,12 @@ def build_and_run():
         ],
         check=True,
     )
-    out = subprocess.run([binary, TOKENIZE], capture_output=True, text=True, check=True)
+    return subprocess.run([binary, TOKENIZE], capture_output=True, text=True, check=True).stdout
 
+
+def build_and_run():
     classes, folds = {}, {}
-    for line in out.stdout.splitlines():
+    for line in probe_output().splitlines():
         if not line:
             continue
         scalar, kind, folded = line.split("\t")
@@ -153,4 +162,7 @@ nonisolated enum SearchUnicodeTables {{
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--oracle"]:
+        sys.stdout.write(probe_output())
+    else:
+        main()

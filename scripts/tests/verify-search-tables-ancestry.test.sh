@@ -50,6 +50,8 @@ setup_repo() {
   # isolates the ancestry behaviour.
   for pair in "generate-search-unicode-tables.py:Toj/Core/Search/SearchUnicodeTables.swift" \
               "generate-search-normalizer-vectors.py:server/src/search-normalizer-vectors.json" \
+              "generate-search-unicode-tables-json.py:server/src/search-unicode-tables.json" \
+              "generate-search-parity-vectors.py:server/src/search-parity-vectors.json" \
               "generate-search-manifest.py:Toj/Core/Search/search-tokenizer-manifest.json"; do
     printf '#!/usr/bin/env python3\nimport sys\nsys.stdout.write(open("%s").read())\n' \
       "${pair##*:}" > "$dir/scripts/${pair%%:*}"
@@ -58,6 +60,8 @@ setup_repo() {
   chmod +x "$dir/scripts/"*
   echo "// tables" > "$dir/Toj/Core/Search/SearchUnicodeTables.swift"
   echo '{"vectors":[]}' > "$dir/server/src/search-normalizer-vectors.json"
+  echo '{"separatorRanges":[]}' > "$dir/server/src/search-unicode-tables.json"
+  echo '{"vectors":[]}' > "$dir/server/src/search-parity-vectors.json"
   cat > "$dir/Toj/Core/Search/search-tokenizer-manifest.json" <<'JSON'
 {
   "tokenizer": "unicode61 remove_diacritics 2",

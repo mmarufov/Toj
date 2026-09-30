@@ -26,6 +26,10 @@ BASE_REF="${1:-}"
 TABLES="Toj/Core/Search/SearchUnicodeTables.swift"
 VECTORS="server/src/search-normalizer-vectors.json"
 MANIFEST="Toj/Core/Search/search-tokenizer-manifest.json"
+# The Bun copy of the tables and the generated parity vectors. Neither feeds the manifest, so
+# neither can demand a version bump, but both must still describe the locked pod.
+BUN_TABLES="server/src/search-unicode-tables.json"
+PARITY_VECTORS="server/src/search-parity-vectors.json"
 
 if [[ ! -f Pods/SQLCipher/sqlite3.c ]]; then
   echo "FAIL: Pods/SQLCipher/sqlite3.c missing — run 'pod install' first" >&2
@@ -38,6 +42,8 @@ echo "==> Regenerating from Pods/SQLCipher ($(grep -m1 '#define SQLITE_VERSION '
 fail=0
 for pair in "$TABLES:generate-search-unicode-tables.py" \
             "$VECTORS:generate-search-normalizer-vectors.py" \
+            "$BUN_TABLES:generate-search-unicode-tables-json.py" \
+            "$PARITY_VECTORS:generate-search-parity-vectors.py" \
             "$MANIFEST:generate-search-manifest.py"; do
   path="${pair%%:*}"
   script="${pair##*:}"

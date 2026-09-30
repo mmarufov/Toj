@@ -30,6 +30,12 @@ plist and the vendored `Dependencies/TojWebRTC/LICENSE`.
 | `sharp` | Apache-2.0 | [lovell/sharp](https://github.com/lovell/sharp) |
 | `ipaddr.js` | MIT | [whitequark/ipaddr.js](https://github.com/whitequark/ipaddr.js) |
 
+## Data
+
+| Component | License |
+| --- | --- |
+| Unicode Character Database `Blocks.txt` 17.0.0 — [`server/src/unicode-blocks-17.0.0.txt`](server/src/unicode-blocks-17.0.0.txt), used only to group search-parity scores by block | [Unicode License v3](https://www.unicode.org/license.txt) |
+
 ## Fonts
 
 | Component | License |
