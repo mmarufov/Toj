@@ -5,7 +5,7 @@ local PostgreSQL, not on staging and not under real traffic. Toj has zero real u
 
 | | |
 |---|---|
-| Code measured | `e8258bdc8f35519726dfa8360dacfe8f62007609` (this branch; later commits change only comments and docs) |
+| Code measured | `c207edef3d4b5143670e53bee03e71206b95ce00` (the commit before this file's final edit, which changes only this file) |
 | Date | 2026-09-30 |
 | Machine | Apple M5 Pro, 24 GB, macOS 27.0.1 (26A434) |
 | Runtime | Bun 1.3.11, PostgreSQL 17.10 (Homebrew), local socket |
@@ -64,7 +64,7 @@ and `src/statement-count.ts` were copied into a detached worktree at that commit
 |---|---|---|---|
 | `2ab4b42` (`0df5aa9^`, before group chats) | 20 | 812 | 4 |
 | `a796a92` (main before this branch) | 23 | 221 | 1 |
-| `e8258bd` (this branch) | 22 | 22 | 0 |
+| `c207ede` (this branch) | 22 | 22 | 0 |
 
 Per-member statements on `2ab4b42`, classified by statement text at 2 and 5 members:
 `UPDATE account_sync_states`, `INSERT INTO account_events`, `INSERT INTO push_deliveries` (the
@@ -91,11 +91,11 @@ the same time.
 
 | Lock order in the fan-out | Runs | Sends failing with SQLSTATE 40P01 |
 |---|---|---|
-| account-UUID order (this branch) | 2 (the N7 unmutated run and the full suite, both at `e8258bd`) | 0 of 64 in both |
-| `ORDER BY random()` (negative control N7) | 3 | 41, 37 and 47 of 64 |
+| account-UUID order (this branch) | 2 (the N7 unmutated run and the full suite, both at `c207ede`) | 0 of 64 in both |
+| `ORDER BY random()` (negative control N7) | 3 | 55, 35 and 42 of 64 |
 
 The negative-control runner reports only pass or fail. The per-run counts for N7 came from the
-same mutation in a detached worktree at `e8258bd` with one added line in the test that printed the
+same mutation in a detached worktree at `c207ede` with one added line in the test that printed the
 rejection codes (`bun test src/fanout.test.ts -t "64 overlapping"`, three times): every rejection
 was `errno 40P01`, message `deadlock detected`.
 
@@ -118,7 +118,7 @@ cd server && bun run scripts/negative-controls.ts
 ```
 
 For each claim the runner checks out HEAD into a temporary worktree, runs the test unmodified (it
-must pass), applies one mutation and runs it again (it must fail). Run at `e8258bd`, 2 min 32 s:
+must pass), applies one mutation and runs it again (it must fail). Run at `c207ede`:
 
 | Id | Claim | Mutation | Unmutated | Mutated runs failing |
 |---|---|---|---|---|
@@ -146,8 +146,14 @@ envelope-canary and envelope passes over `m3`, `drafts`, `cloud-productivity` an
 
 | Tree | Per-file suite | envelope-canary pass | envelope pass |
 |---|---|---|---|
-| `e8258bd` (this branch) | 437 pass, 0 fail, 4 skipped by design (search benchmark) | 148 pass, 0 fail | 148 pass, 0 fail |
+| `c207ede` (this branch) | 436 pass, 1 fail, 4 skipped by design (search benchmark) | 148 pass, 0 fail | 148 pass, 0 fail |
 | `a796a92` (main) | 419 pass, 0 fail, 4 skipped | not run | not run |
+
+The one failure was `presence.test.ts`, "account deletion publishes terminal offline and visibility
+revocation before erasure", which stopped for 98.6 s against a 15 s per-test timeout, so the whole
+process stalled rather than the test failing an assertion. Not investigated further: the file
+passed 19 of 19 in three immediate re-runs at `c207ede`, on main, in a full run of the same code
+before the branch was squashed, and in CI's server-tests job for this branch. It is recorded here because it happened.
 
 The 18 added tests: 6 in `auth-security`, 6 in `client-address`, 2 in `fanout`, 3 in `m3`
 (late mutation retries, mutation-id conflicts, receipt-schema readiness) and 1 in `groups`. The
