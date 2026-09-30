@@ -55,6 +55,14 @@ type WireDifference =
 // link, so reuse would make a 20% fault hit one long-lived link or none; and Bun's fetch silently
 // re-sends a request whose reused keep-alive socket closed, which hides the failure from the
 // outbox logic this client exists to exercise.
+//
+// Fresh connections cost ephemeral ports: every request leaves client-to-proxy and
+// proxy-to-server sockets in TIME_WAIT for 30 s on macOS. Unpaced, the first sweep ran the
+// machine out of ports ("FailedToOpenSocket") in 5 of 20 clean runs. These minimum gaps keep 4
+// clients under about 240 new connections a second, which is still far faster than a person
+// types.
+const MIN_SEND_GAP_MS = 50;
+const MIN_SYNC_GAP_MS = 100;
 const SEND_TIMEOUT_MS = 8_000;
 const SYNC_TIMEOUT_MS = 20_000;
 const PING_INTERVAL_MS = 5_000;
@@ -110,6 +118,8 @@ export class SyncClient {
   private stopped = false;
   private syncRunning: Promise<void> | null = null;
   private syncDirty = false;
+  private lastSendAt = 0;
+  private lastSyncAt = 0;
 
   constructor(name: string, endpoints: ClientEndpoints) {
     this.name = name;
@@ -231,6 +241,8 @@ export class SyncClient {
   private async catchUp(): Promise<void> {
     let attempt = 0;
     while (!this.stopped) {
+      await sleep(Math.max(0, this.lastSyncAt + MIN_SYNC_GAP_MS - Date.now()));
+      this.lastSyncAt = Date.now();
       this.stats.syncCalls += 1;
       let difference: WireDifference;
       try {
@@ -287,6 +299,8 @@ export class SyncClient {
   async send(clientMsgId: string, body: string): Promise<void> {
     let attempt = 0;
     while (!this.stopped) {
+      await sleep(Math.max(0, this.lastSendAt + MIN_SEND_GAP_MS - Date.now()));
+      this.lastSendAt = Date.now();
       this.stats.sendAttempts += 1;
       try {
         const response = await fetch(`${this.endpoints.apiBase}/v1/messages/send`, {
