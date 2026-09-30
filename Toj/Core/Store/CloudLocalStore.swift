@@ -4220,7 +4220,12 @@ actor CloudLocalStore {
             let dialogId = try String.fetchOne(
                 db, sql: "SELECT dialog_id FROM messages WHERE client_msg_id = ?", arguments: [clientMsgId]
             )
-            try db.execute(sql: "UPDATE messages SET local_state = 'failed' WHERE client_msg_id = ?", arguments: [clientMsgId])
+            // A late HTTP failure can arrive after sync already acknowledged the send (the reply
+            // was lost but the POST committed). A row with a server msg_id is delivered; keep it.
+            try db.execute(
+                sql: "UPDATE messages SET local_state = 'failed' WHERE client_msg_id = ? AND msg_id IS NULL",
+                arguments: [clientMsgId]
+            )
             try db.execute(
                 sql: """
                 UPDATE pending_outbox

@@ -2597,6 +2597,84 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(dialogs.map(\.lastText), ["remote reply"])
     }
 
+    /// On a slow link the POST can commit, the WebSocket hint can drive sync to acknowledge the
+    /// row and delete its outbox entry, and only then can the HTTP reply time out. The late
+    /// failure must not relabel a delivered message: with no outbox row behind it, Retry would
+    /// spin forever and Remove refuses rows that carry a server msg_id.
+    @MainActor
+    func testLateSendFailureCannotDowngradeMessageAlreadyAcknowledgedBySync() async throws {
+        let store = try makeStore()
+        let accountId = "account-a"
+        let dialogId = "dialog-late-failure"
+        let clientMsgId = UUID().uuidString.lowercased()
+        try await store.upsertDialog(dialogId: dialogId, title: "Bob")
+        _ = try await store.insertSending(
+            dialogId: dialogId,
+            clientMsgId: clientMsgId,
+            text: "committed before the reply was lost",
+            senderAccountId: accountId
+        )
+
+        let ownEcho = CloudMessage(
+            dialogId: dialogId,
+            msgId: 1,
+            senderAccountId: accountId,
+            clientMsgId: clientMsgId,
+            kind: "text",
+            text: "committed before the reply was lost",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-09-30T00:00:00Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: DifferenceResponse.State(pts: 1),
+                updates: [
+                    CloudUpdate(
+                        pts: 1,
+                        ptsCount: 1,
+                        type: "message.new",
+                        dialogId: dialogId,
+                        dialogTitle: "Bob",
+                        message: ownEcho,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let acknowledgedOutbox = try await store.pendingOutboxReady()
+        XCTAssertTrue(acknowledgedOutbox.isEmpty, "Sync owns outbox cleanup once the echo lands")
+
+        // A transient timeout, then a permanent classification, both arriving after the echo.
+        try await store.markFailed(clientMsgId: clientMsgId, retryAfter: 30)
+        try await store.markFailed(clientMsgId: clientMsgId, terminal: true)
+
+        let messages = try await store.messages(dialogId: dialogId)
+        XCTAssertEqual(messages.map(\.msgId), [1])
+        XCTAssertEqual(messages.map(\.localState), ["sent"])
+        let outboxAfterFailure = try await store.pendingOutboxReady()
+        let retryDelay = try await store.nextPendingOutboxDelay()
+        XCTAssertTrue(outboxAfterFailure.isEmpty)
+        XCTAssertNil(retryDelay)
+
+        // An unacknowledged send still fails normally, so the guard only protects delivered rows.
+        let unsentId = UUID().uuidString.lowercased()
+        _ = try await store.insertSending(
+            dialogId: dialogId,
+            clientMsgId: unsentId,
+            text: "never reached the server",
+            senderAccountId: accountId
+        )
+        try await store.markFailed(clientMsgId: unsentId, terminal: true)
+        let unsent = try await store.messages(dialogId: dialogId).first { $0.clientMsgId == unsentId }
+        XCTAssertEqual(unsent?.localState, "failed")
+        XCTAssertNil(unsent?.msgId)
+    }
+
     @MainActor
     func testDifferencePersistsDirectPeerTitle() async throws {
         let store = try makeStore()

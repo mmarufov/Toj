@@ -1945,11 +1945,15 @@ export async function getDifference(
   const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
   const st = (await sql`SELECT pts, pruned_through_pts FROM account_sync_states WHERE account_id = ${accountId}`)[0];
   if (!st) throw new SyncError("unknown account");
-  const statePts = n(st.pts);
-  if (sincePts < n(st.pruned_through_pts)) return { kind: "difference_too_long", state: { pts: statePts } };
+  if (sincePts < n(st.pruned_through_pts)) return { kind: "difference_too_long", state: { pts: n(st.pts) } };
 
+  // The returned cursor must come from the same statement snapshot as the page. Read separately,
+  // an event committing between the two reads lands in the page above the cursor, and the next
+  // call delivers it again.
   const rows = await sql`
-    WITH page AS MATERIALIZED (
+    WITH page_state AS MATERIALIZED (
+      SELECT pts FROM account_sync_states WHERE account_id = ${accountId}
+    ), page AS MATERIALIZED (
       SELECT *
       FROM account_events
       WHERE account_id = ${accountId} AND pts > ${sincePts}
@@ -2026,9 +2030,11 @@ export async function getDifference(
              WHEN d.type = 'saved' THEN 'Saved Messages'
              ELSE d.title
            END AS dialog_title,
-           profile_payload.profiles
+           profile_payload.profiles,
+           page_state.pts AS state_pts
     FROM page ae
     CROSS JOIN profile_payload
+    CROSS JOIN page_state
     LEFT JOIN dialogs d ON d.id = ae.dialog_id
     LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
     LEFT JOIN dialog_members self
@@ -2049,6 +2055,10 @@ export async function getDifference(
       ELSE NULL
     END
     ORDER BY ae.pts ASC`;
+
+  // An empty page has no row to carry the snapshot cursor; nothing newer than sincePts existed
+  // then, so the first read is still a safe cursor.
+  const statePts = rows.length ? n(rows[0].state_pts) : n(st.pts);
 
   const groupAccess = new Map<string, "active" | "revoked">();
   const accessDecisions = rows.map((event: any) => {
