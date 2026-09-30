@@ -1261,6 +1261,39 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("readiness fails closed on mutation-receipt and upgrade-receipt schema drift", async () => {
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const healthy = await (await fetch(`${base}/ready`)).json() as any;
+      expect(healthy.status).toBe("ready");
+      expect(healthy.mutationReceiptSchema).toBe("ready");
+      expect(healthy.authSecuritySchema).toBe("ready");
+
+      await db`ALTER TABLE group_mutation_requests DROP COLUMN result_expired_at`;
+      try {
+        const drifted = await (await fetch(`${base}/ready`)).json() as any;
+        expect(drifted.status).toBe("not_ready");
+        expect(drifted.mutationReceiptSchema).toBe("incomplete");
+        expect(drifted.mutationReceiptSchemaMissing).toEqual(["group_mutation_requests.result_expired_at"]);
+      } finally {
+        await db`ALTER TABLE group_mutation_requests ADD COLUMN IF NOT EXISTS result_expired_at TIMESTAMPTZ`;
+      }
+
+      await db`ALTER TABLE session_rotation_receipts DROP COLUMN purpose`;
+      try {
+        const drifted = await (await fetch(`${base}/ready`)).json() as any;
+        expect(drifted.status).toBe("not_ready");
+        expect(drifted.authSecuritySchema).toBe("incomplete");
+      } finally {
+        await db`ALTER TABLE session_rotation_receipts
+          ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'refresh'`;
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
     const originalConsoleError = console.error;
@@ -1821,6 +1854,74 @@ describe("M3 cloud sync", () => {
       clientMutationId: crypto.randomUUID(),
       emoji: "🔥",
     })).rejects.toMatchObject({ status: 401 });
+  });
+
+  test("late mutation retries: inside the window a retry replays, after it nothing re-runs", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId, clientMsgId: crypto.randomUUID(), body: "react to this",
+    });
+    const heart = {
+      actorAccountId: bob.accountId, actorDeviceId: bob.deviceId,
+      dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(), emoji: "❤️",
+    };
+    await setReaction(db, heart);
+    await setReaction(db, { ...heart, clientMutationId: crypto.randomUUID(), emoji: "👍" });
+    const reactions = async () => (await getHistory(db, alice.accountId, dialogId)).messages[0].reactions;
+
+    // Receipt present: the outbox retry of the first reaction is a replay and changes nothing.
+    const replay = await setReaction(db, heart);
+    expect(replay.duplicate).toBe(true);
+    expect(await reactions()).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+
+    // Past the 24-hour window the receipt is a tombstone: the retry is refused, and the stale heart
+    // never overwrites the newer thumbs-up.
+    await db`UPDATE message_mutation_requests SET created_at = now() - interval '25 hours'`;
+    await cleanupExpiredData(db);
+    await expect(setReaction(db, heart)).rejects.toMatchObject({
+      status: 409, code: "mutation_result_expired",
+    });
+    expect(await reactions()).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+    const [tombstone] = await db`
+      SELECT result_expired_at, fingerprint FROM message_mutation_requests
+      WHERE client_mutation_id = ${heart.clientMutationId}`;
+    expect(tombstone.result_expired_at).not.toBeNull();
+    expect(tombstone.fingerprint).toBeNull();
+  });
+
+  test("a mutation id reused with different input is a conflict, not a silent success", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId, clientMsgId: crypto.randomUUID(), body: "original",
+    });
+    const reaction = {
+      actorAccountId: bob.accountId, actorDeviceId: bob.deviceId,
+      dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(), emoji: "❤️",
+    };
+    await setReaction(db, reaction);
+    await expect(setReaction(db, { ...reaction, emoji: "👍" })).rejects.toMatchObject({
+      status: 409, code: "idempotency_conflict",
+    });
+    expect((await setReaction(db, reaction)).duplicate).toBe(true);
+
+    const edit = {
+      actorAccountId: alice.accountId, actorDeviceId: alice.deviceId, dialogId, msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(), body: "first edit", expectedEditVersion: 0,
+    };
+    await editMessage(db, edit);
+    await expect(editMessage(db, { ...edit, body: "a different edit" })).rejects.toMatchObject({
+      status: 409, code: "idempotency_conflict",
+    });
+    // Same id against another operation or target is the same conflict.
+    await expect(deleteMessage(db, {
+      actorAccountId: alice.accountId, actorDeviceId: alice.deviceId, dialogId, msgId: sent.msgId,
+      clientMutationId: edit.clientMutationId,
+    })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    expect((await editMessage(db, edit)).duplicate).toBe(true);
+    const history = await getHistory(db, alice.accountId, dialogId);
+    expect(history.messages[0].text).toBe("first edit");
   });
 
   test("reactions require membership and a visible message", async () => {
@@ -3132,18 +3233,28 @@ describe("M3 cloud sync", () => {
     }
   });
 
-  test("concurrent sends with the same client_msg_id collapse to one message (B2 race)", async () => {
-    const { alice, dialogId } = await makePair();
+  test("50 concurrent sends with the same client_msg_id collapse to one message (B2 race)", async () => {
+    const { alice, bob, dialogId } = await makePair();
     const params = {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
       dialogId, clientMsgId: crypto.randomUUID(), body: "race",
     };
-    const [a, b] = await Promise.all([sendMessage(db, params), sendMessage(db, params)]);
-    expect(a.msgId).toBe(b.msgId);
-    expect(a.senderPts).toBe(b.senderPts);
-    expect([a.duplicate, b.duplicate].sort()).toEqual([false, true]);
+    const results = await Promise.all(Array.from({ length: 50 }, () => sendMessage(db, params)));
+    const first = results.find((result) => !result.duplicate)!;
+    expect(results.filter((result) => !result.duplicate)).toHaveLength(1);
+    for (const result of results) {
+      expect(result.msgId).toBe(first.msgId);
+      expect(result.senderPts).toBe(first.senderPts);
+    }
     const count = (await db`SELECT count(*)::int AS c FROM messages WHERE dialog_id = ${dialogId}`)[0];
     expect(Number(count.c)).toBe(1);
+    // One effect means one sync event per participant, not one per request.
+    const events = await db`
+      SELECT account_id, count(*)::int AS c FROM account_events
+      WHERE type = 'message.new' AND dialog_id = ${dialogId}
+      GROUP BY account_id ORDER BY account_id`;
+    expect(events.map((row: any) => row.c)).toEqual([1, 1]);
+    expect(events.map((row: any) => row.account_id).sort()).toEqual([alice.accountId, bob.accountId].sort());
   });
 
   test("contact lookup resolves a phone to an account and null for unknown", async () => {

@@ -49,7 +49,11 @@ WHERE namespace.nspname = 'public'
     'abuse_report_budgets_retention_idx',
     'abuse_reports_open_queue_idx',
     'content_access_audit_abuse_retention_idx',
-    'session_rotation_receipts_key_migration_idx'
+    'session_rotation_receipts_key_migration_idx',
+    'session_rotation_receipts_upgrade_digest_idx',
+    'message_mutation_requests_open_idx',
+    'group_create_requests_open_idx',
+    'group_mutation_requests_open_idx'
   )
   AND (NOT idx.indisvalid OR NOT idx.indisready)
 \gexec
@@ -165,6 +169,15 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS abuse_report_notes_key_migration_idx
   ON abuse_report_actions(note_key_id, id) WHERE note_key_id IS NOT NULL;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS session_rotation_receipts_key_migration_idx
   ON session_rotation_receipts(response_key_id, session_id, rotation_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS session_rotation_receipts_upgrade_digest_idx
+  ON session_rotation_receipts(request_token_digest) WHERE purpose = 'upgrade';
+-- Receipts are tombstoned rather than deleted, so the cleanup worker scans only the open ones.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mutation_requests_open_idx
+  ON message_mutation_requests(created_at) WHERE result_expired_at IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS group_create_requests_open_idx
+  ON group_create_requests(created_at) WHERE result_expired_at IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS group_mutation_requests_open_idx
+  ON group_mutation_requests(created_at) WHERE result_expired_at IS NULL;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_report_evidence_idx
   ON messages(dialog_id, sender_account_id, msg_id DESC)

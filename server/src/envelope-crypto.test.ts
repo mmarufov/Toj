@@ -874,7 +874,7 @@ describe.serial("provider-neutral envelope encryption", () => {
 
   test("final writer mode seals and idempotently replays v2 rotation receipts", async () => {
     const account = await makeAccount();
-    const session = await upgradeLegacySession(db, account.accountId, account.deviceId);
+    const session = await upgradeLegacySession(db, account.token);
     const rotationId = cryptoUUID();
     try {
       process.env.TOJ_KEY_ENCRYPTION_PROVIDER = "local";

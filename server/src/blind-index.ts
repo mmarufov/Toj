@@ -12,6 +12,7 @@ export type BlindIndexDomain =
   | "media-group-send"
   | "abuse-report"
   | "messaging-feature"
+  | "message-mutation"
   | "chat-folder-mutation"
   | "scheduled-delivery-mutation"
   | "link-preview-url"
@@ -226,6 +227,7 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     two_factor_attempt_budgets: ["network_key_id"],
     security_step_up_tickets: ["token_key_id"],
     messaging_feature_mutations: ["fingerprint_key_id"],
+    message_mutation_requests: ["fingerprint_key_id"],
     push_installations: ["normal_token_hash_key_id", "voip_token_hash_key_id"],
   };
   const columns = await sql`
@@ -342,6 +344,8 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
       UNION ALL SELECT 'two-factor.step-up', token_key_id FROM security_step_up_tickets
       UNION ALL SELECT 'messaging-feature.receipt', fingerprint_key_id
         FROM messaging_feature_mutations
+      UNION ALL SELECT 'message-mutation.receipt', fingerprint_key_id
+        FROM message_mutation_requests WHERE fingerprint IS NOT NULL
       UNION ALL SELECT 'push-installation.normal', COALESCE(normal_token_hash_key_id, 'unlabeled')
         FROM push_installations WHERE normal_token_hash IS NOT NULL
       UNION ALL SELECT 'push-installation.voip', COALESCE(voip_token_hash_key_id, 'unlabeled')

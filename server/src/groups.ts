@@ -402,10 +402,13 @@ export async function createGroup(sql: SQL, input: {
       RETURNING status`;
     if (claim.length === 0) {
       const existing = (await tx`
-        SELECT fingerprint, status FROM group_create_requests
+        SELECT fingerprint, status, result_expired_at FROM group_create_requests
         WHERE creator_account_id = ${input.creatorAccountId}
           AND client_group_id = ${groupId}
         FOR UPDATE`)[0];
+      if (existing.result_expired_at != null) {
+        throw new GroupError("group request result has expired", "mutation_result_expired", 409);
+      }
       if (!sameBuffer(existing.fingerprint, requestFingerprint)) {
         throw new GroupError("group request was reused with different details", "idempotency_conflict", 409);
       }
@@ -559,10 +562,14 @@ async function claimMutation(
     RETURNING status`;
   if (inserted.length) return { duplicate: false, mutationId };
   const existing = (await sql`
-    SELECT dialog_id, operation, fingerprint, status
+    SELECT dialog_id, operation, fingerprint, status, result_expired_at
     FROM group_mutation_requests
     WHERE actor_account_id = ${actorId} AND client_mutation_id = ${mutationId}
     FOR UPDATE`)[0];
+  // A tombstone outlives the replay window so a late retry can never run the change again.
+  if (existing.result_expired_at != null) {
+    throw new GroupError("group mutation result has expired", "mutation_result_expired", 409);
+  }
   if (
     existing.dialog_id !== dialogId
     || existing.operation !== operation

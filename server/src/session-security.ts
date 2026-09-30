@@ -1,8 +1,8 @@
 import type { SQL } from "bun";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { AuthError } from "./auth-error";
-import { sessionRotationAAD, tokenHashCandidates, tokenHashIndex } from "./crypto";
+import { sessionRotationAAD, sessionUpgradeAAD, tokenHashCandidates, tokenHashIndex } from "./crypto";
 import { openForScope, sealForScope } from "./envelope-crypto";
 import { revokePushBindingsForDevice } from "./push";
 
@@ -153,14 +153,148 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
   }, accessToken, refreshToken);
 }
 
+/**
+ * Legacy bearer tokens carry the same idle and absolute bounds as a v2 session, measured from the
+ * device row. A client that returns after the idle bound gets `session_expired`, which the iOS app
+ * treats as "sign in again" and keeps the local replica. That is the same outcome a v2 device gets
+ * at the same moment, so moving `SESSION_IDLE_TTL_MS` moves both schemes together.
+ *
+ * The device is refused, not revoked. Revocation broadcasts `device_revoked`, which tells every
+ * socket of that device to wipe local data; an expired credential must not do that.
+ */
+export function legacyTokenExpired(
+  row: { created_at: unknown; last_seen_at: unknown },
+  now: Date,
+): boolean {
+  return date(row.created_at).getTime() + SESSION_ABSOLUTE_TTL_MS <= now.getTime()
+    || date(row.last_seen_at).getTime() + SESSION_IDLE_TTL_MS <= now.getTime();
+}
+
+/**
+ * Exchange a legacy bearer token for a v2 session, replayably.
+ *
+ * The upgrade retires the legacy token in the same commit that creates the v2 credentials, and the
+ * client sends no idempotency key. If the response is lost, the only credential the client still
+ * holds is the one that was just retired. So the sealed response is stored as a receipt keyed by the
+ * legacy token's digest, and a retry with that token gets the same session back.
+ *
+ * The receipt follows the rotation-receipt rules: it replays only while the session is still at the
+ * generation the upgrade produced. Once anyone has refreshed, the holder of the legacy token is not
+ * the party that finished the upgrade, and it gets `rotation_superseded` instead. Pruning is by
+ * depth, as for every rotation receipt (see `ROTATION_RECEIPT_RETAINED_GENERATIONS`).
+ */
 export async function upgradeLegacySession(
   sql: SQL,
-  accountId: string,
-  deviceId: string,
+  legacyToken: string,
+  now = new Date(),
 ): Promise<AuthV2Session> {
-  return await sql.begin(async (tx) => issueV2Session(tx, {
-    accountId, existingDeviceId: deviceId, platform: "ios",
-  }));
+  if (isV2AccessToken(legacyToken)) {
+    throw new AuthError("session is already upgraded", 409, undefined, "session_already_upgraded");
+  }
+  const candidates = tokenHashCandidates(legacyToken)
+    .map((candidate) => candidate.digest.toString("hex"));
+  const outcome = await sql.begin(async (tx) => {
+    const device = (await tx`
+      SELECT device.id, device.account_id, device.auth_token_hash, device.auth_token_key_id,
+             device.platform, device.created_at,
+             COALESCE(device.last_seen_at, device.created_at) AS last_seen_at
+      FROM devices device
+      JOIN accounts account ON account.id = device.account_id
+      WHERE device.auth_token_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(${tx.array(candidates, "text")}::text[]) AS candidate(value)
+      )
+        AND device.auth_scheme = 'legacy'
+        AND device.revoked_at IS NULL
+        AND account.status IN ('active','limited')
+      FOR UPDATE OF device`)[0];
+    if (!device) return await replayLegacyUpgrade(tx, candidates, now);
+    if (legacyTokenExpired(device, now)) {
+      return new AuthError("session expired", 401, undefined, "session_expired");
+    }
+    const accountId = String(device.account_id);
+    const deviceId = String(device.id);
+    const response = await issueV2Session(tx, {
+      accountId, existingDeviceId: deviceId, platform: String(device.platform), now,
+    });
+    // A fresh session starts at generation 0 and receipts require a positive generation, so the
+    // upgrade itself counts as the session's first rotation.
+    const session = (await tx`
+      UPDATE device_sessions SET rotation_generation = rotation_generation + 1
+      WHERE device_id = ${deviceId}
+      RETURNING id, rotation_generation`)[0];
+    const rotationId = randomUUID();
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId },
+      JSON.stringify(response),
+      sessionUpgradeAAD(String(session.id), rotationId),
+    );
+    await tx`
+      INSERT INTO session_rotation_receipts
+        (session_id, rotation_id, request_token_digest, request_token_digest_key_id, response_ciphertext,
+         response_nonce, response_key_id, response_generation, expires_at, purpose)
+      VALUES (
+        ${session.id}, ${rotationId}, ${device.auth_token_hash}, ${device.auth_token_key_id},
+        ${sealed.ciphertext}, ${sealed.nonce}, ${sealed.keyId}, ${Number(session.rotation_generation)},
+        ${new Date(now.getTime() + ROTATION_RECEIPT_BACKSTOP_TTL_MS)}, 'upgrade'
+      )`;
+    return response;
+  });
+  if (outcome instanceof AuthError) throw outcome;
+  return outcome;
+}
+
+async function replayLegacyUpgrade(
+  tx: SQL,
+  candidates: string[],
+  now: Date,
+): Promise<AuthV2Session | AuthError> {
+  const receipts = await tx`
+    SELECT receipt.session_id, receipt.rotation_id, receipt.response_ciphertext, receipt.response_nonce,
+           receipt.response_key_id, receipt.response_generation,
+           session.rotation_generation AS current_generation, session.revoked_at,
+           session.last_activity_at, session.absolute_expires_at,
+           device.account_id, device.revoked_at AS device_revoked_at, account.status AS account_status
+    FROM session_rotation_receipts receipt
+    JOIN device_sessions session ON session.id = receipt.session_id
+    JOIN devices device ON device.id = session.device_id
+    JOIN accounts account ON account.id = device.account_id
+    WHERE receipt.purpose = 'upgrade'
+      AND receipt.request_token_digest IN (
+        SELECT decode(value, 'hex') FROM unnest(${tx.array(candidates, "text")}::text[]) AS candidate(value)
+      )
+    FOR UPDATE OF session`;
+  if (receipts.length !== 1) return new AuthError("invalid device token", 401, undefined, "device_revoked");
+  const receipt = receipts[0];
+  if (receipt.revoked_at || receipt.device_revoked_at) {
+    return new AuthError("device is no longer active", 401, undefined, "device_revoked");
+  }
+  if (!["active", "limited"].includes(String(receipt.account_status))) {
+    return new AuthError("account unavailable", 403, undefined, "device_revoked");
+  }
+  if (
+    date(receipt.absolute_expires_at) <= now
+    || date(receipt.last_activity_at).getTime() + SESSION_IDLE_TTL_MS <= now.getTime()
+  ) {
+    return new AuthError("session expired", 401, undefined, "session_expired");
+  }
+  if (Number(receipt.response_generation) !== Number(receipt.current_generation)) {
+    return new AuthError(
+      "upgrade response was superseded by a newer rotation", 409, undefined, "rotation_superseded",
+    );
+  }
+  const plaintext = await openForScope(tx, {
+    kind: "account", accountId: String(receipt.account_id),
+  }, {
+    ciphertext: Buffer.from(receipt.response_ciphertext),
+    nonce: Buffer.from(receipt.response_nonce),
+    keyId: String(receipt.response_key_id),
+  }, sessionUpgradeAAD(String(receipt.session_id), String(receipt.rotation_id)));
+  try {
+    return JSON.parse(plaintext.toString("utf8")) as AuthV2Session;
+  } finally {
+    plaintext.fill(0);
+  }
 }
 
 export async function resolveV2Access(
@@ -275,6 +409,7 @@ export async function refreshV2Session(
         JOIN device_sessions session ON session.id = receipt.session_id
         JOIN devices device ON device.id = session.device_id
         WHERE receipt.session_id = ${used.session_id} AND receipt.rotation_id = ${rotationId}
+          AND receipt.purpose = 'refresh'
           AND receipt.request_token_digest = ${used.token_digest}
           AND receipt.request_token_digest_key_id = ${used.token_digest_key_id}`)[0];
       if (receipt) {

@@ -19,12 +19,15 @@ export async function notifySyncWakeups(sql: SQL, pushes: SyncPush[]): Promise<v
     const current = coalesced.get(push.accountId);
     if (!current || push.pts > current.pts) coalesced.set(push.accountId, push);
   }
-  for (const push of [...coalesced.values()].sort((a, b) =>
-    a.accountId.localeCompare(b.accountId)
-  )) {
-    const payload = JSON.stringify(push);
-    await sql`SELECT pg_notify(${SYNC_NOTIFY_CHANNEL}, ${payload})`;
-  }
+  const payloads = [...coalesced.values()]
+    .sort((a, b) => a.accountId.localeCompare(b.accountId))
+    .map((push) => JSON.stringify(push));
+  if (payloads.length === 0) return;
+  // One statement for every recipient, so a group send costs the same round trips at any size.
+  await sql`
+    SELECT pg_notify(${SYNC_NOTIFY_CHANNEL}, wakeup.payload)
+    FROM unnest(${sql.array(payloads, "text")}::text[]) WITH ORDINALITY AS wakeup(payload, position)
+    ORDER BY wakeup.position`;
 }
 
 export function isSyncWakeupChannel(channel: string): boolean {

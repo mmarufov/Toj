@@ -372,6 +372,25 @@ export function providerState(value: unknown): ProviderState {
   return value ? "configured" : "disabled";
 }
 
+export async function mutationReceiptSchemaReadiness(
+  sql: SQL,
+): Promise<{ ready: boolean; missing: string[] }> {
+  const required = [
+    "message_mutation_requests.fingerprint",
+    "message_mutation_requests.fingerprint_key_id",
+    "message_mutation_requests.result_expired_at",
+    "group_create_requests.result_expired_at",
+    "group_mutation_requests.result_expired_at",
+  ];
+  const rows = await sql`
+    SELECT table_name || '.' || column_name AS name FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name IN ('message_mutation_requests', 'group_create_requests', 'group_mutation_requests')`;
+  const present = new Set(rows.map((row: any) => String(row.name)));
+  const missing = required.filter((name) => !present.has(name));
+  return { ready: missing.length === 0, missing };
+}
+
 export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState; telegram?: ProviderState }) {
   const started = performance.now();
   await sql`SELECT 1`;
@@ -408,8 +427,14 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
         AND EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'devices' AND column_name = 'auth_scheme'
+        )
+        AND EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'session_rotation_receipts'
+            AND column_name = 'purpose'
         ) AS ready`)[0];
   const authSecurityReady = Boolean(authSecurityRow?.ready);
+  const mutationReceipts = await mutationReceiptSchemaReadiness(sql);
   const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
   const groupCallInfrastructure = groupCallsConfigured();
   return {
@@ -418,7 +443,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
       && groupCallSchema.ready && authSecurityReady && messagingFeatures.ready
-      && cloudProductivity.ready && presence.ready && profilePhotos.ready
+      && cloudProductivity.ready && presence.ready && profilePhotos.ready && mutationReceipts.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -443,6 +468,9 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // drift here so /ready cannot report healthy while OTP is broken.
     otpSchema: otpSchema.ready ? "ready" : "incomplete",
     ...(otpSchema.ready ? {} : { otpSchemaMissing: otpSchema.missing }),
+    // Message and group mutations read and write these columns on every claim.
+    mutationReceiptSchema: mutationReceipts.ready ? "ready" : "incomplete",
+    ...(mutationReceipts.ready ? {} : { mutationReceiptSchemaMissing: mutationReceipts.missing }),
     messagingFeatures,
     cloudProductivity,
     groupCalls: {
@@ -649,14 +677,25 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.sender_account_id = doomed.sender_account_id
       AND request.client_msg_id = doomed.client_msg_id
     RETURNING request.client_msg_id`;
+  // Mutation receipts are tombstoned at the end of their 24-hour replay window, never deleted. A
+  // missing row lets the same client_mutation_id claim again and re-run the edit, reaction or group
+  // change, which is destructive: an outbox retry that surfaces days later on a congested link would
+  // overwrite newer state. A tombstone answers 409 mutation_result_expired, which the iOS client
+  // treats as permanent, so the late retry stops and the device converges through ordinary sync.
+  // The keyed fingerprint is dropped with the result, as for every other receipt past its window.
+  // Tombstones go when the account does (ON DELETE CASCADE). Pinned in both directions by the
+  // "late mutation retries" tests in m3.test.ts.
   const messageMutations = await sql`
     WITH doomed AS (
       SELECT actor_account_id, client_mutation_id FROM message_mutation_requests
-      WHERE created_at < now() - interval '24 hours'
+      WHERE result_expired_at IS NULL AND created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
       FOR UPDATE SKIP LOCKED
     )
-    DELETE FROM message_mutation_requests request USING doomed
+    UPDATE message_mutation_requests request
+    SET result_expired_at = now(), fingerprint = NULL,
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
@@ -791,25 +830,28 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     DELETE FROM media_group_send_budgets budget USING doomed
     WHERE budget.id = doomed.id
     RETURNING budget.id`;
+  // Tombstoned, not deleted, for the reason given at messageMutations above.
   const groupCreates = await sql`
     WITH doomed AS (
       SELECT creator_account_id, client_group_id FROM group_create_requests
-      WHERE created_at < now() - interval '24 hours'
+      WHERE result_expired_at IS NULL AND created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
       FOR UPDATE SKIP LOCKED
     )
-    DELETE FROM group_create_requests request USING doomed
+    UPDATE group_create_requests request SET result_expired_at = now()
+    FROM doomed
     WHERE request.creator_account_id = doomed.creator_account_id
       AND request.client_group_id = doomed.client_group_id
     RETURNING request.client_group_id`;
   const groupMutations = await sql`
     WITH doomed AS (
       SELECT actor_account_id, client_mutation_id FROM group_mutation_requests
-      WHERE created_at < now() - interval '24 hours'
+      WHERE result_expired_at IS NULL AND created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
       FOR UPDATE SKIP LOCKED
     )
-    DELETE FROM group_mutation_requests request USING doomed
+    UPDATE group_mutation_requests request SET result_expired_at = now()
+    FROM doomed
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;

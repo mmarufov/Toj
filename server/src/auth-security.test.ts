@@ -21,6 +21,7 @@ import {
   ACCESS_TOKEN_TTL_MS,
   ROTATION_RECEIPT_RETAINED_GENERATIONS,
   SESSION_ABSOLUTE_TTL_MS,
+  SESSION_IDLE_TTL_MS,
   issueV2Session,
   refreshV2Session,
   resolveV2Access,
@@ -45,7 +46,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("refresh rotation is crash-safe and detects a different replay", async () => {
     const legacy = await legacyAccount("+16505557101");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     expect(upgraded.accessToken.startsWith("toj.v2.access.")).toBe(true);
     expect(upgraded.refreshToken.startsWith("toj.v2.refresh.")).toBe(true);
     expect((await resolveDevice(db, upgraded.accessToken)).deviceId).toBe(legacy.deviceId);
@@ -65,7 +66,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("age decides neither replay nor pruning for a client stuck mid-rotation", async () => {
     const legacy = await legacyAccount("+16505557121");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     const rotationId = crypto.randomUUID();
     const rotated = await refreshV2Session(db, upgraded.refreshToken, rotationId);
 
@@ -80,7 +81,7 @@ describe("auth protocol v2 and two-step verification", () => {
       SET expires_at = now() + interval '23 days', created_at = now() - interval '7 days'`;
     await cleanupExpiredData(db);
 
-    expect(await db`SELECT rotation_id FROM session_rotation_receipts`).toHaveLength(1);
+    expect(await db`SELECT rotation_id FROM session_rotation_receipts WHERE purpose = 'refresh'`).toHaveLength(1);
     expect(await refreshV2Session(db, upgraded.refreshToken, rotationId)).toEqual(rotated);
     await expect(resolveV2Access(db, rotated.accessToken)).resolves.toMatchObject({
       deviceId: legacy.deviceId,
@@ -89,7 +90,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("receipts are pruned by rotation depth, and burial past it is superseded not reuse", async () => {
     const legacy = await legacyAccount("+16505557122");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     const rotationId = crypto.randomUUID();
     let session = await refreshV2Session(db, upgraded.refreshToken, rotationId);
 
@@ -109,7 +110,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("cleanup prunes receipts without locking the live sessions they belong to", async () => {
     const legacy = await legacyAccount("+16505557123");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     await refreshV2Session(db, upgraded.refreshToken, crypto.randomUUID());
 
     // A bare FOR UPDATE across the join would lock device_sessions and contend with refreshes.
@@ -127,7 +128,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("refresh rejects malformed and cross-generation rotation identifiers without mutation", async () => {
     const legacy = await legacyAccount("+16505557107");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     await expect(refreshV2Session(db, upgraded.refreshToken, "------------------------------------"))
       .rejects.toMatchObject({ status: 400, code: "invalid_rotation_id" });
 
@@ -141,7 +142,7 @@ describe("auth protocol v2 and two-step verification", () => {
 
   test("late receipts cannot roll credentials backward and in-place reissue fences prior access", async () => {
     const legacy = await legacyAccount("+16505557108");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     const firstRotationId = crypto.randomUUID();
     const first = await refreshV2Session(db, upgraded.refreshToken, firstRotationId);
     const second = await refreshV2Session(db, first.refreshToken, crypto.randomUUID());
@@ -194,7 +195,7 @@ describe("auth protocol v2 and two-step verification", () => {
   test("password login and SMS-bound recovery rotate codes and revoke older sessions", async () => {
     const phone = "+16505557102";
     const legacy = await legacyAccount(phone);
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
 
     const security = await startSecurityChange(db, legacy.accountId);
     const stepUp = await completeSecurityStepUp(db, legacy.accountId, security.code!);
@@ -254,7 +255,7 @@ describe("auth protocol v2 and two-step verification", () => {
     const originalFactor = process.env.TOJ_TWO_FACTOR_ENABLED;
     process.env.TOJ_TWO_FACTOR_ENABLED = "1";
     const legacy = await legacyAccount("+16505557131");
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     const doomed = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
     const alsoDoomed = await issueV2Session(db, { accountId: legacy.accountId, platform: "ios" });
 
@@ -320,7 +321,7 @@ describe("auth protocol v2 and two-step verification", () => {
     process.env.TOJ_TWO_FACTOR_ENABLED = "1";
     const phone = "+16505557109";
     const legacy = await legacyAccount(phone);
-    const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    const upgraded = await upgradeLegacySession(db, legacy.token);
     const security = await startSecurityChange(db, legacy.accountId);
     const stepUp = await completeSecurityStepUp(db, legacy.accountId, security.code!);
     const enabled = await configureTwoFactor(db, {
@@ -569,4 +570,155 @@ describe("auth protocol v2 and two-step verification", () => {
       await listener.end().catch(() => {});
     }
   }, 10_000);
+});
+
+describe("legacy credential bounds and replayable upgrade", () => {
+  beforeEach(resetDb);
+
+  const DAY_MS = 24 * 60 * 60_000;
+
+  test("a legacy token is honoured inside the idle bound and refused past it", async () => {
+    const legacy = await legacyAccount("+16505557160");
+    const now = Date.now();
+
+    // Row present and recently seen: the token authenticates.
+    await db`UPDATE devices SET last_seen_at = ${new Date(now - SESSION_IDLE_TTL_MS + DAY_MS)}
+      WHERE id = ${legacy.deviceId}`;
+    await expect(resolveDevice(db, legacy.token)).resolves.toMatchObject({ deviceId: legacy.deviceId });
+
+    // Seen just past the idle bound: refused as expired, never as revoked, and the device row is
+    // left intact so no revocation broadcast tells the client to wipe its replica.
+    await db`UPDATE devices SET last_seen_at = ${new Date(now - SESSION_IDLE_TTL_MS - 60_000)}
+      WHERE id = ${legacy.deviceId}`;
+    await expect(resolveDevice(db, legacy.token)).rejects.toMatchObject({
+      status: 401, code: "session_expired",
+    });
+    const [device] = await db`SELECT revoked_at FROM devices WHERE id = ${legacy.deviceId}`;
+    expect(device.revoked_at).toBeNull();
+  });
+
+  test("a legacy token stops at the absolute bound however active it is", async () => {
+    const legacy = await legacyAccount("+16505557161");
+    await db`UPDATE devices
+      SET created_at = ${new Date(Date.now() - SESSION_ABSOLUTE_TTL_MS + DAY_MS)}, last_seen_at = now()
+      WHERE id = ${legacy.deviceId}`;
+    await expect(resolveDevice(db, legacy.token)).resolves.toMatchObject({ deviceId: legacy.deviceId });
+
+    await db`UPDATE devices
+      SET created_at = ${new Date(Date.now() - SESSION_ABSOLUTE_TTL_MS - 60_000)}, last_seen_at = now()
+      WHERE id = ${legacy.deviceId}`;
+    await expect(resolveDevice(db, legacy.token)).rejects.toMatchObject({ code: "session_expired" });
+    await expect(upgradeLegacySession(db, legacy.token)).rejects.toMatchObject({ code: "session_expired" });
+  });
+
+  test("a v2 server refuses to mint legacy credentials and still serves v2 logins", async () => {
+    const original = process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const base = `http://127.0.0.1:${server.port}`;
+    const check = async (phone: string, code: string, authProtocolVersion?: number) =>
+      await fetch(`${base}/v1/auth/check`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phone, code, platform: "ios", deviceName: "iPhone", authProtocolVersion }),
+      });
+    try {
+      process.env.TOJ_AUTH_SESSIONS_V2_ENABLED = "1";
+      const phone = "+16505557162";
+      const { code } = await startVerification(db, phone);
+      const refused = await check(phone, code!);
+      expect(refused.status).toBe(426);
+      expect(await refused.json()).toMatchObject({ code: "auth_protocol_upgrade_required" });
+      expect(await db`SELECT id FROM devices`).toHaveLength(0);
+
+      // The refusal consumed nothing: the same code still completes a v2 login.
+      const accepted = await check(phone, code!, 2);
+      expect(accepted.status).toBe(200);
+      expect((await accepted.json() as any).session.tokenVersion).toBe(2);
+
+      // Without v2 there is no other protocol, so v1 still issues (bounded) credentials.
+      process.env.TOJ_AUTH_SESSIONS_V2_ENABLED = "0";
+      const legacyPhone = "+16505557163";
+      const legacyCode = (await startVerification(db, legacyPhone)).code!;
+      const legacy = await check(legacyPhone, legacyCode);
+      expect(legacy.status).toBe(200);
+      expect(typeof (await legacy.json() as any).token).toBe("string");
+    } finally {
+      await server.stop(true);
+      if (original == null) delete process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
+      else process.env.TOJ_AUTH_SESSIONS_V2_ENABLED = original;
+    }
+  });
+
+  test("an upgrade whose response was lost is replayed", async () => {
+    const original = process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
+    process.env.TOJ_AUTH_SESSIONS_V2_ENABLED = "1";
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const base = `http://127.0.0.1:${server.port}`;
+    const upgrade = async (token: string) => await fetch(`${base}/v1/session/upgrade`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: "{}",
+    });
+    try {
+      const legacy = await legacyAccount("+16505557164");
+      const first = await upgrade(legacy.token);
+      expect(first.status).toBe(200);
+      const issued = (await first.json() as any).session;
+
+      // The client never saw `issued`. Its only credential is the legacy token the upgrade retired,
+      // which no longer authenticates anything else...
+      const other = await fetch(`${base}/v1/capabilities`, {
+        headers: { authorization: `Bearer ${legacy.token}` },
+      });
+      expect(other.status).toBe(401);
+
+      // ...but a retry of the upgrade itself returns the same session, including after a delay.
+      await db`UPDATE session_rotation_receipts SET created_at = now() - interval '3 days'`;
+      await cleanupExpiredData(db);
+      const retry = await upgrade(legacy.token);
+      expect(retry.status).toBe(200);
+      expect((await retry.json() as any).session).toEqual(issued);
+      await expect(resolveDevice(db, issued.accessToken)).resolves.toMatchObject({
+        deviceId: legacy.deviceId,
+      });
+
+      // Once the session has rotated, the legacy token is not the party holding it: superseded.
+      const rotated = await refreshV2Session(db, issued.refreshToken, crypto.randomUUID());
+      const late = await upgrade(legacy.token);
+      expect(late.status).toBe(409);
+      expect(await late.json()).toMatchObject({ code: "rotation_superseded" });
+      await expect(resolveDevice(db, rotated.accessToken)).resolves.toMatchObject({
+        deviceId: legacy.deviceId,
+      });
+    } finally {
+      await server.stop(true);
+      if (original == null) delete process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
+      else process.env.TOJ_AUTH_SESSIONS_V2_ENABLED = original;
+    }
+  });
+
+  test("concurrent upgrades with one legacy token converge on one session", async () => {
+    const legacy = await legacyAccount("+16505557165");
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => upgradeLegacySession(db, legacy.token)),
+    );
+    for (const result of results) expect(result).toEqual(results[0]);
+    expect(await db`SELECT id FROM device_sessions`).toHaveLength(1);
+    expect(await db`SELECT rotation_id FROM session_rotation_receipts WHERE purpose = 'upgrade'`)
+      .toHaveLength(1);
+  });
+
+  test("upgrade receipts are never replayed through refresh, nor refresh receipts through upgrade", async () => {
+    const legacy = await legacyAccount("+16505557166");
+    const upgraded = await upgradeLegacySession(db, legacy.token);
+    const rotationId = crypto.randomUUID();
+    await refreshV2Session(db, upgraded.refreshToken, rotationId);
+    // Presenting the spent refresh token as an upgrade bearer finds no upgrade receipt.
+    await expect(upgradeLegacySession(db, upgraded.refreshToken)).rejects.toMatchObject({
+      code: "device_revoked",
+    });
+    await expect(upgradeLegacySession(db, upgraded.accessToken)).rejects.toMatchObject({
+      code: "session_already_upgraded",
+    });
+  });
 });
