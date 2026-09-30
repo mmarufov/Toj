@@ -360,7 +360,7 @@ describe.serial("versioned blind-index keyring", () => {
     expect((await db`SELECT normal_token_hash_key_id FROM push_installations
       WHERE installation_id = ${secondInstallationId}`)[0].normal_token_hash_key_id)
       .toBe("lookup-v2");
-    expect(await db`SELECT installation_id FROM push_account_bindings
+    expect(await db<{ installation_id: string }[]>`SELECT installation_id FROM push_account_bindings
       WHERE device_id = ${account.deviceId}`).toEqual([
       expect.objectContaining({ installation_id: secondInstallationId }),
     ]);

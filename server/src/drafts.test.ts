@@ -208,7 +208,7 @@ describe("cloud drafts and media groups", () => {
     });
     expect(cleared.draft.state).toBe("cleared");
     expect(cleared.draft.revision).toBeGreaterThan(winner.draft.revision);
-    expect(await db`
+    expect(await db<{ state: string }[]>`
       SELECT state FROM account_dialog_drafts
       WHERE account_id = ${alice.accountId} AND dialog_id = ${dialogId}`)
       .toEqual([expect.objectContaining({ state: "cleared" })]);

@@ -175,7 +175,7 @@ export async function dialogPreferenceSchemaState(
       AND relation.relname = ANY(${sql.array([...new Set(REQUIRED_COLUMNS.map((column) => column.table))], "text")}::text[])
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped`;
-  const actualColumns = new Map(
+  const actualColumns = new Map<string, { type: string; notNull: boolean; default: string | null }>(
     existingColumns.map((row: any) => [
       `${row.table_name}.${row.column_name}`,
       {

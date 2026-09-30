@@ -12,7 +12,8 @@ import {
 } from "./dialog-access";
 import { appendAccessRevokedEvent, fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { loadMediaDTO, type MediaDTO } from "./media";
-import { loadProfiles, type ProfileDTO } from "./sync";
+import type { ProfileDTO } from "./auth";
+import { loadProfiles } from "./sync";
 import { failScheduledDeliveriesForRevokedDialogInTransaction } from "./scheduled-deliveries";
 import { purgeRevokedDialogDraftState } from "./drafts";
 import { updateDialogPreferences } from "./dialog-preferences";
@@ -536,7 +537,7 @@ export async function getGroupMembers(
 
 type MutationOperation =
   | "add_members" | "remove_member" | "change_role" | "update_profile"
-  | "transfer_owner" | "leave" | "notifications";
+  | "update_permissions" | "transfer_owner" | "leave" | "notifications";
 
 async function claimMutation(
   sql: SQL,
@@ -960,7 +961,7 @@ export async function leaveGroup(sql: SQL, input: {
     ? null
     : requireUUID(input.successorAccountId, "successorAccountId");
   let affectedGroupCallIds: string[] = [];
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<{ left: true; closed: boolean; pushes: FanoutPush[] }>(async (tx) => {
     const claim = await claimMutation(
       tx, input.actorAccountId, input.clientMutationId, input.dialogId, "leave", successorId,
     );
@@ -1041,7 +1042,7 @@ export async function updateGroupNotifications(sql: SQL, input: {
     throw new GroupError("notification mode must be all or muted", "invalid_request");
   }
   if (input.usePreferenceService === false) {
-    return sql.begin(async (tx) => {
+    return sql.begin<{ envelope: GroupEnvelope; pushes: FanoutPush[] }>(async (tx) => {
       const claim = await claimMutation(
         tx,
         input.actorAccountId,

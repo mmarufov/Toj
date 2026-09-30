@@ -212,7 +212,7 @@ describe("messaging parity integration", () => {
       .find((message) => message.msg_id === forwarded.msgId)?.poll;
     expect(forwardedPoll?.total_voters).toBeUndefined();
     expect(forwardedPoll?.my_option_indices).toEqual([]);
-    expect(await db`
+    expect(await db<{ count: number }[]>`
       SELECT count(*)::int AS count FROM poll_votes
       WHERE dialog_id = ${dialogId} AND msg_id = ${forwarded.msgId}`)
       .toEqual([expect.objectContaining({ count: 0 })]);

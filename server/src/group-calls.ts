@@ -610,7 +610,7 @@ async function inspectGroupCallSchema(sql: SQL): Promise<GroupCallSchemaReadines
       || Boolean(row.not_null) !== contract.notNull
       || (row.column_default == null ? null : String(row.column_default)) !== contract.default;
   }).map((row: any) => `${row.table_name}.${row.column_name}`);
-  const actualPrimaryKeys = new Map(primaryKeys.map((row: any) => [
+  const actualPrimaryKeys = new Map<string, string[]>(primaryKeys.map((row: any) => [
     String(row.table_name), Array.from(row.columns ?? [], String),
   ]));
   const invalidPrimaryKeys = Object.entries(REQUIRED_GROUP_CALL_PRIMARY_KEYS)
@@ -1470,6 +1470,12 @@ export function startGroupCallSFUWorker(
   return () => clearInterval(timer);
 }
 
+type GroupCallMutationResult = {
+  call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean;
+};
+
+type GroupCallReleaseResult = { released: true; hints: GroupCallHint[] };
+
 export async function startGroupCall(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown; dialogId: unknown;
   initialKind: unknown; joinPublicKey: unknown; joinNonce: unknown; epochKeyCommitment: unknown;
@@ -1483,7 +1489,10 @@ export async function startGroupCall(sql: SQL, input: {
   const joinPublicKey = decodeJoinMaterial(input.joinPublicKey, "joinPublicKey");
   const joinNonce = decodeJoinMaterial(input.joinNonce, "joinNonce");
   const epochCommitment = decodeBase64(input.epochKeyCommitment, "epochKeyCommitment", 32);
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<{
+    call: GroupCallSnapshot; credentials: GroupCallCredentials | null; hints: GroupCallHint[];
+    duplicate: boolean;
+  }>(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const access = await lockDialogForMutation(tx, input.accountId, dialogId).catch(mapDialogError);
     requireGroupRole(access, ["owner", "admin", "member"]);
@@ -1594,7 +1603,7 @@ export async function joinGroupCall(sql: SQL, input: {
   const callId = requireUUID(input.callId, "callId");
   const joinPublicKey = decodeJoinMaterial(input.joinPublicKey, "joinPublicKey");
   const joinNonce = decodeJoinMaterial(input.joinNonce, "joinNonce");
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<GroupCallMutationResult>(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1712,7 +1721,7 @@ export async function activateGroupCallEpoch(sql: SQL, input: {
   const keyCommitment = decodeBase64(input.keyCommitment, "keyCommitment", 32);
   const suppliedSetHash = decodeBase64(input.participantSetHash, "participantSetHash", 32);
   const envelopes = normalizeEnvelopes(input.envelopes);
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<GroupCallMutationResult>(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -2010,7 +2019,7 @@ export async function endGroupCall(sql: SQL, input: {
   const allowedReasons = new Set(["ended_by_admin", "failed", "security_error"]);
   const reason = typeof input.reason === "string" && allowedReasons.has(input.reason)
     ? input.reason : "ended_by_admin";
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<GroupCallMutationResult>(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -2219,7 +2228,7 @@ export async function acquireGroupCamera(sql: SQL, input: {
       expiresAt: iso(lease.expires_at),
       call: await loadSnapshot(tx, visibleRow, input.accountId, input.deviceId),
       hints: !existing || expired.length ? await hintTargets(tx, visibleRow) : [],
-      displacedDeviceIds: [...new Set(expired
+      displacedDeviceIds: [...new Set<string>(expired
         .map((lease: any) => String(lease.device_id))
         .filter((deviceId: string) => deviceId !== input.deviceId))],
     };
@@ -2293,7 +2302,7 @@ export async function releaseGroupCamera(sql: SQL, input: {
 }> {
   const callId = requireUUID(input.callId, "callId");
   const generation = requireUUID(input.generation, "generation");
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<GroupCallReleaseResult>(async (tx) => {
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     const removed = await tx`
       DELETE FROM group_call_camera_leases
@@ -2369,7 +2378,7 @@ export async function acquireGroupScreenShare(sql: SQL, input: {
     return { generation, expiresAt: iso(lease.expires_at),
       call: await loadSnapshot(tx, visibleRow, input.accountId, input.deviceId),
       hints: !existing || expired.length ? await hintTargets(tx, visibleRow) : [],
-      displacedDeviceIds: [...new Set(expired
+      displacedDeviceIds: [...new Set<string>(expired
         .map((lease: any) => String(lease.device_id))
         .filter((deviceId: string) => deviceId !== input.deviceId))] };
   });
@@ -2442,7 +2451,7 @@ export async function releaseGroupScreenShare(sql: SQL, input: {
 }> {
   const callId = requireUUID(input.callId, "callId");
   const generation = requireUUID(input.generation, "generation");
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<GroupCallReleaseResult>(async (tx) => {
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     const removed = await tx`
       DELETE FROM group_call_screen_share_leases

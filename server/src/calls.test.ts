@@ -911,7 +911,7 @@ describe("E2EE voice-call control plane", () => {
     expect(await processVoIPPushBatch(db, sender)).toBe(1);
     const videoRequest = sender.requests[0];
     if (videoRequest?.kind !== "voip") throw new Error("expected VoIP request");
-    expect(buildVoIPAPNsPayload(videoRequest).toj.type).toBe("video_call");
+    expect(buildVoIPAPNsPayload(videoRequest)).toMatchObject({ toj: { type: "video_call" } });
     await cancelCall(db, {
       accountId: alice.accountId, deviceId: alice.deviceId, callId: videoCallId,
     });

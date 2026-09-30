@@ -337,7 +337,7 @@ function cloudCapabilities(
   twoFactorAvailable = twoFactorConfigured(),
   otpChannels: readonly OTPChannel[] = [],
 ) {
-  const capabilities = [...CLOUD_CAPABILITIES.capabilities];
+  const capabilities: string[] = [...CLOUD_CAPABILITIES.capabilities];
   // Which channels the picker may offer. Deliberately GLOBAL and phone-free: a per-number response
   // would answer "is this number allowlisted / reachable on X", turning a public endpoint into the
   // membership oracle that the single generic 503 in startVerification exists to deny.
@@ -373,7 +373,7 @@ function cloudCapabilities(
   };
 }
 
-function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
+function json(value: unknown, status = 200, extraHeaders: Bun.HeadersInit = {}): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: { ...jsonHeaders, ...Object.fromEntries(new Headers(extraHeaders)) },
@@ -571,6 +571,13 @@ function disconnectAllAccounts(
   for (const accountId of [...sockets.keys()]) disconnectAccount(sockets, accountId, reason);
 }
 
+type SocketSessionState = {
+  id: string;
+  account_id: string;
+  revoked_at: Date | null;
+  account_status: string;
+};
+
 export async function revalidateSocketSessions(
   db: Db,
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
@@ -585,7 +592,9 @@ export async function revalidateSocketSessions(
     FROM devices device
     JOIN accounts account ON account.id = device.account_id
     WHERE device.id = ANY(${db.array(deviceIds, "uuid")}::uuid[])`;
-  const stateByDeviceId = new Map(rows.map((row: any) => [String(row.id), row]));
+  const stateByDeviceId = new Map<string, SocketSessionState>(
+    rows.map((row: SocketSessionState) => [String(row.id), row]),
+  );
   for (const entry of entries) {
     const state = stateByDeviceId.get(entry.deviceId);
     const sameAccount = state && String(state.account_id) === entry.accountId;

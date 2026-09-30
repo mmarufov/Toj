@@ -18,7 +18,8 @@
     "crypto:keys": "bun run scripts/envelope-keys.ts",
     "backup": "bash scripts/backup-postgres.sh",
     "restore-drill": "bash scripts/restore-drill.sh",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "ipaddr.js": "^2.4.0",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",
-    "@types/pg": "^8.15.5"
+    "@types/pg": "^8.15.5",
+    "typescript": "5.9.3"
   }
 }

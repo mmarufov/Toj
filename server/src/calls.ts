@@ -1349,7 +1349,7 @@ async function terminalAction(sql: SQL, p: {
 }): Promise<MutationResult> {
   const callId = requireUUID(p.callId, "callId");
   await expireStaleCalls(sql, p.accountId, 10);
-  const result = await sql.begin(async (tx) => {
+  const result = await sql.begin<{ row: CallRow; call: CallSnapshot; hints: CallHint[] }>(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     const row = await lockedCall(tx, callId);
     await callAccess(tx, row, p.accountId, p.deviceId);

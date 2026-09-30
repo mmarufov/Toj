@@ -728,7 +728,7 @@ describe("dark-gated scaling hardening", () => {
       await db`UPDATE worker_heartbeats SET last_seen_at = now() - interval '31 seconds'`;
       clearWorkerHeartbeatCache(counted.sql);
       const stale = await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`, { headers })
-        .then((response) => response.json());
+        .then((response) => response.json() as Promise<{ capabilities: string[] }>);
       expect(stale.capabilities).not.toContain("scheduled_delivery_v1");
       expect(stale.capabilities).not.toContain("link_previews_v1");
     } finally {

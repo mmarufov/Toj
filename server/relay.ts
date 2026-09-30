@@ -38,7 +38,7 @@ export function startRelay(port: number) {
     }
   };
 
-  const server = Bun.serve<SocketData, {}>({
+  const server = Bun.serve<SocketData>({
     port,
     fetch(req, server) {
       const url = new URL(req.url);

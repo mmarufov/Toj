@@ -118,7 +118,7 @@ function expectDatabaseDetectedLockCycle(results: PromiseSettledResult<unknown>[
 }
 
 async function readSubprocessLine(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
   state: { buffer: string },
 ): Promise<string> {
   while (!state.buffer.includes("\n")) {
