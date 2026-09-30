@@ -347,6 +347,7 @@ async function main(): Promise<void> {
       syncCalls: sum("syncCalls"),
       syncFailures: sum("syncFailures"),
       wsConnects: sum("wsConnects"),
+      failureReasons: mergeCounts(clients.map((c) => c.stats.failureReasons)),
       fatalErrors: clients.flatMap((c) => c.stats.fatalErrors),
       sendPhaseMs: Math.round(lastAck - sendStarted),
       convergenceMs: convergenceMs == null ? null : Math.round(convergenceMs),
@@ -359,7 +360,8 @@ type RunResult = {
   serverDuplicates: number; truthAgreesAcrossAccounts: boolean; deviceMismatches: number;
   ptsMismatches: number; conflictingEchoes: number; redeliveredUpdates: number;
   sendAttempts: number; sendFailures: number; duplicateAcks: number; lateFailuresAfterEcho: number;
-  syncCalls: number; syncFailures: number; wsConnects: number; fatalErrors: string[];
+  syncCalls: number; syncFailures: number; wsConnects: number;
+  failureReasons: Record<string, number>; fatalErrors: string[];
   sendPhaseMs: number; convergenceMs: number | null;
 };
 
@@ -387,6 +389,14 @@ async function serverTruth(
     if (page.kind === "difference") break;
   }
   return { digest: stateDigest(messages), count: messages.size };
+}
+
+function mergeCounts(counts: Record<string, number>[]): Record<string, number> {
+  const merged: Record<string, number> = {};
+  for (const count of counts) {
+    for (const [key, value] of Object.entries(count)) merged[key] = (merged[key] ?? 0) + value;
+  }
+  return merged;
 }
 
 async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boolean> {
@@ -421,6 +431,7 @@ function summarize(results: RunResult[], scenarios: Scenario[]) {
       lateFailuresAfterEcho: total("lateFailuresAfterEcho"),
       syncFailures: total("syncFailures"),
       wsConnects: total("wsConnects"),
+      failureReasons: mergeCounts(runs.map((r) => r.failureReasons)),
       fatalErrors: runs.reduce((sum, r) => sum + r.fatalErrors.length, 0),
       unconverged: runs.filter((r) => r.convergenceMs == null).length,
       convergenceP50Ms: percentile(convergence, 50),

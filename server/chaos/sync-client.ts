@@ -28,6 +28,8 @@ export type ClientStats = {
   conflictingEchoes: number;
   wsConnects: number;
   wsHints: number;
+  /** Why attempts failed, by error name or HTTP status. Diagnostic only. */
+  failureReasons: Record<string, number>;
   fatalErrors: string[];
 };
 
@@ -99,7 +101,7 @@ export class SyncClient {
   readonly stats: ClientStats = {
     sendAttempts: 0, sendFailures: 0, duplicateAcks: 0, lateFailuresAfterEcho: 0,
     syncCalls: 0, syncFailures: 0, redeliveredUpdates: 0, conflictingEchoes: 0,
-    wsConnects: 0, wsHints: 0, fatalErrors: [],
+    wsConnects: 0, wsHints: 0, failureReasons: {}, fatalErrors: [],
   };
 
   private ws: WebSocket | null = null;
@@ -241,8 +243,9 @@ export class SyncClient {
         });
         if (!response.ok) throw new Error(`difference ${response.status}`);
         difference = await response.json() as WireDifference;
-      } catch {
+      } catch (error) {
         this.stats.syncFailures += 1;
+        this.noteFailure("sync", error);
         await sleep(backoff(attempt++));
         continue;
       }
@@ -303,14 +306,25 @@ export class SyncClient {
           return;
         }
         throw new Error(`send ${response.status}`);
-      } catch {
+      } catch (error) {
         this.stats.sendFailures += 1;
+        this.noteFailure("send", error);
         // This is the window the iOS markFailed fix covers: sync already has the echo, and the
         // HTTP attempt still reports failure.
         if (this.echoApplied.has(clientMsgId)) this.stats.lateFailuresAfterEcho += 1;
         await sleep(backoff(attempt++));
       }
     }
+  }
+
+  private noteFailure(kind: string, error: unknown): void {
+    const reason = error instanceof Error
+      ? (error.message.match(/^(send|difference) \d+$/)
+        ? error.message
+        : (error as { code?: string }).code ?? error.name)
+      : "unknown";
+    const key = `${kind}:${reason}`;
+    this.stats.failureReasons[key] = (this.stats.failureReasons[key] ?? 0) + 1;
   }
 
   digest(): string {
