@@ -14,6 +14,16 @@ import { AuthError } from "./auth-error";
 import { telegramOTPFromEnvironment } from "./telegram-otp";
 import { infobipOTPFromEnvironment } from "./infobip-otp";
 import { whatsappOTPFromEnvironment } from "./whatsapp-otp";
+import { otpNow } from "./otp-clock";
+import {
+  callingCode,
+  decideOtpRisk,
+  HOME_COUNTRY_CODE,
+  otpRiskConfigFromEnvironment,
+  phonePrefix,
+  type OtpRiskConfig,
+  type OtpRiskDecision,
+} from "./otp-risk";
 export { AuthError } from "./auth-error";
 import {
   isV2AccessToken,
@@ -131,6 +141,16 @@ export async function otpSchemaReadiness(sql: SQL): Promise<{ ready: boolean; mi
         SELECT 1 FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'otp_challenges' AND column_name = 'channel'
       ) AS otp_challenges_channel,
+      EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'otp_challenges' AND column_name = 'phone_prefix'
+      ) AS otp_challenges_phone_prefix,
+      EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'otp_challenges' AND column_name = 'verified_at'
+      ) AS otp_challenges_verified_at,
+      to_regclass('public.otp_risk_decisions') IS NOT NULL AS otp_risk_decisions,
+      to_regclass('public.otp_spend_reservations') IS NOT NULL AS otp_spend_reservations,
       to_regclass('public.security_step_up_tickets') IS NOT NULL AS security_step_up_tickets,
       to_regclass('public.account_two_factor') IS NOT NULL AS account_two_factor`)[0];
   for (const [name, present] of Object.entries(row ?? {})) {
@@ -189,7 +209,96 @@ type StartVerificationOptions = {
   purpose?: OTPPurpose;
   /** The channel the user tapped. Required whenever any channel is configured. */
   deliveryChannel?: unknown;
+  /** Fraud rules and spend accounting. Defaults to otpRiskConfigFromEnvironment(). */
+  risk?: OtpRiskConfig;
 };
+
+/**
+ * Reads the rule features for one request, decides, and records the decision. Runs in its own
+ * statements, outside the challenge transaction, so a refused request still leaves its log row.
+ */
+async function assessOtpRequest(
+  sql: SQL,
+  input: {
+    now: Date; prefix: string; domestic: boolean; channel: string; purpose: string;
+    networkCandidates: Buffer[]; config: OtpRiskConfig;
+  },
+): Promise<OtpRiskDecision> {
+  const { now, prefix, config } = input;
+  const rules = config.rules;
+  const [row] = await sql`
+    SELECT
+      count(*) FILTER (WHERE created_at > ${now}::timestamptz - interval '1 hour') AS last_hour,
+      count(*) FILTER (WHERE created_at <= ${now}::timestamptz - interval '1 hour') AS prior_23h,
+      count(*) FILTER (
+        WHERE channel = 'sms'
+          AND created_at > ${now}::timestamptz - (${rules.verifyRateWindowMinutes} * interval '1 minute')
+          AND created_at <= ${now}::timestamptz - (${rules.verifyRateSettleMinutes} * interval '1 minute')
+      ) AS settled_sms,
+      count(*) FILTER (
+        WHERE channel = 'sms' AND verified_at IS NOT NULL
+          AND created_at > ${now}::timestamptz - (${rules.verifyRateWindowMinutes} * interval '1 minute')
+          AND created_at <= ${now}::timestamptz - (${rules.verifyRateSettleMinutes} * interval '1 minute')
+      ) AS settled_verified
+    FROM otp_challenges
+    WHERE phone_prefix = ${prefix}
+      AND created_at > ${now}::timestamptz - interval '24 hours'
+      AND created_at <= ${now}::timestamptz`;
+  let networkLastHour: number | null = null;
+  if (input.networkCandidates.length) {
+    networkLastHour = Number((await sql`
+      SELECT count(*) AS count FROM otp_challenges
+      WHERE network_hash IN (
+        SELECT decode(value, 'hex') FROM unnest(
+          ${sql.array(input.networkCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
+        ) AS candidate(value)
+      )
+        AND created_at > ${now}::timestamptz - interval '1 hour'
+        AND created_at <= ${now}::timestamptz`)[0].count);
+  }
+  const decision = decideOtpRisk({
+    channel: input.channel,
+    phonePrefix: prefix,
+    domestic: input.domestic,
+    prefixLastHour: Number(row.last_hour),
+    prefixPrior23Hours: Number(row.prior_23h),
+    prefixSettledSmsSends: Number(row.settled_sms),
+    prefixSettledSmsVerified: Number(row.settled_verified),
+    networkLastHour,
+  }, rules, config.mode === "shadow" ? "shadow" : "enforce");
+  await sql`
+    INSERT INTO otp_risk_decisions
+      (created_at, purpose, channel, phone_prefix, action, would_action, rule_id, reason)
+    VALUES (${now}, ${input.purpose}, ${input.channel}, ${prefix}, ${decision.action},
+            ${decision.wouldAction}, ${decision.ruleId}, ${decision.reason})`;
+  return decision;
+}
+
+/**
+ * Reserves the price of one send before the provider is called. Reservations are never released:
+ * with no delivery receipts on Tajik routes, a send can never be shown not to have been billed.
+ * With a ceiling configured, the day's total across every channel is checked under one lock.
+ */
+async function reserveOtpSpend(
+  tx: SQL, now: Date, channel: string, priceMicros: number, config: OtpRiskConfig,
+): Promise<void> {
+  const utcDay = now.toISOString().slice(0, 10);
+  if (config.dailySpendCeilingMicros != null) {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended('toj-otp-spend-v1', 0))`;
+    const reserved = Number((await tx`
+      SELECT COALESCE(sum(reserved_micros), 0) AS total FROM otp_spend_reservations
+      WHERE utc_day = ${utcDay}::date`)[0].total);
+    if (reserved + priceMicros > config.dailySpendCeilingMicros) {
+      throw new AuthError("verification is unavailable right now", 429, 3600, "verification_unavailable");
+    }
+  }
+  await tx`
+    INSERT INTO otp_spend_reservations (utc_day, channel, reserved_micros, sends)
+    VALUES (${utcDay}::date, ${channel}, ${priceMicros}, 1)
+    ON CONFLICT (utc_day, channel) DO UPDATE SET
+      reserved_micros = otp_spend_reservations.reserved_micros + EXCLUDED.reserved_micros,
+      sends = otp_spend_reservations.sends + 1`;
+}
 
 function privateBetaOTPAllowed(normalizedPhone: string): boolean {
   if (process.env.TOJ_RETURN_OTP !== "1") return false;
@@ -234,6 +343,8 @@ export async function startVerification(
   options: StartVerificationOptions = {},
 ): Promise<{ code?: string; retryAfter?: number }> {
   const normalizedPhone = validPhone(phone);
+  const now = otpNow();
+  const prefix = phonePrefix(normalizedPhone);
   const purpose = options.purpose ?? "login";
   const lookupIndex = phoneLookupIndex(normalizedPhone);
   const lookup = lookupIndex.digest;
@@ -285,9 +396,25 @@ export async function startVerification(
     throw new AuthError("verification service temporarily unavailable", 503);
   }
 
+  // Fraud rules run before the daily budget, and only for real sends: a returned development code
+  // costs nothing. The decision is logged whether or not it is enforced.
+  const risk = delivery ? options.risk ?? otpRiskConfigFromEnvironment() : null;
+  if (risk && risk.mode !== "off") {
+    const decision = await assessOtpRequest(sql, {
+      now, prefix, domestic: callingCode(normalizedPhone) === HOME_COUNTRY_CODE,
+      channel: delivery!.channel, purpose, networkCandidates, config: risk,
+    });
+    if (decision.action === "block") {
+      throw new AuthError("verification is unavailable right now", 429, 3600, "verification_unavailable");
+    }
+    if (decision.action === "require_channel") {
+      throw new AuthError("request the code by Telegram instead", 409, undefined, "sms_unavailable");
+    }
+  }
+
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const salt = randomBytes(16);
-  const expires = new Date(Date.now() + OTP_TTL_MS);
+  const expires = new Date(now.getTime() + OTP_TTL_MS);
   const phoneLocks = lookupCandidates.map((candidate) => candidate.readBigInt64BE(0));
   const networkLocks = networkCandidates.map((candidate) => candidate.readBigInt64BE(0));
 
@@ -298,7 +425,7 @@ export async function startVerification(
       // 24 hours; ops.ts carries the matching note and m3.test.ts pins the pair.
       await tx`SELECT pg_advisory_xact_lock(hashtextextended('toj-otp-daily-budget-v1', 0))`;
       const count = Number((await tx`SELECT count(*) AS count FROM otp_challenges
-        WHERE created_at > now() - interval '24 hours'`)[0].count);
+        WHERE created_at > ${now}::timestamptz - interval '24 hours'`)[0].count);
       if (count >= delivery.dailyRequestLimit) {
         throw new AuthError("verification request budget reached; try again later", 429, 86400);
       }
@@ -317,7 +444,7 @@ export async function startVerification(
         AND purpose = ${purpose}
       ORDER BY created_at DESC LIMIT 1`)[0];
     if (latest) {
-      const ageSeconds = Math.floor((Date.now() - new Date(latest.created_at).getTime()) / 1000);
+      const ageSeconds = Math.floor((now.getTime() - new Date(latest.created_at).getTime()) / 1000);
       // "I didn't get the WhatsApp one, send me a text" is the flow the picker exists for, so a
       // genuine channel change skips the cooldown. The cooldown is anti-annoyance and
       // anti-double-billing; the abuse control is the window limits below, which this never
@@ -342,7 +469,7 @@ export async function startVerification(
           ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
         ) AS candidate(value)
       )
-        AND created_at > now() - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
+        AND created_at > ${now}::timestamptz - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
     if (phoneCount >= OTP_PHONE_WINDOW_LIMIT) {
       throw new AuthError("too many verification requests; try again later", 429, OTP_WINDOW_MINUTES * 60);
     }
@@ -355,28 +482,30 @@ export async function startVerification(
             ${tx.array(networkCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
           ) AS candidate(value)
         )
-          AND created_at > now() - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
+          AND created_at > ${now}::timestamptz - (${OTP_WINDOW_MINUTES} * interval '1 minute')`)[0].count);
       if (networkCount >= OTP_NETWORK_WINDOW_LIMIT) {
         throw new AuthError("too many verification requests; try again later", 429, OTP_WINDOW_MINUTES * 60);
       }
     }
 
     await tx`
-      UPDATE otp_challenges SET consumed_at = now()
+      UPDATE otp_challenges SET consumed_at = ${now}
       WHERE phone_lookup_hash IN (
         SELECT decode(value, 'hex') FROM unnest(
           ${tx.array(lookupCandidates.map((hash) => hash.toString("hex")), "text")}::text[]
         ) AS candidate(value)
       )
         AND consumed_at IS NULL`;
+    const price = delivery ? risk?.pricesMicros[delivery.channel] : undefined;
+    if (delivery && price != null) await reserveOtpSpend(tx, now, delivery.channel, price, risk!);
     const codeIndex = codeHashIndex(code, salt);
     return (await tx`
       INSERT INTO otp_challenges
         (phone_lookup_hash, phone_lookup_key_id, code_hash, code_key_id, code_salt,
-         network_hash, network_key_id, purpose, expires_at, channel)
+         network_hash, network_key_id, purpose, expires_at, channel, phone_prefix, created_at)
       VALUES (${lookup}, ${lookupIndex.keyId}, ${codeIndex.digest}, ${codeIndex.keyId}, ${salt},
               ${networkHash}, ${networkIndex?.keyId ?? null}, ${purpose}, ${expires},
-              ${delivery?.channel ?? null})
+              ${delivery?.channel ?? null}, ${prefix}, ${now})
       RETURNING id`)[0].id;
   });
 
@@ -384,7 +513,7 @@ export async function startVerification(
     try {
       await delivery.send(normalizedPhone, code, purpose);
     } catch (error) {
-      await sql`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challengeId}`;
+      await sql`UPDATE otp_challenges SET consumed_at = ${now} WHERE id = ${challengeId}`;
       console.error(new Date().toISOString(), "auth.otp.delivery_failed",
         error instanceof Error ? error.name : "UnknownError");
       throw new AuthError("verification service temporarily unavailable", 503);
@@ -533,6 +662,7 @@ async function completePhoneVerification<T>(
   platform: string,
 ): Promise<T> {
   const normalizedPhone = validPhone(phone);
+  const now = otpNow();
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   if (!ALLOWED_PLATFORMS.has(platform)) throw new AuthError("unsupported device platform", 400);
   const lookupIndex = phoneLookupIndex(normalizedPhone);
@@ -547,7 +677,7 @@ async function completePhoneVerification<T>(
         ) AS candidate(value)
       )
         AND purpose = 'login'
-        AND consumed_at IS NULL AND expires_at > now()
+        AND consumed_at IS NULL AND expires_at > ${now}
       ORDER BY created_at DESC LIMIT 1
       FOR UPDATE`;
     if (rows.length === 0) throw new AuthError("no active verification code");
@@ -563,7 +693,7 @@ async function completePhoneVerification<T>(
       return new AuthError("incorrect code");
     }
     const claimed = await tx`
-      UPDATE otp_challenges SET consumed_at = now()
+      UPDATE otp_challenges SET consumed_at = ${now}, verified_at = ${now}
       WHERE id = ${challenge.id} AND consumed_at IS NULL
       RETURNING id`;
     if (claimed.length === 0) throw new AuthError("verification code already used");
@@ -918,7 +1048,7 @@ export async function completeSecurityStepUp(
       }
       return new AuthError("incorrect code", 401);
     }
-    await tx`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challenge.id}`;
+    await tx`UPDATE otp_challenges SET consumed_at = now(), verified_at = now() WHERE id = ${challenge.id}`;
     const ticketIndex = tokenHashIndex(ticket);
     await tx`
       INSERT INTO security_step_up_tickets (account_id, token_hash, token_key_id, expires_at)
