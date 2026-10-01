@@ -2209,6 +2209,48 @@ describe("M3 cloud sync", () => {
     expect(calls).toBeLessThanOrEqual(4);
   });
 
+  test("a send that commits mid-difference is not re-delivered by the returned cursor", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const send = (body: string) => sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body,
+    });
+    await send("before the read");
+    const start = await getUpdates(db, bob.accountId, 0);
+
+    // Commit a concurrent send after the first statement of the next difference returns, so it
+    // lands between any cursor read and page read that are not one snapshot.
+    let calls = 0;
+    const racingDB = new Proxy(db, {
+      apply(target, _thisArg, argumentsList) {
+        calls += 1;
+        const result = Reflect.apply(target, target, argumentsList);
+        if (calls !== 1) return result;
+        return Promise.resolve(result).then(async (rows) => {
+          await send("committed mid-read");
+          return rows;
+        });
+      },
+    });
+    await send("already committed");
+    const page = await getUpdates(racingDB, bob.accountId, start.state.pts);
+    expect(page.kind).toBe("difference");
+
+    const next = await getUpdates(db, bob.accountId, page.state.pts);
+    const delivered = new Set(page.updates.map((update) => update.pts));
+    const redelivered = next.updates.filter((update) => delivered.has(update.pts));
+    expect(page.updates.every((update) => update.pts <= page.state.pts)).toBe(true);
+    expect(redelivered.map((update) => update.pts)).toEqual([]);
+    // Nothing is lost either way: every committed send is in exactly one of the two pages.
+    const texts = [...page.updates, ...next.updates]
+      .map((update) => update.message?.text)
+      .filter(Boolean);
+    expect(texts).toEqual(["already committed", "committed mid-read"]);
+  });
+
   test("pruned event floor returns difference_too_long instead of a fake partial catch-up", async () => {
     const { alice, bob, dialogId } = await makePair();
     await sendMessage(db, {
