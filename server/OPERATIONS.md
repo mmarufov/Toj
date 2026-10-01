@@ -155,6 +155,41 @@ CallKit answering, weak-network rotation response loss, and remote-device socket
 Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
 a device retrying after days can recover the canonical `client_msg_id`.
 
+## OTP fraud rules and spend reservations
+
+`startVerification` scores every OTP request that would reach a paid provider before the daily
+budget and the per-phone and per-network windows run (`server/src/otp-risk.ts`). Each decision is
+one of `allow`, `require_channel` (refuse SMS, accept Telegram or WhatsApp), `block`, or `shadow`,
+and always names its rule and a reason. Decisions are written to `otp_risk_decisions` with the
+prefix, channel, action and rule only, and kept 30 days. The log is an audit trail: no rule reads
+it, so its retention changes no decision.
+
+- `TOJ_OTP_RISK_MODE` is `off` (default), `shadow` or `enforce`. Start with `shadow` and read the
+  log before enforcing.
+- `TOJ_OTP_RISK_RULES` is a JSON object of thresholds and is required on a hosted deployment
+  whenever the mode is not `off`. It lives in the deployment secret store, never in the repository:
+  the thresholds in `EVALUATION_OTP_RISK_RULES` are the published evaluation set, and running on
+  them would tell an attacker exactly where each line is.
+- Every rule reads `otp_challenges` over at most 24 hours (`phone_prefix`, `verified_at`,
+  `channel`, `network_hash`, `created_at`), which the OTP cleanup already retains for longer.
+  Shortening that retention below 24 hours would silently weaken the surge and verify-rate rules
+  as well as the daily budget.
+- The surge rule compares the last hour with the prefix's preceding 23 hours. On a fresh database
+  there is no baseline, so the first 20 requests an hour per prefix are the whole allowance: keep
+  the rules in `shadow` for at least a day after launch or after any database restore.
+- `require_channel` fails a user who has no Telegram or WhatsApp. It is the cheaper failure, not a
+  free one; read the replay results in `docs/results/otp-fraud-replay.md` before enforcing.
+- The thresholds are absolute and do not transfer across traffic volume: in the replay, rules tuned
+  at 2,000 sign-ups a day stopped none of the in-country pumping at 5,000 a day. Re-derive them from
+  shadow-mode data whenever volume changes by a large factor.
+
+Every paid send reserves its price in `otp_spend_reservations`, integer micro-dollars per UTC day
+and channel, before the provider is called (`TOJ_OTP_PRICE_MICROS_SMS`, `_TELEGRAM`, `_WHATSAPP`
+override the published defaults). Reservations are never released, because Tajik routes return no
+delivery receipts and a send can never be shown not to have been billed. With
+`TOJ_OTP_DAILY_SPEND_CEILING_MICROS` set, a send that would take the day's total across all
+channels past the ceiling is refused with 429 `verification_unavailable`.
+
 ## Abuse-reporting rollout and response
 
 `abuse_reports_v1` is hidden unless the additive schema and every operational gate is present:

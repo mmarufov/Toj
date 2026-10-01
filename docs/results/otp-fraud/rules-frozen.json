@@ -1,0 +1,1 @@
+{"foreignPrefixPerHour": 3, "verifyRateMinSends": 10, "verifyRateFloor": 0.5, "verifyRateWindowMinutes": 720, "verifyRateSettleMinutes": 10, "networkPerHour": 30, "surgeMultiplier": 3, "surgeFloor": 20}

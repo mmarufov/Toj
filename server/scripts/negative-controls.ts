@@ -199,6 +199,71 @@ export const CONTROLS: Control[] = [
     test: "src/auth-security.test.ts",
     pattern: "age decides neither replay nor pruning",
   },
+  {
+    id: "N13",
+    claim: "prefix_verify_rate steers a pumped home prefix off SMS",
+    mutation: "never evaluate the verify-rate rule",
+    file: "src/otp-risk.ts",
+    find: `  if (features.prefixSettledSmsSends >= rules.verifyRateMinSends) {`,
+    replace: `  if (false) {`,
+    test: "src/otp-risk.test.ts",
+    pattern: "pumped home prefix is steered off SMS",
+  },
+  {
+    id: "N14",
+    claim: "foreign_prefix_velocity blocks a foreign burst within the hour",
+    mutation: "never evaluate the foreign-velocity rule",
+    file: "src/otp-risk.ts",
+    find: `  if (!features.domestic && features.prefixLastHour > rules.foreignPrefixPerHour) {`,
+    replace: `  if (false) {`,
+    test: "src/otp-risk.test.ts",
+    pattern: "foreign burst is blocked",
+  },
+  {
+    id: "N15",
+    claim: "verified_at marks a correct code only",
+    mutation: "stamp verified_at whenever a resend consumes the previous challenge",
+    file: "src/auth.ts",
+    find: `    await tx\`
+      UPDATE otp_challenges SET consumed_at = \${now}
+      WHERE phone_lookup_hash IN (`,
+    replace: `    await tx\`
+      UPDATE otp_challenges SET consumed_at = \${now}, verified_at = \${now}
+      WHERE phone_lookup_hash IN (`,
+    test: "src/otp-risk.test.ts",
+    pattern: "verified_at marks a correct code only",
+  },
+  {
+    id: "N16",
+    claim: "the daily spend ceiling refuses a send that would pass it",
+    mutation: "never compare the day's total with the ceiling",
+    file: "src/auth.ts",
+    find: `    if (reserved + priceMicros > config.dailySpendCeilingMicros) {`,
+    replace: `    if (false) {`,
+    test: "src/otp-risk.test.ts",
+    pattern: "spend is reserved in micro-dollars",
+  },
+  {
+    id: "N17",
+    claim: "the clock seam drives the resend cooldown",
+    mutation: "read the wall clock in the cooldown",
+    file: "src/auth.ts",
+    find: `      const ageSeconds = Math.floor((now.getTime() - new Date(latest.created_at).getTime()) / 1000);`,
+    replace: `      const ageSeconds = Math.floor((Date.now() - new Date(latest.created_at).getTime()) / 1000);`,
+    test: "src/otp-risk.test.ts",
+    pattern: "clock seam moves the cooldown",
+  },
+  {
+    id: "N18",
+    claim: "/ready fails closed when the OTP risk columns are missing",
+    mutation: "leave the OTP schema out of the overall status",
+    file: "src/ops.ts",
+    find: `
+      && otpSchema.ready`,
+    replace: ``,
+    test: "src/otp-risk.test.ts",
+    pattern: "fails closed when the risk columns are missing",
+  },
 ];
 
 type RunResult = { pass: number; fail: number; output: string };
