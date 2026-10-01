@@ -45,13 +45,6 @@ not production traffic.
 | Document | What it covers |
 | --- | --- |
 | [Session, receipt, client-address and fan-out hardening](results/step1-hardening.md) | Render client-address verification, statements per group send, overlapping-send deadlock test, negative controls |
-
-## Measured results
-
-Each file states its exact command, commit, date and machine.
-
-| Document | What it covers |
-| --- | --- |
 | [Sync under injected network faults](results/sync-chaos.md) | Toxiproxy sweep of the sync protocol: messages lost, duplicated and mismatched, and convergence time ([pre-registration](results/sync-chaos-preregistration.md)) |
 
 ## Implementation plans

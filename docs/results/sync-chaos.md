@@ -21,9 +21,102 @@ number here was copied by hand.
   and not the national gateway. Only the network is faulted: there is no database crash and no
   server kill.
 
-<!-- HEADLINE -->
+## Headline
 
-<!-- TABLES -->
+| | After the fix (`47120dc`) | Before the fix (`1d10014`) |
+|---|---|---|
+| Messages sent (5 scenarios × 20 runs × 500) | 50,000 | 50,000 |
+| Lost, server duplicates, device mismatches | 0, 0, 0 | 0, 0, 0 |
+| Runs where a device was re-sent an update it already had | **0 of 100** | **97 of 100** (1,241 updates) |
+| Worst scenario's convergence p99 (`reply_dropped`) | 4.01 s | 3.89 s |
+
+- **Messages were not lost or duplicated** either way. Retries with the same `clientMsgId` and the
+  server's idempotent send held under every fault.
+- **The `getDifference` fix removed re-delivery entirely.** Before it, the bug showed up even on a
+  clean link (17 of 20 runs), because four concurrent senders are enough to commit an event
+  between two statements.
+- **Convergence did not measurably change**, and was not expected to. Re-delivered updates are
+  small and idempotent, so the fix saves bytes, not seconds, at this scale.
+
+## Tables
+
+### After the fix: environment
+
+- Label: `after-fix`
+- Git SHA: `47120dc70a3a67d43d4354f33836d65321039fbd`
+- Date: 2026-09-30T22:37:34.897Z
+- Machine: Mac17,9; Apple M5 Pro; 15 cores; 24 GB
+- Bun 1.3.11; PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0; Toxiproxy 2.12.0
+- Command (from `server/`): `bun run chaos/run.ts --runs 20 --messages 500 --label after-fix --out ../docs/results/sync-chaos-after.json`
+
+### Correctness
+
+| Scenario | Runs | Messages | Lost | Server duplicates | Conflicting echoes | Device mismatches | pts mismatches | Unconverged runs | Fatal errors |
+|---|---|---|---|---|---|---|---|---|---|
+| clean | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 3g | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| resets | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| reply_dropped | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| reply_cut | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+### Convergence
+
+| Scenario | Convergence p50 (s) | Convergence p99 = max of 20 (s) | Send phase p50 (s) |
+|---|---|---|---|
+| clean | 0.14 | 0.22 | 6.30 |
+| 3g | 0.62 | 1.08 | 43.48 |
+| resets | 0.21 | 0.71 | 8.93 |
+| reply_dropped | 2.12 | 4.01 | 44.46 |
+| reply_cut | 0.20 | 0.47 | 10.70 |
+
+### Faults the clients hit
+
+| Scenario | Send attempts | Failed attempts | Replies lost after commit (`duplicate: true`) | Failed after echo | Failed catch-up calls | WebSocket connects |
+|---|---|---|---|---|---|---|
+| clean | 10,000 | 0 | 0 | 0 | 0 | 80 |
+| 3g | 10,000 | 0 | 0 | 0 | 0 | 80 |
+| resets | 11,541 | 1,541 | 85 | 0 | 1,396 | 300 |
+| reply_dropped | 12,339 | 2,339 | 1,917 | 1,518 | 1,818 | 123 |
+| reply_cut | 12,492 | 2,492 | 2,015 | 313 | 1,540 | 97 |
+
+### Re-delivery before and after the `getDifference` fix
+
+| Scenario | Re-delivered updates before the fix | After the fix |
+|---|---|---|
+| clean | 68 (17 of 20 runs) | 0 (0 of 20 runs) |
+| 3g | 99 (20 of 20 runs) | 0 (0 of 20 runs) |
+| resets | 389 (20 of 20 runs) | 0 (0 of 20 runs) |
+| reply_dropped | 299 (20 of 20 runs) | 0 (0 of 20 runs) |
+| reply_cut | 386 (20 of 20 runs) | 0 (0 of 20 runs) |
+
+### Before the fix: environment
+
+- Label: `before-fix`
+- Git SHA: `1d1001412eab0f512401dd98c3890ab4521e516f` (working tree differs from this SHA; see notes)
+- Date: 2026-10-01T00:13:57.063Z
+- Machine: Mac17,9; Apple M5 Pro; 15 cores; 24 GB
+- Bun 1.3.11; PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0; Toxiproxy 2.12.0
+- Command (from `server/`): `bun run chaos/run.ts --runs 20 --messages 500 --label before-fix --out ../docs/results/sync-chaos-before.json`
+
+### Before the fix: correctness
+
+| Scenario | Runs | Messages | Lost | Server duplicates | Conflicting echoes | Device mismatches | pts mismatches | Unconverged runs | Fatal errors |
+|---|---|---|---|---|---|---|---|---|---|
+| clean | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 3g | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| resets | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| reply_dropped | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| reply_cut | 20 | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+### Before the fix: convergence
+
+| Scenario | Convergence p50 (s) | Convergence p99 = max of 20 (s) | Send phase p50 (s) |
+|---|---|---|---|
+| clean | 0.15 | 0.22 | 6.30 |
+| 3g | 0.58 | 1.30 | 43.78 |
+| resets | 0.20 | 0.93 | 8.84 |
+| reply_dropped | 2.18 | 3.89 | 48.46 |
+| reply_cut | 0.21 | 0.49 | 10.70 |
 
 ## How to read the fault columns
 
@@ -32,7 +125,8 @@ number here was copied by hand.
   exactly one message, which is the server's idempotent send doing its job.
 - **Failed after echo.** An HTTP send attempt that failed after the same device had already
   received its own message through sync. That is the precise condition in which the old iOS
-  store relabelled a delivered message as failed.
+  store relabelled a delivered message as failed. Under dropped replies it happened 1,518 times
+  in 10,000 messages, so on a lossy link the bug was not a corner case.
 - **Re-delivered updates.** Updates a device received whose pts it had already applied. Before
   the `getDifference` fix, the cursor and the event page came from two statements, so an event
   committing between them was delivered twice. Nothing was lost either way, because clients
@@ -81,9 +175,20 @@ Commit SHAs below are on this branch after its rebase onto `1d10014`.
    - The sweeps below were re-run from scratch on the rebased branch, with the same harness.
    - "Before" is therefore `1d10014`, main without the fix, not the pre-registered `a796a92`.
      The comparison stays like-for-like.
-4. **The machine was shared.** Other work ran on the same laptop. Load averages sampled once a
-   minute during the sweeps are in the JSON's companion log (see the build notes). Timings are
-   indicative, not a benchmark. The correctness counts do not depend on timing.
+4. **The machine was shared.** Other work ran on the same laptop.
+   - The 1-minute load average was sampled 56 times, once a minute, from 2026-09-30T23:55Z
+     (two thirds of the way through the "after" sweep) to 2026-10-01T01:17Z (the end of the
+     "before" sweep). It ranged from 1.45 to 3.74 on 15 cores.
+   - Timings are indicative, not a benchmark. The correctness counts do not depend on timing.
+5. **The `--out` path recorded in each JSON** pointed at a local scratch directory. It was
+   rewritten to the committed location (`../docs/results/…`) in both `environment.command` and
+   `environment.options.out`. No other field was changed.
+6. **Unidentified client errors.** A few failed attempts carry Bun error code `23`, which I did
+   not identify:
+   - "after", `reply_dropped`: 16 sends and 10 catch-up calls;
+   - "before", `3g`: 8 sends and 7 catch-up calls.
+
+   Each was retried like any other failure, and none affected the correctness counts.
 
 ## Reproduce
 
