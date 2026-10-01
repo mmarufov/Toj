@@ -89,7 +89,6 @@ h2 > span {
 .eyebrow,
 .mono,
 .card-index,
-.preview-label,
 .stage-coordinate {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 10px;
@@ -268,7 +267,8 @@ nav a {
     0 0 0 1px #56565a,
     0 36px 90px #0009;
   overflow: hidden;
-  transform: rotate(-5deg);
+  transform: translateY(var(--scroll-lift, 0px))
+    rotate(calc(-5deg + var(--scroll-tilt, 0deg)));
   position: relative;
 }
 .phone-status {
@@ -420,7 +420,7 @@ nav a {
   background: #191916;
   box-shadow: 0 12px 32px #0005;
   border-radius: 10px;
-  transform: rotate(2deg);
+  transform: translateY(var(--note-lift, 0px)) rotate(2deg);
 }
 .note-icon {
   color: var(--gold);
@@ -441,13 +441,6 @@ nav a {
   display: block;
   color: #9e9d96;
   font-size: 9px;
-}
-.preview-label {
-  position: absolute;
-  bottom: -10px;
-  color: #7c8088;
-  font-size: 8px;
-  letter-spacing: 0.09em;
 }
 .principle-strip {
   border-block: 1px solid var(--line);
@@ -1170,15 +1163,12 @@ details p a {
     transform-origin: center center;
   }
   .phone {
-    transform: rotate(-4deg);
+    transform: translateY(var(--scroll-lift, 0px))
+      rotate(calc(-4deg + var(--scroll-tilt, 0deg)));
   }
   .floating-note {
     right: -3px;
     bottom: 34px;
-  }
-  .preview-label {
-    bottom: -40px;
-    font-size: 7px;
   }
   .orbit-one {
     width: 345px;
@@ -1323,6 +1313,12 @@ details p a {
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  .phone {
+    transform: rotate(-5deg);
+  }
+  .floating-note {
+    transform: rotate(2deg);
+  }
   html {
     scroll-behavior: auto;
   }

@@ -59,6 +59,9 @@ reset.addEventListener("click", () => {
 });
 render("Start by going offline, then queue a sample message.");
 
+// Motion is optional: failed loading never hides content or disables the demo.
+import("./motion.js").then(({ setupMotion }) => setupMotion()).catch(() => {});
+
 // Optional typography enhancement. Native layout is the fallback if it fails.
 // Keep the demo functional independently of font loading and text measurement.
 async function enhanceTypography() {
