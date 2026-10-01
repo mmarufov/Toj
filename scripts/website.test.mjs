@@ -124,7 +124,7 @@ test("page preserves domain, accessibility baseline and truthful availability", 
   assert.equal([...html.matchAll(/<h1\b/g)].length, 1);
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /not a live backend test/);
-  assert.ok(html.replace(/\s+/g, ' ').includes('not end-to-end encrypted'));
+  assert.ok(html.replace(/\s+/g, " ").includes("not end-to-end encrypted"));
   assert.match(html, /isn't accepting public users/);
   assert.doesNotMatch(
     script,
