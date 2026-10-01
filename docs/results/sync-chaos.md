@@ -190,6 +190,15 @@ Commit SHAs below are on this branch after its rebase onto `1d10014`.
 
    Each was retried like any other failure, and none affected the correctness counts.
 
+## Where the measured commits live
+
+- **"Before" (`1d10014`)** is on main.
+- **"After" (`47120dc`)** is a commit on the branch of PR #52, which was squash-merged.
+  - It stays reachable through the pull request:
+    `git fetch origin pull/52/head && git checkout 47120dc`.
+  - Its `server/src` and `server/chaos` match the squash commit, except for changes that merged
+    to main afterwards (#51, outside the sync path).
+
 ## Reproduce
 
 ```sh
