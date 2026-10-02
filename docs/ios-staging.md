@@ -45,8 +45,8 @@ OTP flows are not part of this login-only pilot.
 The toggle appears whenever the configured endpoint's host is `api.tojchat.tech`. Exhausting the
 request budget answers with a full-day retry hint; the resend countdown caps that at one hour and
 switches to minutes, so the button is never parked for a day. If no code arrives, read the
-server's `auth.otp.telegram_failed` tag described in `server/STAGING.md` — the client's generic
-failure message deliberately says nothing about the provider.
+server's `auth.otp.telegram_failed` tag described in `server/STAGING.md`. The client's generic
+failure message leaves out the provider on purpose.
 
 The scheme does not pass its live endpoint to unit tests and has no Archive or
 Profile action. Use the existing **Toj** scheme for production workflows. Neither
