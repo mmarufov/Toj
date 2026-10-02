@@ -57,8 +57,8 @@ what keeps the app responsive.
 
 | Module | Contents | Notes |
 | --- | --- | --- |
-| `App/` | `TojApp`, `TojAppDelegate`, `ContentView`, `CloudRootView`, `CloudAppModel` | Entry point, root view, and the app-wide state the screens bind to |
-| `Core/Store/` | `CloudLocalStore`, `CloudProductivityStore`, `EncryptedProfilePhotoStore` | SQLite via GRDB, encrypted with SQLCipher |
+| `App/` | `TojApp`, `TojAppDelegate`, `ContentView`, `CloudRootView`, `CloudAppModel` | Entry point, root view, and the app-wide state the screens bind to. `CloudAppModel` is split by area across `App/CloudAppModel/` |
+| `Core/Store/` | `CloudLocalStore`, `CloudProductivityStore`, `EncryptedProfilePhotoStore` | SQLite via GRDB, encrypted with SQLCipher. `CloudLocalStore` is split by area across `Core/Store/CloudLocalStore/`, with migrations in `CloudLocalStore+Migrations.swift` |
 | `Core/Store/Search/` | `SearchIndexer`, `MessageSearchStore`, `SearchIndexSchema` | On-device FTS5 index |
 | `Core/Search/` | `SearchTextNormalizer`, `SearchUnicodeTables`, `PreparedSearchQuery` | Tokenizer tables are generated (see below) |
 | `Core/Cloud/` | `CloudAPI`, `CloudConfig`, `TokenStore`, `CloudMediaEngine`, `MediaPrefetchScheduler` | REST/WebSocket client, endpoint config, chunked media |
