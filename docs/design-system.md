@@ -36,6 +36,15 @@ quiet, premium, and immediately familiar to people who already use modern chat a
 - Green (`secure`) signals encryption / online / success only. Red signals destruction only.
 - Never encode meaning through color alone; never use thin text on black.
 
+## Logo
+
+- A solid off-white crown (`#F5F5F3`), tilted 6° counter-clockwise, on a charcoal tile
+  (`#17191B`). No color and no gradient.
+- It lives in three places that must change together: the app icon set
+  (`Toj/Assets.xcassets/AppIcon.appiconset`), `docs/assets/toj-symbol.png` and `.webp` (README and
+  website), and `TojMark` in `TojTheme.swift`, which draws the same geometry in code.
+- The tinted app icon is the crown in white on black; iOS applies the tint.
+
 ## Typography
 
 - Brand and large headings: Onest Semibold/Bold, relative to Dynamic Type styles.

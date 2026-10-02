@@ -101,37 +101,56 @@ extension View {
     }
 }
 
+/// The Toj logo: an off-white crown, tilted 6°, on a charcoal tile. Matches the app icon.
 struct TojMark: View {
     var size: CGFloat = 72
 
+    private static let tile = Color(hex: 0x17191B)
+    private static let crown = Color(hex: 0xF5F5F3)
+
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.30, style: .continuous)
-                .fill(TojTheme.raised)
-            RoundedRectangle(cornerRadius: size * 0.30, style: .continuous)
-                .stroke(TojTheme.gold.opacity(0.28), lineWidth: 1)
+            RoundedRectangle(cornerRadius: size * 0.2237, style: .continuous)
+                .fill(Self.tile)
+            RoundedRectangle(cornerRadius: size * 0.2237, style: .continuous)
+                .stroke(TojTheme.hairline, lineWidth: 1)
             CrownShape()
-                .stroke(TojTheme.gold, style: StrokeStyle(lineWidth: max(1.5, size * 0.026), lineCap: .round, lineJoin: .round))
-                .padding(size * 0.24)
+                .fill(Self.crown)
+                .frame(width: size * 0.44, height: size * 0.44 / CrownShape.aspectRatio)
+                .rotationEffect(.degrees(-6))
+                .offset(y: -size * 0.012)
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
 }
 
-private struct CrownShape: Shape {
+/// The logo's crown, traced from its 1024-point source grid. Draw it in a frame whose
+/// width-to-height ratio is `aspectRatio`; corner radii are fractions of the width.
+private nonisolated struct CrownShape: Shape {
+    static let aspectRatio: CGFloat = 524.0 / 388.0
+
+    private static let corners: [(x: CGFloat, y: CGFloat, radius: CGFloat)] = [
+        (0.0878, 1.0, 0.0611),
+        (0.0, 0.1753, 0.0684),
+        (0.2824, 0.5258, 0.0305),
+        (0.5, 0.0, 0.0802),
+        (0.7176, 0.5258, 0.0305),
+        (1.0, 0.1753, 0.0684),
+        (0.9122, 1.0, 0.0611),
+    ]
+
     func path(in rect: CGRect) -> Path {
+        func point(_ index: Int) -> CGPoint {
+            let corner = Self.corners[index % Self.corners.count]
+            return CGPoint(x: rect.minX + corner.x * rect.width, y: rect.minY + corner.y * rect.height)
+        }
         var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.minY + rect.height * 0.34))
-        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.24, y: rect.maxY * 0.58))
-        path.addLine(to: CGPoint(x: rect.midX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.76, y: rect.maxY * 0.58))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + rect.height * 0.34))
-        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.10, y: rect.maxY * 0.84))
-        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.10, y: rect.maxY * 0.84))
+        path.move(to: CGPoint(x: rect.midX, y: rect.maxY))
+        for index in Self.corners.indices {
+            path.addArc(tangent1End: point(index), tangent2End: point(index + 1), radius: Self.corners[index].radius * rect.width)
+        }
         path.closeSubpath()
-        path.move(to: CGPoint(x: rect.minX + rect.width * 0.14, y: rect.maxY))
-        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.14, y: rect.maxY))
         return path
     }
 }
