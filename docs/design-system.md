@@ -1,17 +1,17 @@
-# Design System — Toj
+# Toj design system
 
 ## Product
 
-Toj is a private, Tajik-first messenger for iPhone and iPad. It should feel fast,
-quiet, premium, and immediately familiar to people who already use modern chat apps.
+Toj is a messenger for iPhone and iPad. It should feel fast and quiet, and familiar to people
+who already use modern chat apps.
 
 ## Visual Direction
 
-- Black-only interface with matte conversation content and floating Liquid Glass controls —
-  premium, minimal, and sleek in the spirit of X and Grok, and unmistakably Toj.
-- We borrow how Telegram *executes* iOS 26 Liquid Glass (floating chrome, well-measured pressable
-  controls, inset grouped cards, folder pills, detached search) — never its palette.
-- Modern Tajik identity is expressed through the restrained crown mark, not flag stripes or ornament.
+- Black-only interface with matte conversation content and floating Liquid Glass controls, in
+  the minimal style of X and Grok.
+- We follow Telegram's use of iOS 26 Liquid Glass (floating chrome, well-measured pressable
+  controls, inset grouped cards, folder pills, detached search) with our own palette.
+- The crown logo carries the brand. The interface uses no flag colors or ornament.
 
 ## Color
 
@@ -28,11 +28,11 @@ quiet, premium, and immediately familiar to people who already use modern chat a
 
 ## Accent
 
-- Gold is Toj's **signature interactive accent** — the role Telegram gives blue. Apply it with
-  precision to high-intent and active moments: the send button, primary CTAs, active unread badges,
-  and selected folder/search pills. On gold, foreground is `canvas` (black).
+- Gold is Toj's **interactive accent**, the role blue plays in Telegram. Use it for high-intent and
+  active elements: the send button, primary CTAs, active unread badges, and selected folder/search
+  pills. On gold, foreground is `canvas` (black).
 - White (`text`) stays the neutral accent for high-frequency/secondary controls (back, compose,
-  attach, chevrons) so the interface reads clean, not gaudy.
+  attach, chevrons), which keeps the interface calm.
 - Green (`secure`) signals encryption / online / success only. Red signals destruction only.
 - Never encode meaning through color alone; never use thin text on black.
 
@@ -67,12 +67,12 @@ quiet, premium, and immediately familiar to people who already use modern chat a
   chrome), `TojSectionCard` + `TojIconTile` (grouped rows), `TojPillFilter` (segmented pills), and
   `TojPressableStyle` / `.buttonStyle(.tojPressable)` (reactive press feedback).
 - Grouped-row icon tiles are premium/monochrome by default; use a semantic tint only where it carries
-  meaning (green privacy, gold premium, red destructive), never a rainbow.
+  meaning (green privacy, gold premium, red destructive).
 - Everything interactive is pressable: a gentle press-scale + dim, replaced by opacity under Reduce Motion.
 
 ## Motion
 
-- Micro transitions: 140–180 ms; screen/state transitions: 180–220 ms.
+- Micro transitions: 140-180 ms; screen/state transitions: 180-220 ms.
 - Prefer native navigation, glass morphing, opacity, and short snappy springs.
 - Reduce Motion replaces movement and scale with opacity.
 - Reduce Transparency replaces glass with an opaque raised surface.

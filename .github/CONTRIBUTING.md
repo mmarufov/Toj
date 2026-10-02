@@ -1,23 +1,21 @@
 # Contributing to Toj
 
-Thanks for looking. Toj is a product codebase that is developed in the open so
-that the way it handles people's messages can be inspected rather than taken on
-trust.
+Thanks for looking. Toj's code is public so that anyone can check how it
+handles people's messages.
 
 ## What we are looking for
 
 | | |
 | --- | --- |
-| **Security reports** | Very welcome. Follow the [security policy](SECURITY.md) — privately, not as an issue. |
+| **Security reports** | Very welcome. Follow the [security policy](SECURITY.md) and report privately. |
 | **Bug reports** | Welcome. Open an issue with the steps you took and what happened instead. |
-| **Correctness and design feedback** | Welcome. Open an issue; a good argument about the data model or the network behaviour is genuinely useful. |
+| **Correctness and design feedback** | Welcome. Open an issue. Arguments about the data model or network behaviour are useful. |
 | **Unsolicited pull requests** | Generally not merged. See below. |
 
-Toj is pre-launch, and the areas that look most inviting to contribute to —
-crypto, sync, transport — are the ones where an unreviewed change is most
-expensive. We would rather discuss a problem in an issue first and then decide
-who writes the fix. If you want to send code anyway, open an issue first so the
-work is not wasted.
+Toj is pre-launch, and the areas that look most inviting (crypto, sync,
+transport) are the ones where an unreviewed change costs the most. We prefer to
+discuss a problem in an issue first and then decide who writes the fix. If you
+want to send code anyway, open an issue first so the work isn't wasted.
 
 ## Running the project
 
@@ -35,8 +33,8 @@ cd server && bun install && createdb toj_dev && bun run migrate
 ```
 
 The backend suite needs its own migrated `toj_test` database and runs one file
-at a time — a single parallel `bun test` is not reliable. The exact commands are
-in the [README](../README.md#tests).
+at a time, because a single parallel `bun test` is not reliable. The exact
+commands are in the [README](../README.md#run-the-tests).
 
 ## Engineering conventions
 
@@ -55,25 +53,25 @@ immediately and is confirmed later.
 rest; [libsignal](https://github.com/signalapp/libsignal) for end-to-end.
 
 **Treat all message content as secret.** Never log plaintext, keys, or full
-phone numbers. Be deliberate about what crosses to the server at all.
+phone numbers. Be careful about what is sent to the server.
 
 **Row absence is load-bearing.** Any table whose *missing* row changes a
 security or rate-limit decision must carry a comment naming that dependency and
-a test pinning both directions — row present and row absent. This includes TTL
+a test pinning both directions: row present and row absent. This includes TTL
 constants: when you set an expiry, state what happens to a client that comes
-back *after* it on a 100–500 kbps congested link. If that outcome is
+back *after* it on a 100-500 kbps congested link. If that outcome is
 destructive, the expiry is wrong.
 
 **Match the surrounding style.** Keep views small and push logic out of views
 into testable types.
 
-**Check the docs, do not guess the API.** SwiftUI 26, LibSignalClient and
-LiveKit all move; verify against current documentation rather than memory.
+**Check the docs before using an API.** SwiftUI 26, LibSignalClient and
+LiveKit change often, so check the current documentation.
 
 ## Tests
 
 New behaviour needs tests. New test files must be registered with the Xcode
-project — `TojTests` is a classic group and does not pick files up
+project, because `TojTests` is a classic group and does not pick files up
 automatically:
 
 ```bash
@@ -89,20 +87,19 @@ automatically.
 If a maintainer has asked you for a PR:
 
 - Keep it to one reviewable change.
-- Make sure all three CI jobs pass — backend, iOS, and repository policy.
+- Make sure the CI jobs pass: backend, iOS, sync chaos smoke and repository policy.
 - GitHub Actions must be referenced by full commit SHA. CI fails the build
   otherwise.
 - Write the description for someone who was not in the conversation that
   produced the change.
 
 **Get it right before pushing.** This repository is public. A force-push does
-not remove the old commit — GitHub keeps the object and publishes the previous
-SHA in the pull request timeline, and editing a description only hides the
-earlier revision behind an "edited" marker. Anything sensitive enough that you
-would want to amend it out is sensitive enough that amending will not be enough.
+not remove the old commit: GitHub keeps the object and shows the previous SHA in
+the pull request timeline. Editing a description only hides the earlier
+revision behind an "edited" marker. If something should never have been pushed,
+amending it will not remove it.
 
 ## Code of conduct
 
-Be straightforward and civil. Argue with the code, not the person. Maintainers
-may close or block anything that turns the project into an unpleasant place to
-work.
+Be straightforward and civil, and keep criticism about the code. Maintainers
+may close or block anything that makes the project an unpleasant place to work.
