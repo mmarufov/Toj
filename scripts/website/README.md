@@ -1,6 +1,6 @@
 # Toj website
 
-Read [the writing guide](../../docs/AGENTS.md) before editing copy. The website remains static GitHub Pages, published from `main:/docs`. It never contacts the messenger backend.
+Read [the writing guide](AGENTS.md) before editing copy. The website remains static GitHub Pages, published from `main:/docs`. It never contacts the messenger backend.
 
 ## Local workflow
 
