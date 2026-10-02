@@ -90,7 +90,7 @@ jobs:
         run: |
           pod install
           grep -Fq 'TojWebRTC' Podfile.lock
-          plutil -lint Toj-Info.plist Toj/Toj.entitlements \
+          plutil -lint Toj/Info.plist Toj/Toj.entitlements \
             Toj/Toj-MultitaskingCamera.entitlements
 
           xcodebuild build \

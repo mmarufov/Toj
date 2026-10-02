@@ -19,6 +19,17 @@ LOCATION_TYPES = {
     "NSPrivacyCollectedDataTypeCoarseLocation",
 }
 LOCALIZATION_CATALOG = ROOT / "Toj" / "Localizable.xcstrings"
+# Folders holding the cloud-chat surfaces whose wording verify_cloud_chat_claims checks.
+CLOUD_CHAT_SOURCE_DIRS = (
+    "Toj/App",
+    "Toj/Features/Messaging",
+    "Toj/Features/Contacts",
+    "Toj/Features/Groups",
+    "Toj/Features/Profile",
+    "Toj/Features/Settings",
+    "Toj/Features/Demo",
+    "Toj/UITestSupport",
+)
 
 
 def inventory_entries() -> dict[str, bool]:
@@ -77,7 +88,7 @@ def source_uses_location() -> list[str]:
         re.compile(r"NSLocation(?:WhenInUse|Always)UsageDescription"),
     )
     hits: list[str] = []
-    for relative in ("Toj", "Toj-Info.plist", "server/src"):
+    for relative in ("Toj", "server/src"):
         target = ROOT / relative
         files = [target] if target.is_file() else target.rglob("*")
         for path in files:
@@ -94,21 +105,28 @@ def verify_cloud_chat_claims() -> None:
         "Private conversation": "cloud chats are not end-to-end encrypted",
         "Connection: Protected": "connection state is not a message-privacy guarantee",
     }
-    swift_sources = list((ROOT / "Toj" / "Features" / "Cloud").rglob("*.swift"))
+    missing_dirs = [relative for relative in CLOUD_CHAT_SOURCE_DIRS if not (ROOT / relative).is_dir()]
+    if missing_dirs:
+        raise SystemExit("cloud-chat source folders moved or missing: " + ", ".join(missing_dirs))
+    swift_sources = [
+        path for relative in CLOUD_CHAT_SOURCE_DIRS for path in (ROOT / relative).rglob("*.swift")
+    ]
+    if not swift_sources:
+        raise SystemExit("no cloud-chat Swift sources found to check")
     for claim, reason in forbidden.items():
         hits = [str(path.relative_to(ROOT)) for path in swift_sources if claim in path.read_text()]
         if hits:
             raise SystemExit(f"misleading cloud-chat claim {claim!r} ({reason}): {', '.join(hits)}")
 
     for relative in (
-        "Toj/Features/Cloud/ConversationExperience.swift",
-        "Toj/Features/Cloud/RichDemoSurfaces.swift",
-        "Toj/Features/Cloud/GroupCreationView.swift",
+        "Toj/Features/Messaging/ConversationExperience.swift",
+        "Toj/Features/Demo/RichDemoSurfaces.swift",
+        "Toj/Features/Groups/GroupCreationView.swift",
     ):
         if 'systemImage: "lock.fill"' in (ROOT / relative).read_text():
             raise SystemExit(f"{relative}: cloud-message surfaces must not use a lock security claim")
 
-    presentation = (ROOT / "Toj" / "Features" / "Cloud" / "MessagingPresentation.swift").read_text()
+    presentation = (ROOT / "Toj" / "Features" / "Messaging" / "MessagingPresentation.swift").read_text()
     required = ("cloud.fill", "not end-to-end encrypted", "Cloud encrypted")
     missing = [value for value in required if value not in presentation]
     if missing:

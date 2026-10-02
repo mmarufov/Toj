@@ -131,13 +131,14 @@ networking run off the main thread and can be cancelled.
 
 | Module | Responsibility |
 | --- | --- |
+| `App/` | App entry point, root view, and `CloudAppModel`, the shared state the screens bind to |
 | `Core/Store/` | Encrypted local database (GRDB + SQLCipher) and an on-device FTS5 search index |
 | `Core/Sync/` | Outbox, multi-device sync, presence, draft sync, network monitoring |
 | `Core/Cloud/` | REST/WebSocket client, endpoint config, token storage, chunked media |
 | `Core/Transport/` | Connection lifecycle, reconnection and backoff |
 | `Core/Calls/`, `Core/GroupCalls/` | WebRTC 1:1 calls and LiveKit SFU group calls with frame encryption |
 | `Core/Crypto/` | libsignal engine for the planned Secret Chats |
-| `Features/` | Screens for conversations, contacts, settings, calls and search |
+| `Features/` | Screens by feature: messaging and search, contacts, groups, profile, settings, calls, group calls |
 | `DesignSystem/` | Shared theme components (see the [design system](docs/design-system.md)) |
 
 ### Backend ([`server/`](server/))
