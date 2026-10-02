@@ -1,73 +1,69 @@
 <div align="center">
 
-<img src="docs/assets/toj-symbol.png" alt="" width="84" height="84" />
+<img src="docs/assets/toj-symbol.png" alt="Toj" width="84" height="84" />
 
 # Toj
 
-**Made for the signal you actually have.**
+**A cloud messenger engineered for the network Tajikistan actually has.**
 
-A cloud messenger built for Tajikistan's network — offline-first on the device,
-encrypted in transit and at rest, and engineered to stay responsive on a
-congested 3G link.
+Offline-first on the device · encrypted in transit and at rest · sync proven under injected network faults
 
 [![CI](https://github.com/mmarufov/Toj/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mmarufov/Toj/actions/workflows/ci.yml)
-[![Platform](https://img.shields.io/badge/platform-iOS%2026.0%2B-000000?logo=apple&logoColor=white)](#building)
+[![Platform](https://img.shields.io/badge/iOS-26.0%2B-000000?logo=apple&logoColor=white)](#getting-started)
+[![Swift](https://img.shields.io/badge/Swift-SwiftUI-000000?logo=swift&logoColor=white)](Toj/)
 [![Backend](https://img.shields.io/badge/backend-Bun%20%2B%20PostgreSQL-000000?logo=bun&logoColor=white)](server/)
-[![Status](https://img.shields.io/badge/status-pre--launch-D6A936)](#project-status)
+[![Status](https://img.shields.io/badge/status-pre--launch-D6A936)](#status-and-roadmap)
 
-[Website](https://tojchat.tech) · [Documentation](docs/) · [Changelog](CHANGELOG.md) · [Architecture](#architecture)
+[Website](https://tojchat.tech) · [Architecture](docs/architecture.md) · [Engineering results](docs/results/) · [Changelog](CHANGELOG.md)
 
 </div>
 
 ---
 
-## Project status
+Toj is a native iOS messenger — 1:1 and group chat, media, multi-device sync,
+voice and video calls — designed from the first commit around one fact: in
+Tajikistan, the link between the phone and the server is slow, congested and
+unreliable. Most international traffic leaves the country through a single
+narrow gateway, so every round trip to a distant data center is expensive.
 
-> **Pre-launch. Toj is not released and is not accepting users.**
->
-> The client and backend are feature-complete and run against a private staging
-> deployment. What stands between this repository and a public beta is
-> **infrastructure, provisioning and field evidence — not features.** Calls are
-> written and tested but *disabled in every deployed configuration*; the backend
-> refuses to boot if their flags are set, because the release gates behind them
-> are not met.
+Toj's answer is to make the network **stop mattering to the user**. The app
+renders from an encrypted on-device database, sends optimistically, and
+reconciles in the background with a sync protocol that has been driven through
+50,000 messages of injected packet loss, connection resets and dropped replies
+without losing or duplicating a single one.
 
-| Area | State |
+## Highlights
+
+- **Instant on a 3G link.** The encrypted local store is the UI's source of
+  truth. Views never wait on the network; a sent message appears immediately
+  and is confirmed later. The design target is 100–500 kbps with jitter, loss
+  and sudden disconnects.
+- **Exactly-once delivery over an unreliable link.** Sends are idempotent by
+  client message ID, and catch-up is ordered by a per-account sequence number,
+  so a lost reply can never become a lost — or doubled — message.
+- **Encrypted at rest by default.** Envelope encryption with AES-GCM and
+  per-account wrapped keys, fenced key retirement, and versioned blind indexes
+  so the server can look records up without storing what it is looking up.
+- **Multi-device as a core feature.** Telegram-style cloud chats: history
+  persists server-side, syncs across devices, and restores on a new login.
+- **Unremarkable on the wire.** Standard TLS + WebSocket. No bespoke protocol,
+  because a bespoke protocol is a fingerprint.
+- **Verified, not asserted.** Pre-registered experiments with committed raw
+  data, release gates enforced in code, and a fully pinned, attested supply
+  chain.
+
+## By the numbers
+
+| | |
 | --- | --- |
-| 1:1 and group messaging, media, search, sync | Built, tested, running on staging |
-| Voice and video calls | Code complete; **disabled** — no TURN server deployed, release gates open |
-| Group calls (LiveKit SFU) | Code complete; **disabled** |
-| Push notifications | **Not provisioned** — needs an Apple Developer account and APNs keys |
-| Secret Chats (true end-to-end) | **Not built.** The libsignal engine is in place; the feature is not |
-| Validation on a real Tajik network | **Not done.** Blocked on device provisioning |
-| In-country hosting | Planned for launch; staging runs in Frankfurt |
+| **~1,000** automated tests | 538 iOS · 455 backend, run on every pull request |
+| **50,000** messages under fault injection | **0** lost · **0** duplicated · **0** device mismatches across 5 fault profiles |
+| **97 → 0** of 100 runs | Sync re-delivery race found by the fault harness, fixed, and re-measured |
+| **4.01 s** | Worst-case p99 multi-device convergence, with server replies deliberately dropped |
+| **4** CI jobs on every pull request | Backend on live PostgreSQL, signed iOS suite on a simulator, sync chaos smoke, repository policy |
+| **100%** | GitHub Actions pinned to a full commit SHA — CI fails otherwise |
 
-Current version: **`0.4.0.1`** — see the [changelog](CHANGELOG.md).
-
----
-
-## Why Toj exists
-
-Tajikistan routes effectively all international traffic through a single
-state-controlled gateway, and that gateway throttles the messengers people
-actually use. Telegram feels slow there for two compounding reasons: it is
-targeted for throttling, *and* its servers are far away, so every packet makes
-the round trip through a congested chokepoint.
-
-That single fact drives every engineering decision in this repository:
-
-1. **The network is assumed hostile.** The design target is a 3G worst case —
-   100–500 kbps, high latency, jitter, packet loss, and sudden disconnection.
-   Nothing may assume connectivity. Everything retries, resumes and degrades.
-2. **Domestic traffic should stay domestic.** Keeping traffic inside the country
-   means it never crosses the gateway at all. The service endpoint is a single
-   swappable configuration value, so moving the backend in-country is a
-   migration rather than a redesign.
-
-The product answer is a **Telegram-style cloud messenger**: messages persist
-server-side and sync across a user's devices, because that convenience is what
-makes a messenger switchable. The privacy answer is *honest defaults plus an
-opt-in maximum* — see [Security model](#security-model).
+Methodology, environment and raw JSON for every figure: [sync under injected network faults](docs/results/sync-chaos.md).
 
 ---
 
@@ -87,7 +83,7 @@ flowchart LR
         Media["Media engine<br/>chunked · resumable"]
     end
 
-    subgraph edge["Transport — looks like ordinary HTTPS"]
+    subgraph edge["Transport — ordinary HTTPS"]
         WS["TLS + WebSocket<br/>REST /v1"]
     end
 
@@ -111,70 +107,132 @@ flowchart LR
     style backend fill:#08090B,stroke:#2A2E36,color:#9096A1
 ```
 
-**The UI renders from the local store, never from the network.** A sent message
-appears immediately and is confirmed later; a dropped connection is an expected
-state rather than an error path. This is the single rule that makes the app feel
-fast on a link where the round trip does not.
+### How a message moves
 
-### Client — `Toj/`
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Sender device
+    participant S as Server
+    participant B as Other devices
 
-Native Swift and SwiftUI targeting iOS 26, using the Liquid Glass design
-language. All I/O, crypto and networking are asynchronous and cancellable;
-the main thread never blocks.
+    A->>A: Save message + outbox entry atomically
+    Note over A: UI shows the message instantly
+    A->>S: send(clientMsgId)
+    S->>S: Idempotent insert · encrypt · sequence
+    S--xA: Reply lost on a bad link
+    A->>S: Retry send(clientMsgId)
+    S-->>A: Same message — stored once
+    S-)B: WebSocket hint
+    B->>S: getDifference(since)
+    S-->>B: Ordered updates, paged
+    Note over A,B: Every device converges on the same history
+```
 
-| Path | Responsibility |
+### Client — [`Toj/`](Toj/)
+
+Native Swift and SwiftUI on iOS 26 with the Liquid Glass design language. All
+I/O, cryptography and networking are asynchronous and cancellable; the main
+thread never blocks.
+
+| Module | Responsibility |
 | --- | --- |
-| `Toj/Core/Store/` | Encrypted local database (GRDB + SQLCipher) and the FTS5 search index — the UI's source of truth |
-| `Toj/Core/Cloud/` | REST/WebSocket client, endpoint config, token storage, media transfer |
-| `Toj/Core/Sync/` | Outbox, delivery/ack reconciliation, background wake-up |
-| `Toj/Core/Transport/` | Connection management, reconnection and backoff |
-| `Toj/Core/Calls/`, `Toj/Core/GroupCalls/` | WebRTC 1:1 calling and LiveKit SFU group calls |
-| `Toj/Core/Crypto/` | libsignal engine, retained for Secret Chats |
-| `Toj/Features/` | Feature UI — conversations, contacts, settings, calls, search |
-| `Toj/DesignSystem/` | Shared theme primitives ([design system](docs/design-system.md)) |
+| `Core/Store/` | Encrypted local database (GRDB + SQLCipher) and an on-device FTS5 search index |
+| `Core/Sync/` | Outbox, multi-device convergence, presence, draft sync, network monitoring |
+| `Core/Cloud/` | REST/WebSocket client, swappable endpoint config, token storage, chunked media |
+| `Core/Transport/` | Connection lifecycle, reconnection and backoff |
+| `Core/Calls/`, `Core/GroupCalls/` | WebRTC 1:1 calls and LiveKit SFU group calls with frame encryption |
+| `Core/Crypto/` | libsignal engine for end-to-end Secret Chats |
+| `Features/` | Conversations, contacts, settings, calls, search — logic in testable types, not views |
+| `DesignSystem/` | Shared theme primitives — see the [design system](docs/design-system.md) |
 
-### Backend — `server/`
+### Backend — [`server/`](server/)
 
-Bun + TypeScript over PostgreSQL. This is the real backend, not a stand-in: it
-persists messages encrypted at rest, syncs devices, and handles delivery, acks,
-presence and fan-out over TLS + WebSocket. Media chunks live encrypted in
-PostgreSQL rather than object storage.
+Bun + TypeScript over PostgreSQL: authentication, messaging, groups, media,
+presence, delivery, acks and fan-out over TLS + WebSocket.
 
-Notable pieces: envelope encryption with wrapped per-account keys
-(`envelope-crypto.ts`), versioned blind indexes for lookup without plaintext
-(`blind-index.ts`), expand/contract SQL migrations (`schema-*.sql`), and
-multi-channel OTP delivery over Telegram, SMS and WhatsApp (`*-otp.ts`).
+| Concern | Approach |
+| --- | --- |
+| **Encryption at rest** | Per-record data keys sealed with AES-GCM, wrapped by per-account keys; key material cached briefly and zeroized; retirement fenced so revocation cannot race an in-flight read (`envelope-crypto.ts`) |
+| **Lookup without plaintext** | Versioned, domain-separated HMAC blind indexes — a digest from one context can never be replayed as a lookup in another, and the key rotates without a flag day (`blind-index.ts`) |
+| **Zero-downtime schema changes** | Expand/contract migrations, with lock-free concurrent index builds in their own files (`schema-*-expand.sql`, `-contract.sql`, `-concurrent.sql`) |
+| **Identity** | Phone number + OTP, delivered over multiple channels with explainable, pre-registered fraud rules (`otp-risk.ts`) |
+| **Storage** | Media chunks live encrypted in PostgreSQL — one less service to reach across the gateway, one less place for plaintext to sit |
 
-The transport is deliberately ordinary. Toj does **not** implement a custom wire
-protocol — looking exactly like normal HTTPS is the censorship-resistance
-strategy, not an accident.
+The deep version, including transport and calls: [docs/architecture.md](docs/architecture.md).
+
+---
+
+## Engineering approach
+
+**Offline-first is the anti-lag rule.** On a link where a round trip can take
+half a second on a good day, the only way to feel fast is to never wait for
+one. Every interaction resolves against local data first.
+
+**Faults are measured, not imagined.** A [Toxiproxy harness](server/chaos/)
+drives headless clients through the real server and sync protocol under five
+fault profiles — clean, 3G, connection resets, dropped replies and truncated
+replies. It surfaced a cursor race that re-delivered updates in 97 of 100 runs;
+after the fix, zero. A mild version runs in CI on every pull request.
+
+**Experiments are pre-registered.** Hypotheses, metrics and thresholds are
+committed *before* the first measurement run, and results are rendered from
+committed raw data rather than copied by hand. The
+[OTP fraud evaluation](docs/results/otp-fraud-replay.md) tuned on one set of
+seeds and reported once on held-out seeds — including the attack shape the
+rules do not yet handle well.
+
+**Release gates are enforced in code.** Features that are built but not yet
+cleared for rollout are not behind a toggle someone can flip by accident: the
+server refuses to start if their flags are set before their
+[release gates](docs/releases/) are met.
+
+**The supply chain is pinned.** The WebRTC XCFramework is a reproducible build
+published as an attested artifact and verified by checksum and provenance;
+LibSignalClient is pinned by tag *and* prebuilt-FFI checksum; SwiftPM and
+CocoaPods pins are asserted against reviewed revisions in CI.
 
 ---
 
 ## Security model
 
-Toj is a **secure cloud messenger, not a zero-access one**, and the README says
-so plainly because marketing it otherwise would be the dangerous lie.
+**Default (cloud) chats** are encrypted in transit and encrypted at rest using
+standard AEAD envelope encryption with server-held keys — never stored as
+plaintext. Server-held keys are what make cross-device sync, history restore
+and new-device login work. Access is gated and logged.
 
-**Default (cloud) chats.** Messages are encrypted in transit and encrypted at
-rest with server-held keys, using standard AEAD envelope encryption. They are
-never stored as plaintext on disk. Because the server holds the keys, it *can*
-decrypt — that is what makes cross-device sync, history restore and a new-device
-login work. Access is gated and logged.
-
-**Secret Chats.** The honest private mode: true end-to-end encryption via
+**Secret Chats** are the opt-in private mode: true end-to-end encryption via
 [libsignal](https://github.com/signalapp/libsignal), where the server cannot
-read content at all. Single-device by design. **This feature is not built yet** —
-the crypto engine is in the repository, the user-facing feature is not.
+read content at all. Single-device by design.
 
-**Ground rules.** No hand-rolled cryptography: standard AEAD and KMS primitives
-at rest, libsignal for end-to-end. Plaintext, keys and full phone numbers are
-never logged. Every dependency is pinned to an immutable revision, and CI
-[fails the build](.github/workflows/ci.yml) if a GitHub Action is referenced by
-anything other than a full commit SHA.
+**Ground rules.** No hand-rolled cryptography. Plaintext, keys and full phone
+numbers are never logged. Collected data categories are machine-verified
+against the app's privacy manifest in CI ([privacy data map](docs/privacy-data-map.md)).
 
-To report a vulnerability, see the [security policy](.github/SECURITY.md).
-Please do not open a public issue.
+To report a vulnerability, follow the [security policy](.github/SECURITY.md) —
+please do not open a public issue.
+
+---
+
+## Status and roadmap
+
+Toj is **pre-launch**. The client and backend are feature-complete and running
+against a private staging deployment; the remaining work is provisioning,
+infrastructure and field validation.
+
+| Capability | State |
+| --- | --- |
+| 1:1 and group messaging, media, search, multi-device sync | ✅ Running on staging |
+| Phone + OTP accounts, sessions, two-step verification | ✅ Running on staging |
+| Voice and video calls (1:1), group calls | 🟡 Implemented and tested · rollout gated on TURN capacity and device release gates |
+| Push notifications | 🟡 Implemented · awaiting APNs provisioning |
+| Field validation on Tajik mobile networks | ⏭ Next milestone |
+| In-country hosting | ⏭ Launch milestone — the endpoint is a single swappable config value |
+| Secret Chats | ⏭ Planned — libsignal engine already integrated |
+| Android | ⏭ Planned |
+
+Deliberately out of scope until after launch: channels, bots, payments and
+server-side search.
 
 ---
 
@@ -185,73 +243,51 @@ Please do not open a public issue.
 | Requirement | Version |
 | --- | --- |
 | macOS with Xcode | 26.5+ (iOS 26 simulator runtime) |
-| CocoaPods | any recent |
+| CocoaPods | recent |
 | [Bun](https://bun.sh) | 1.3.11 |
 | PostgreSQL | 17.x |
 
-### Building
-
-Always open the **workspace**, not the `.xcodeproj` — the project uses CocoaPods.
+### Build the iOS app
 
 ```bash
 git clone https://github.com/mmarufov/Toj.git
 cd Toj
 
-# Fetch the pinned, attested WebRTC XCFramework (verifies checksum + provenance)
-scripts/fetch-webrtc-xcframework.sh
-
+scripts/fetch-webrtc-xcframework.sh   # pinned WebRTC build, checksum + provenance verified
 pod install
-open Toj.xcworkspace          # scheme: Toj
+open Toj.xcworkspace                  # always the workspace, not the .xcodeproj
 ```
 
-Schemes: **`Toj`** builds and runs the app against a local relay and runs
-`TojTests`. **`Toj Staging`** runs the same Debug app against the staging
-backend — see [iOS staging](docs/ios-staging.md).
+Scheme **`Toj`** runs the app against a local backend and runs `TojTests`.
+Scheme **`Toj Staging`** runs it against staging — see [iOS staging](docs/ios-staging.md).
 
-### Running the backend locally
+### Run the backend
 
 ```bash
 cd server
 bun install
-
-createdb toj_dev
-bun run migrate
-
-PORT=8787 bun run server.ts   # simulators reach it on 127.0.0.1
+createdb toj_dev && bun run migrate
+PORT=8787 bun run server.ts           # simulators reach it on 127.0.0.1
 ```
 
-### Tests
+### Run the tests
 
 ```bash
-# iOS — ~537 tests
+# iOS
 xcodebuild -workspace Toj.xcworkspace -scheme Toj \
   -destination 'platform=iOS Simulator,OS=26.5,name=iPhone 17 Pro' test
-```
 
-The backend suite runs against a real PostgreSQL, in a database of its own that
-has to be migrated separately:
-
-```bash
+# Backend — against a real PostgreSQL, one file at a time (the suites share a database)
 cd server
 createdb toj_test
-DATABASE_URL=postgres://localhost:5432/toj_test bun run migrate
-```
-
-Then run it **one file at a time**. The tests share a database, so a single
-parallel `bun test` is not reliable — this loop is what CI does:
-
-```bash
+export DATABASE_URL=postgres://localhost:5432/toj_test
+bun run migrate
 find . -path ./node_modules -prune -o -name '*.test.ts' -print | sort \
-  | while read -r file; do bun test --timeout 15000 "$file" || break; done
+  | while read -r f; do bun test --timeout 15000 "$f" || break; done
 ```
 
-If a run leaves the schema stale, drop and recreate `toj_test` and migrate again
-rather than debugging the leftovers.
-
-CI runs three jobs on every pull request: the backend suite against a live
-PostgreSQL service, a signed iOS build and test run on a real simulator with the
-genuine WebRTC binary, and a repository-policy job that verifies the privacy
-manifest, dependency pins, coturn peer policy and action pinning.
+To reproduce the fault-injection results, see
+[Reproduce](docs/results/sync-chaos.md#reproduce).
 
 ---
 
@@ -259,71 +295,42 @@ manifest, dependency pins, coturn peer policy and action pinning.
 
 ```
 Toj/                      iOS client — Swift, SwiftUI
-TojTests/                 iOS unit tests
-TojUITests/               iOS UI tests
+TojTests/, TojUITests/    iOS unit and UI tests
 TojBroadcastExtension/    ReplayKit screen-share extension
 server/                   Backend — Bun, TypeScript, PostgreSQL
+server/chaos/             Network fault-injection harness
 infra/coturn/             TURN relay deployment template
 scripts/                  Build, verification and codegen scripts
-docs/                     Documentation and the tojchat.tech site
-Dependencies/TojWebRTC/   Pinned WebRTC XCFramework (fetched, not committed)
+docs/                     Documentation, results, and the tojchat.tech site
 ```
-
----
 
 ## Documentation
 
-Full index: [`docs/`](docs/).
-
 | Document | What it covers |
 | --- | --- |
-| [Architecture](docs/architecture.md) | The deep version of the section above — data model, transport, encryption at rest, verification, known gaps |
+| [Architecture](docs/architecture.md) | Data model, transport, encryption at rest, calls, verification |
+| [Engineering results](docs/results/) | Pre-registered experiments with committed raw data |
 | [Design system](docs/design-system.md) | Color, typography, spacing, motion, Liquid Glass rules |
-| [Privacy data map](docs/privacy-data-map.md) | Collected data categories, machine-verified against the app's privacy manifest |
-| [iOS staging](docs/ios-staging.md) | Running the app against the staging backend |
-| [Backend staging](server/STAGING.md) | Deployment runbook for Render + Supabase |
-| [Backend operations](server/OPERATIONS.md) | Retention, security conventions, rollout flags |
+| [Privacy data map](docs/privacy-data-map.md) | Data categories, machine-verified against the privacy manifest |
+| [Backend staging](server/STAGING.md) · [Operations](server/OPERATIONS.md) | Deployment runbook, retention and security conventions |
 | [TURN relay](infra/coturn/README.md) | coturn deployment and capacity gates |
-| [Release records](docs/releases/) | Voice and video call release evidence and open gates |
-| [Design plans](docs/plans/) | Historical implementation plans for shipped features |
+| [Release records](docs/releases/) | Call release evidence and gates |
 
----
-
-## Roadmap
-
-- [x] End-to-end walking skeleton — libsignal → WebSocket → decrypt
-- [x] Phone + OTP accounts, sessions, 2FA, prekey and session management
-- [x] Offline-first local store and chat UI
-- [x] Groups and media
-- [x] Voice calls *(written; not enabled)*
-- [x] Video calls *(written; not enabled)*
-- [ ] **Validate on a real Tajik SIM** — the riskiest remaining unknown
-- [ ] Apple Developer provisioning, APNs, push notifications
-- [ ] Deploy TURN capacity and clear the call release gates
-- [ ] In-country Tajikistan server; scale hardening and a paid database tier
-- [ ] Secret Chats
-- [ ] Android client
-
-Out of scope until after the MVP: channels, bots, payments, server-side search.
-
----
+Full index: [`docs/`](docs/).
 
 ## Contributing
 
-Toj is a product codebase published openly. Please read
-[CONTRIBUTING.md](.github/CONTRIBUTING.md) before opening an issue or a pull
-request, and the [security policy](.github/SECURITY.md) before reporting
-anything security-related.
+Please read [CONTRIBUTING.md](.github/CONTRIBUTING.md) before opening an issue
+or pull request, and the [security policy](.github/SECURITY.md) before
+reporting anything security-related.
 
 ## License
 
-**Source-available, not open source.** Toj is published so it can be inspected
-and audited; publication is not a grant of rights. See [LICENSE](LICENSE).
-
-Third-party dependencies keep their own licenses, listed in [NOTICE.md](NOTICE.md)
-— which also records an unresolved question worth knowing about before any build
-is distributed: libsignal is AGPL-3.0 and is linked into the app.
+Source-available: published for inspection and audit, all rights reserved —
+see [LICENSE](LICENSE). Third-party components retain their own licenses,
+listed in [NOTICE.md](NOTICE.md).
 
 <div align="center">
-<sub>Toj — messaging, closer to home.</sub>
+<br />
+<sub><b>Toj</b> — messaging, closer to home.</sub>
 </div>
