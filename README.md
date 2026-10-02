@@ -4,9 +4,9 @@
 
 # Toj
 
-**A cloud messenger engineered for the network Tajikistan actually has.**
+**The offline-first cloud messenger, built for weak networks.**
 
-Offline-first on the device · encrypted in transit and at rest · sync proven under injected network faults
+Instant on 3G · No lost or duplicated messages · Encrypted in transit and at rest · Seamless multi-device
 
 [![CI](https://github.com/mmarufov/Toj/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mmarufov/Toj/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/iOS-26.0%2B-000000?logo=apple&logoColor=white)](#getting-started)
@@ -20,17 +20,16 @@ Offline-first on the device · encrypted in transit and at rest · sync proven u
 
 ---
 
-Toj is a native iOS messenger with 1:1 and group chat, media, multi-device sync,
-and voice and video calls. It was designed from the first commit around one fact: in
-Tajikistan, the link between the phone and the server is slow, congested and
-unreliable. Most international traffic leaves the country through a single
-narrow gateway, so every round trip to a distant data center is expensive.
+Toj is a native iOS messenger with 1:1 and group chat, media, multi-device
+sync, and voice and video calls. It is built for the connections most apps are
+never tested on: 3G at 100-500 kbps, high latency, packet loss, and links that
+drop in the middle of a send.
 
-Toj's answer is to make the network **stop mattering to the user**. The app
-renders from an encrypted on-device database, sends optimistically, and
-reconciles in the background with a sync protocol that has been driven through
-50,000 messages of injected packet loss, connection resets and dropped replies
-without losing or duplicating a single one.
+Toj makes the network **stop mattering to the user**. The app renders from an
+encrypted on-device database, sends optimistically, and syncs in the
+background, so a slow connection never blocks the interface. Its sync protocol
+has been driven through 50,000 messages of injected packet loss, connection
+resets and dropped replies without losing or duplicating a single one.
 
 ## Highlights
 
@@ -38,16 +37,16 @@ without losing or duplicating a single one.
   truth. Views never wait on the network; a sent message appears immediately
   and is confirmed later. The design target is 100-500 kbps with jitter, loss
   and sudden disconnects.
-- **Exactly-once delivery over an unreliable link.** Sends are idempotent by
-  client message ID, and catch-up is ordered by a per-account sequence number,
-  so a lost reply never turns into a lost or doubled message.
+- **No lost or duplicated messages, even on a dropping link.** Sends are
+  idempotent by client message ID, and catch-up is ordered by a per-account
+  sequence number, so a retry after a lost reply is always safe.
 - **Encrypted at rest by default.** Envelope encryption with AES-GCM and
   per-account wrapped keys, fenced key retirement, and versioned blind indexes
   so the server can look records up without storing what it is looking up.
-- **Multi-device as a core feature.** Telegram-style cloud chats: history
-  persists server-side, syncs across devices, and restores on a new login.
-- **Ordinary HTTPS on the wire.** Standard TLS + WebSocket with no custom
-  protocol, so the traffic has no distinctive fingerprint.
+- **Multi-device as a core feature.** Cloud chats keep history on the server,
+  sync it across every device, and restore it on a new login.
+- **Ordinary HTTPS on the wire.** Standard TLS + WebSocket with no custom wire
+  protocol. To the network, Toj looks like any other HTTPS traffic.
 - **Backed by evidence.** Pre-registered experiments with committed raw
   data, release gates enforced in code, and a fully pinned, attested supply
   chain.
@@ -157,7 +156,7 @@ presence, delivery, acks and fan-out over TLS + WebSocket.
 | **Lookup without plaintext** | Versioned, domain-separated HMAC blind indexes. A digest from one context can never be replayed as a lookup in another, and the key rotates without a flag day (`blind-index.ts`) |
 | **Zero-downtime schema changes** | Expand/contract migrations, with lock-free concurrent index builds in their own files (`schema-*-expand.sql`, `-contract.sql`, `-concurrent.sql`) |
 | **Identity** | Phone number + OTP, delivered over multiple channels with explainable, pre-registered fraud rules (`otp-risk.ts`) |
-| **Storage** | Media chunks are stored encrypted in PostgreSQL, so there is one less service to reach across the gateway and one less place for plaintext to sit |
+| **Storage** | Media chunks are stored encrypted in PostgreSQL, so there is one less service in the critical path and one less place for plaintext to sit |
 
 The deep version, including transport and calls: [docs/architecture.md](docs/architecture.md).
 
@@ -226,8 +225,8 @@ infrastructure and field validation.
 | Phone + OTP accounts, sessions, two-step verification | ✅ Running on staging |
 | Voice and video calls (1:1), group calls | 🟡 Implemented and tested · rollout gated on TURN capacity and device release gates |
 | Push notifications | 🟡 Implemented · awaiting APNs provisioning |
-| Field validation on Tajik mobile networks | ⏭ Next milestone |
-| In-country hosting | ⏭ Launch milestone (the endpoint is a single swappable config value) |
+| Field validation on live carrier networks | ⏭ Next milestone |
+| Edge hosting close to users | ⏭ Launch milestone (the endpoint is a single swappable config value) |
 | Secret Chats | ⏭ Planned, with the libsignal engine already integrated |
 | Android | ⏭ Planned |
 
@@ -332,5 +331,5 @@ listed in [NOTICE.md](NOTICE.md).
 
 <div align="center">
 <br />
-<sub><b>Toj</b>: messaging, closer to home.</sub>
+<sub><b>Toj</b>: made for the signal you actually have.</sub>
 </div>
