@@ -13,6 +13,7 @@ test('message survives signal loss, preserves identity, and separates acceptance
   await expect(scene(page)).toHaveAttribute('data-state', 'queued');
   await expect(page.locator('[data-sender-message]')).toHaveCSS('opacity', '1');
   await expect(page.locator('[data-recipient-message]')).toHaveCSS('opacity', '0');
+  await expect(page.locator('.conversation-recipient .prior-message .message-check')).toHaveCSS('visibility', 'visible');
   const id = await scene(page).getAttribute('data-message-id');
   await expect(scene(page)).toHaveAttribute('data-state', 'accepted');
   await expect(page.locator('[data-message-state]')).toHaveText('Server confirmed');
@@ -59,6 +60,14 @@ test('Save-Data defaults to stillness but allows deliberate playback', async ({ 
   await open(page); await expect(scene(page)).toHaveAttribute('data-state', 'delivered');
   expect(await page.evaluate(() => performance.getEntriesByType('resource').some(entry => /\/motion-/.test(entry.name)))).toBe(false);
   await replay(page); await expect(scene(page)).toHaveAttribute('data-playback', 'playing');
+});
+test('phone autoplay waits until both conversations can be seen', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await open(page);
+  await expect(scene(page)).toHaveAttribute('data-playback', 'static');
+  expect(await page.evaluate(() => performance.getEntriesByType('resource').some(entry => /\/motion-/.test(entry.name)))).toBe(false);
+  await scene(page).scrollIntoViewIfNeeded();
+  await expect(scene(page)).toHaveAttribute('data-playback', 'playing');
 });
 test('blocked motion and fonts preserve content and delivery controls', async ({ page }) => {
   await page.route(/\/(motion-.*\.js|.*\.woff2)$/, route => route.abort());

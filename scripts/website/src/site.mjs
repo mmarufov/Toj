@@ -39,6 +39,8 @@ function enhanceStory(scene) {
   let userInitiated = false;
   let destroyed = false;
   let requestGeneration = 0;
+  // On a phone both conversation panes should be in view before the story starts.
+  const visibilityThreshold = .85;
   const lowData = () => connection?.saveData || ["slow-2g", "2g"].includes(connection?.effectiveType);
   const canRun = () => visible && !document.hidden && !reducedMotion.matches;
 
@@ -156,9 +158,9 @@ function enhanceStory(scene) {
     window.removeEventListener("pageshow", updateVisibility);
   }
   const observer = "IntersectionObserver" in window ? new IntersectionObserver((entries) => {
-    visible = entries[0].isIntersecting && entries[0].intersectionRatio >= .55;
+    visible = entries[0].isIntersecting && entries[0].intersectionRatio >= visibilityThreshold;
     updateVisibility();
-  }, { threshold: [0, .55] }) : null;
+  }, { threshold: [0, visibilityThreshold] }) : null;
 
   scene.dataset.enhanced = "true";
   controls.hidden = false;

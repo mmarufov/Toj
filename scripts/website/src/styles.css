@@ -656,7 +656,7 @@ button,
 .delivery-story[data-state=accepted] .incoming-group {
   opacity: 0;
 }
-.delivery-story:is([data-state=ready], [data-state=sending], [data-state=queued], [data-state=retrying]) .message-check {
+.delivery-story:is([data-state=ready], [data-state=sending], [data-state=queued], [data-state=retrying]) .outgoing-group .message-check {
   visibility: hidden;
 }
 .delivery-story[data-state=queued] .route-status,

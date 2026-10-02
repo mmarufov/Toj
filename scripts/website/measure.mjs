@@ -43,6 +43,12 @@ for (const profile of [{ name: '400kbps', down: 400, up: 100, latency: 400 }, { 
     });
     await page.goto(url, { waitUntil: 'load', timeout: 90000 }); await page.waitForTimeout(2000);
     const initial = await page.evaluate(() => ({ ...window.lab, transferred: performance.getEntriesByType('resource').reduce((sum, entry) => sum + entry.transferSize, 0) + performance.getEntriesByType('navigation')[0].transferSize }));
+    // Include optional playback even when Save-Data or viewport position prevented autoplay.
+    if (await page.locator('[data-replay]').count()) {
+      await page.locator('.delivery-story').scrollIntoViewIfNeeded();
+      await page.locator('[data-replay]').click();
+      await page.waitForTimeout(2000);
+    }
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); await page.waitForTimeout(1200);
     const completeTransfer = await page.evaluate(() => performance.getEntriesByType('resource').reduce((sum, entry) => sum + entry.transferSize, 0) + performance.getEntriesByType('navigation')[0].transferSize);
     const row = { profile: profile.name, downKbps: profile.down, upKbps: profile.up, latencyMs: profile.latency, cpu: 4, index, ...initial, completeTransfer };
