@@ -57,6 +57,7 @@ what keeps the app responsive.
 
 | Module | Contents | Notes |
 | --- | --- | --- |
+| `App/` | `TojApp`, `TojAppDelegate`, `ContentView`, `CloudRootView`, `CloudAppModel` | Entry point, root view, and the app-wide state the screens bind to |
 | `Core/Store/` | `CloudLocalStore`, `CloudProductivityStore`, `EncryptedProfilePhotoStore` | SQLite via GRDB, encrypted with SQLCipher |
 | `Core/Store/Search/` | `SearchIndexer`, `MessageSearchStore`, `SearchIndexSchema` | On-device FTS5 index |
 | `Core/Search/` | `SearchTextNormalizer`, `SearchUnicodeTables`, `PreparedSearchQuery` | Tokenizer tables are generated (see below) |
@@ -67,7 +68,8 @@ what keeps the app responsive.
 | `Core/GroupCalls/` | `GroupCallCrypto`, `GroupCallMediaReducer` | SFU group calls |
 | `Core/Accounts/` | `AccountCatalog`, `AccountStorage`, `MessagingAccountRuntime` | Identity and per-account isolation |
 | `Core/Background/`, `Core/Push/` | `BackgroundRuntimeCoordinator`, `PushRegistrationCenter` | Background wake and APNs registration |
-| `Features/` | Conversations, contacts, settings, calls, search UI | Logic lives in testable types outside the views |
+| `Features/` | `Messaging` (with `Search`), `Contacts`, `Groups`, `Profile`, `Settings`, `Calls`, `GroupCalls`, `Demo` | One folder per feature; logic lives in testable types outside the views |
+| `UITestSupport/` | `TelegramFastUITestFixture` | Fixture data the UI tests launch the app with |
 | `DesignSystem/` | `TojTheme` and shared components | See [design system](design-system.md) |
 
 ### Generated search tables
