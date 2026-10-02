@@ -3,9 +3,9 @@
 Start with the [README](../README.md) for what Toj is and how to build it.
 
 > This directory is also the publishing source for the
-> [tojchat.tech](https://tojchat.tech) site (`index.html`, `styles.css`,
-> `assets/`, `CNAME`). Those files are the public landing page. Leave them
-> alone unless you mean to change the site.
+> [tojchat.tech](https://tojchat.tech) site (`index.html`, `assets/`, `CNAME`). Edit the source under
+> `scripts/website/` and rebuild. See the [website guide](../scripts/website/README.md).
+> Leave these files alone unless you mean to change the site.
 
 ## Design and architecture
 

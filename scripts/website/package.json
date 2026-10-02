@@ -1,0 +1,20 @@
+{
+  "name": "toj-website",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test ../website.test.mjs ../website-motion.test.mjs",
+    "test:browser": "playwright test",
+    "check:budget": "node budget.mjs",
+    "serve": "node serve.mjs"
+  },
+  "dependencies": { "motion": "13.5.0" },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.62.1",
+    "esbuild": "0.28.2",
+    "lighthouse": "13.5.0"
+  }
+}
