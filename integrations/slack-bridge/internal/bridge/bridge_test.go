@@ -395,3 +395,35 @@ func TestPendingEventsAreNeverPruned(t *testing.T) {
 		t.Fatalf("pruned %d pending events", n)
 	}
 }
+
+// Retry-After outlives the process that received it. Row present: the restarted bridge still
+// waits. Row absent: it calls at once.
+func TestRetryAfterSurvivesARestart(t *testing.T) {
+	for _, keepRow := range []bool{true, false} {
+		t.Run(fmt.Sprintf("row_present=%v", keepRow), func(t *testing.T) {
+			h := newHarness(t, harnessOptions{})
+			h.b.rateLimited(h.ctx, h.b.Pacers[testChannel], testChannel, 2*time.Second)
+			if !keepRow {
+				if _, err := h.st.DB.Exec(`DELETE FROM slack_rate_limits`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.restart()
+			h.toj.Send(h.alice, h.dialog, "c1", "after a 429")
+			if err := h.syncToj(); err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			if err := h.drainIntents(); err != nil {
+				t.Fatal(err)
+			}
+			waited := time.Since(started)
+			if keepRow && waited < 1500*time.Millisecond {
+				t.Fatalf("posted after %s, inside the stored Retry-After", waited)
+			}
+			if !keepRow && waited > 500*time.Millisecond {
+				t.Fatalf("waited %s with no stored Retry-After", waited)
+			}
+		})
+	}
+}

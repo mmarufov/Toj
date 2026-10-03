@@ -59,12 +59,23 @@ func (p *Pacer) Wait(ctx context.Context) error {
 	return nil
 }
 
-// RateLimited records a 429: no call goes out before Retry-After has passed.
-func (p *Pacer) RateLimited(retryAfter time.Duration) {
+// RateLimited records a 429: no call goes out before Retry-After has passed. It returns the time
+// the channel is blocked until, for the caller to persist.
+func (p *Pacer) RateLimited(retryAfter time.Duration) time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if until := p.now().Add(retryAfter); until.After(p.next) {
 		p.next = until
 	}
 	p.RateLimits.Add(1)
+	return p.next
+}
+
+// BlockUntil restores a wait recorded by an earlier process.
+func (p *Pacer) BlockUntil(until time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if until.After(p.next) {
+		p.next = until
+	}
 }

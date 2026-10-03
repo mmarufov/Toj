@@ -119,6 +119,13 @@ func (b *Bridge) init() {
 // Prepare must run before Run and before the events handler is served.
 func (b *Bridge) Prepare(ctx context.Context) error {
 	b.init()
+	for channel, pacer := range b.Pacers {
+		until, err := b.Store.RateLimitUntil(ctx, channel)
+		if err != nil {
+			return err
+		}
+		pacer.BlockUntil(until)
+	}
 	if _, ok, err := b.Store.Cursor(ctx); err != nil {
 		return err
 	} else if !ok {

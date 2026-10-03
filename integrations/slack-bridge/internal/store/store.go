@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
   done_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS outbound_intents_pending ON outbound_intents (status, slack_channel, id);
+
+-- Retry-After from Slack's last 429 per channel, so a restarted process keeps waiting it out.
+-- Row absence means no wait, and so does a row whose time has passed. Losing a row (a crash
+-- between the 429 and this write) costs at most one early call, which Slack answers with another
+-- 429: benign, not destructive.
+CREATE TABLE IF NOT EXISTS slack_rate_limits (
+  channel TEXT PRIMARY KEY,
+  until_ms INTEGER NOT NULL
+);
 `
 
 // EventRetention is how long a processed Slack event id is kept for deduplication.
@@ -432,4 +441,25 @@ INSERT INTO message_map (origin, toj_dialog, toj_msg_id, slack_channel, slack_ts
 VALUES ('slack', ?, ?, ?, ?, ?, NULLIF(?, ''))
 ON CONFLICT (slack_channel, slack_ts) DO NOTHING`, dialog, msgID, channel, ts, editVersion, editTS)
 	return err
+}
+
+// SaveRateLimit records that a channel may not be called before until.
+func (s *Store) SaveRateLimit(ctx context.Context, channel string, until time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+INSERT INTO slack_rate_limits (channel, until_ms) VALUES (?, ?)
+ON CONFLICT (channel) DO UPDATE SET until_ms = MAX(until_ms, excluded.until_ms)`, channel, until.UnixMilli())
+	return err
+}
+
+// RateLimitUntil returns the stored wait for a channel; the zero time when there is none.
+func (s *Store) RateLimitUntil(ctx context.Context, channel string) (time.Time, error) {
+	var ms int64
+	err := s.DB.QueryRowContext(ctx, `SELECT until_ms FROM slack_rate_limits WHERE channel = ?`, channel).Scan(&ms)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(ms), nil
 }

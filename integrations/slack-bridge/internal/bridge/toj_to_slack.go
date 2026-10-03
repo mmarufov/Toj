@@ -285,7 +285,7 @@ func (b *Bridge) slackFailure(ctx context.Context, pacer *slack.Pacer, in store.
 	case errors.As(err, &limited):
 		b.Stats.SlackRateLimited.Add(1)
 		if !b.Controls.IgnoreRetryAfter {
-			pacer.RateLimited(limited.RetryAfter)
+			b.rateLimited(ctx, pacer, in.SlackChannel, limited.RetryAfter)
 		}
 		if attempted {
 			if undoErr := b.Store.UndoAttempt(ctx, in.ID); undoErr != nil {
@@ -316,8 +316,8 @@ func (b *Bridge) reconcile(ctx context.Context, pacer *slack.Pacer, in store.Int
 	messages, err := b.Slack.History(ctx, in.SlackChannel, strconv.FormatInt(oldest.Unix(), 10)+".000000")
 	if err != nil {
 		var limited *slack.RateLimitedError
-		if errors.As(err, &limited) {
-			pacer.RateLimited(limited.RetryAfter)
+		if errors.As(err, &limited) && !b.Controls.IgnoreRetryAfter {
+			b.rateLimited(ctx, pacer, in.SlackChannel, limited.RetryAfter)
 		}
 		return "", false, err
 	}
@@ -351,4 +351,13 @@ func (b *Bridge) updateOrDelete(ctx context.Context, pacer *slack.Pacer, in stor
 	}
 	counter.Add(1)
 	return b.finish(ctx, in, "done", in.Op)
+}
+
+// rateLimited holds the channel back for Retry-After in this process and, through SQLite, in the
+// next one if this process is killed before the wait is over.
+func (b *Bridge) rateLimited(ctx context.Context, pacer *slack.Pacer, channel string, retryAfter time.Duration) {
+	until := pacer.RateLimited(retryAfter)
+	if err := b.Store.SaveRateLimit(ctx, channel, until); err != nil {
+		b.Log.Warn("persist slack rate limit", "err", err)
+	}
 }
