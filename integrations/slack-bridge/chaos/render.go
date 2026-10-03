@@ -62,11 +62,11 @@ func render(path string, w io.Writer) error {
 			comma(s.OutOfOrderSlackToToj[0]), comma(s.OutOfOrderSlackToToj[1]))
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| Scenario | Retry deliveries | Duplicate deliveries | Late acks injected | Undeliverable events | 429s injected | Calls during Retry-After | Replies dropped after commit |")
+	fmt.Fprintln(w, "| Scenario | Retry deliveries | Duplicate deliveries | Late acks injected | Undeliverable (never answered by the bridge) | 429s injected | Calls during Retry-After | Replies dropped after commit |")
 	fmt.Fprintln(w, "|---|---|---|---|---|---|---|---|")
 	for _, s := range r.Summary {
-		fmt.Fprintf(w, "| %s | %s | %d | %d | %d | %d | %d | %d |\n", s.Scenario, comma(s.RetryDeliveries),
-			s.DuplicatesInjected, s.SlowAcksInjected, s.Undeliverable, s.RateLimited, s.RateLimitViolations, s.RepliesDropped)
+		fmt.Fprintf(w, "| %s | %s | %d | %d | %d (%d) | %d | %d | %d |\n", s.Scenario, comma(s.RetryDeliveries),
+			s.DuplicatesInjected, s.SlowAcksInjected, s.Undeliverable, s.UndeliverableUnseen, s.RateLimited, s.RateLimitViolations, s.RepliesDropped)
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "| Scenario | Acks | Ack p50 (ms) | Ack p99 (ms) | Ack max (ms) | Acks at or over 3 s | Toj to Slack p50 / p99 (s) | Slack to Toj p50 / p99 (s) |")

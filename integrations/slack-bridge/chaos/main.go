@@ -91,6 +91,7 @@ type options struct {
 	Mild           bool     `json:"mild"`
 	Label          string   `json:"label"`
 	Controls       string   `json:"negativeControls"`
+	ControlSet     string   `json:"controlSet"`
 	KillPoints     []string `json:"killPoints"`
 	Pacer          string   `json:"pacer"`
 	GapMs          int      `json:"gapMs"`
@@ -117,6 +118,8 @@ func parseOptions(args []string) options {
 	fs.BoolVar(&o.Mild, "mild", false, "CI smoke toxics")
 	fs.StringVar(&o.Label, "label", "", "free-text label stored in the results")
 	fs.StringVar(&o.Controls, "negative-control", "", "TOJ_BRIDGE_NEGATIVE_CONTROL for the bridge")
+	fs.StringVar(&o.ControlSet, "control-set", "", "run each item once on the first scenario instead of the sweep: "+
+		"controls[@kill-point] separated by ';', e.g. 'loop_guard;cursor_tx@after_cursor_commit'")
 	fs.StringVar(&killList, "kill-points", strings.Join(defaultKillPoints, ","), "kill k uses point k mod n")
 	fs.StringVar(&o.Pacer, "pacer", "20ms", "SLACK_MIN_INTERVAL for the bridge")
 	fs.IntVar(&o.GapMs, "gap-ms", 50, "pause between source messages")
@@ -181,7 +184,7 @@ func main() {
 			failed = true
 		}
 	}
-	if failed && o.Controls == "" {
+	if failed && o.Controls == "" && o.ControlSet == "" {
 		os.Exit(1)
 	}
 }
@@ -328,6 +331,37 @@ func sweep(o options) (*report, error) {
 	}
 	rep.Scenarios = picked
 
+	if o.ControlSet != "" {
+		// One run per negative control, sharing the sweep's accounts. Each run is reported under
+		// the control's name instead of a scenario name.
+		var labels []scenario
+		for i, item := range strings.Split(o.ControlSet, ";") {
+			controls, killPoint, _ := strings.Cut(strings.TrimSpace(item), "@")
+			run := o
+			run.Controls = controls
+			if killPoint != "" {
+				run.KillPoints = []string{killPoint}
+			}
+			sc := picked[0]
+			res, next, err := runOnce(ctx, run, sc, 10+i, 1, o.Seed+uint64(i), converge, binary, work, proxy, server.port, direct,
+				[]human{{"Alice", alice}, {"Bob", bob}}, session)
+			if err != nil {
+				return rep, fmt.Errorf("control %s: %w", item, err)
+			}
+			session = next
+			res.Scenario = "control:" + strings.TrimSpace(item)
+			labels = append(labels, scenario{Name: res.Scenario, Description: sc.Name + " scenario, bridge with " + controls + " off"})
+			rep.Runs = append(rep.Runs, res)
+			line, _ := json.Marshal(map[string]any{"event": "chaos.control", "control": res.Scenario,
+				"lost": res.Lost(), "duplicated": res.Duplicated(), "echoed": res.Echoed(), "converged": res.Converged,
+				"violations": res.Slack.RateLimitViolations})
+			fmt.Println(string(line))
+		}
+		rep.Scenarios = labels
+		rep.Summary = summarize(rep.Runs, labels)
+		return rep, nil
+	}
+
 	index := 0
 	for si, sc := range picked {
 		for r := 1; r <= o.Runs; r++ {
@@ -381,6 +415,7 @@ type slackStats struct {
 	DuplicatesInjected  int            `json:"duplicatesInjected"`
 	SlowAcksInjected    int            `json:"slowAcksInjected"`
 	Undeliverable       int            `json:"undeliverable"`
+	UndeliverableUnseen int            `json:"undeliverableUnseen"`
 	NonOKAcks           int            `json:"nonOkAcks"`
 	RateLimited         int            `json:"rateLimited"`
 	RateLimitViolations int            `json:"rateLimitViolations"`
@@ -559,7 +594,7 @@ func runOnce(ctx context.Context, o options, sc scenario, si, run int, seed uint
 	fs := fake.Stats()
 	res.Slack = slackStats{EventsCreated: fs.EventsCreated, Deliveries: fs.Deliveries, RetryDeliveries: fs.RetryDeliveries,
 		RetriesByReason: fs.RetriesByReason, DuplicatesInjected: fs.DuplicatesInjected, SlowAcksInjected: fs.SlowAcksInjected,
-		Undeliverable: fs.Undeliverable, NonOKAcks: fs.NonOKAcks, RateLimited: fs.RateLimited,
+		Undeliverable: fs.Undeliverable, UndeliverableUnseen: fs.UndeliverableUnseen, NonOKAcks: fs.NonOKAcks, RateLimited: fs.RateLimited,
 		RateLimitViolations: fs.RateLimitViolations, RepliesDropped: fs.RepliesDropped, HistoryCalls: fs.HistoryCalls}
 	for _, d := range fs.AckLatencies {
 		res.Slack.AckMs = append(res.Slack.AckMs, float64(d.Microseconds())/1000)
@@ -601,6 +636,7 @@ type summary struct {
 	DuplicatesInjected   int            `json:"duplicatesInjected"`
 	SlowAcksInjected     int            `json:"slowAcksInjected"`
 	Undeliverable        int            `json:"undeliverable"`
+	UndeliverableUnseen  int            `json:"undeliverableUnseen"`
 	RateLimited          int            `json:"rateLimited"`
 	RateLimitViolations  int            `json:"rateLimitViolations"`
 	RepliesDropped       int            `json:"repliesDropped"`
@@ -679,6 +715,7 @@ func summarize(runs []runResult, picked []scenario) []summary {
 			s.DuplicatesInjected += r.Slack.DuplicatesInjected
 			s.SlowAcksInjected += r.Slack.SlowAcksInjected
 			s.Undeliverable += r.Slack.Undeliverable
+			s.UndeliverableUnseen += r.Slack.UndeliverableUnseen
 			s.RateLimited += r.Slack.RateLimited
 			s.RateLimitViolations += r.Slack.RateLimitViolations
 			s.RepliesDropped += r.Slack.RepliesDropped

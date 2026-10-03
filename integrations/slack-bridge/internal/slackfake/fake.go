@@ -64,13 +64,16 @@ type Msg struct {
 }
 
 type Stats struct {
-	EventsCreated       int
-	Deliveries          int // every POST to the bridge, first attempts, retries and duplicates
-	RetryDeliveries     int
-	RetriesByReason     map[string]int
-	DuplicatesInjected  int
-	SlowAcksInjected    int
-	Undeliverable       int // events whose last retry also failed
+	EventsCreated      int
+	Deliveries         int // every POST to the bridge, first attempts, retries and duplicates
+	RetryDeliveries    int
+	RetriesByReason    map[string]int
+	DuplicatesInjected int
+	SlowAcksInjected   int
+	Undeliverable      int // event deliveries whose last retry also failed, as Slack sees it
+	// UndeliverableUnseen is the subset where no attempt got a 2xx from the bridge. The rest were
+	// answered by the bridge, and only the fake's injected late ack made Slack count them failed.
+	UndeliverableUnseen int
 	NonOKAcks           int
 	AckLatencies        []time.Duration // per delivery that got an HTTP answer
 	RateLimited         int             // injected 429s
@@ -353,6 +356,7 @@ func (f *Fake) deliver(envelope []byte, firstDelay time.Duration) {
 	}()
 	time.Sleep(firstDelay)
 	reason := ""
+	reached := false
 	for attempt := 0; attempt <= len(f.cfg.RetrySchedule); attempt++ {
 		if attempt > 0 {
 			time.Sleep(f.cfg.RetrySchedule[attempt-1])
@@ -363,18 +367,23 @@ func (f *Fake) deliver(envelope []byte, firstDelay time.Duration) {
 		if stopping || url == "" {
 			return
 		}
-		ok, why := f.attempt(url, envelope, attempt, reason)
+		ok, answered, why := f.attempt(url, envelope, attempt, reason)
 		if ok {
 			return
 		}
+		reached = reached || answered
 		reason = why
 	}
 	f.mu.Lock()
 	f.stats.Undeliverable++
+	if !reached {
+		f.stats.UndeliverableUnseen++
+	}
 	f.mu.Unlock()
 }
 
-func (f *Fake) attempt(url string, envelope []byte, retryNum int, reason string) (bool, string) {
+// attempt reports whether Slack counts the delivery as done, and whether the bridge answered 2xx.
+func (f *Fake) attempt(url string, envelope []byte, retryNum int, reason string) (bool, bool, string) {
 	f.sem <- struct{}{}
 	defer func() { <-f.sem }()
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
@@ -398,22 +407,22 @@ func (f *Fake) attempt(url string, envelope []byte, retryNum int, reason string)
 	}
 	if err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return false, "http_timeout"
+			return false, false, "http_timeout"
 		}
-		return false, "connection_failed"
+		return false, false, "connection_failed"
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	f.stats.AckLatencies = append(f.stats.AckLatencies, elapsed)
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		f.stats.NonOKAcks++
-		return false, "http_error"
+		return false, false, "http_error"
 	}
 	if f.rng.Float64() < f.cfg.PSlowAck {
 		f.stats.SlowAcksInjected++
-		return false, "http_timeout"
+		return false, true, "http_timeout"
 	}
-	return true, ""
+	return true, true, ""
 }
 
 // Drain waits until every event has been delivered or given up on.
