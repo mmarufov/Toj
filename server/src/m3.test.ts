@@ -52,6 +52,7 @@ import {
   deleteMessage,
   setReaction,
   startBootstrap,
+  SyncError,
 } from "./sync";
 import {
   cancelMediaUpload,
@@ -2139,7 +2140,10 @@ describe("M3 cloud sync", () => {
       expectedEditVersion: 0,
       body: "version one",
     });
-    await expect(editMessage(db, {
+    // The app restores the user's edit only on a 409, and the Slack bridge must tell a conflict
+    // apart from a bad request, so the status and code are the contract. The message text is kept
+    // for builds that only show it.
+    const stale = await editMessage(db, {
       actorAccountId: alice.accountId,
       actorDeviceId: alice.deviceId,
       dialogId,
@@ -2147,7 +2151,33 @@ describe("M3 cloud sync", () => {
       clientMutationId: crypto.randomUUID(),
       expectedEditVersion: 0,
       body: "stale overwrite",
-    })).rejects.toThrow("another device");
+    }).then(() => null, (error: unknown) => error);
+    expect(stale).toBeInstanceOf(SyncError);
+    expect((stale as SyncError).message).toBe("message was edited on another device");
+    expect((stale as SyncError).status).toBe(409);
+    expect((stale as SyncError).code).toBe("edit_conflict");
+    expect((stale as SyncError).details).toEqual({ currentEditVersion: 1 });
+
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages/edit`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${alice.token}` },
+        body: JSON.stringify({
+          dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(),
+          expectedEditVersion: 0, body: "stale over HTTP",
+        }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: "message was edited on another device",
+        code: "edit_conflict",
+        currentEditVersion: 1,
+      });
+    } finally {
+      await server.stop(true);
+    }
+
     await expect(deleteMessage(db, {
       actorAccountId: bob.accountId,
       actorDeviceId: bob.deviceId,

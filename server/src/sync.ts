@@ -1680,7 +1680,12 @@ async function mutateMessage(sql: SQL, p: {
       const body = requireTextBody(p.body);
       const expected = Number(p.expectedEditVersion);
       if (!Number.isSafeInteger(expected) || expected < 0) throw new SyncError("expected edit version required");
-      if (n(row.edit_version) !== expected) throw new SyncError("message was edited on another device");
+      if (n(row.edit_version) !== expected) {
+        // 409 is what the app restores a draft on; the message text is unchanged for older builds.
+        throw new SyncError("message was edited on another device", 409, "edit_conflict", {
+          currentEditVersion: n(row.edit_version),
+        });
+      }
       const sealed = await sealForScope(
         tx,
         { kind: "account", accountId: p.actorAccountId },

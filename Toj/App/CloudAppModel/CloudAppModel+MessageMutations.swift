@@ -274,9 +274,12 @@ extension CloudAppModel {
                 generation: generation
             ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
             else { return }
-            if let apiError = error as? CloudAPIError, apiError.status == 409 {
+            if let apiError = error as? CloudAPIError,
+               apiError.status == 409 || apiError.isMessageEditConflict {
                 try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
                 await runCoordinatedSync(trigger: .hint)
+                // The banner must quote the message as the server now has it, not the pending edit.
+                if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
                 if mutation.operation == "edit", let body = mutation.body {
                     draft = body
                     if let current = lines.first(where: { $0.msgId == mutation.msgId }) {

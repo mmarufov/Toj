@@ -1012,6 +1012,13 @@ nonisolated struct CloudAPIError: Error, LocalizedError {
     var errorDescription: String? {
         message
     }
+
+    /// A stale `expectedEditVersion`. Servers since the `edit_conflict` code answer 409; older
+    /// servers (staging before that change) answered 400 with this exact message.
+    var isMessageEditConflict: Bool {
+        code == "edit_conflict"
+            || (status == 400 && message == "message was edited on another device")
+    }
 }
 
 nonisolated struct CloudCapabilitiesResponse: Codable, Equatable, Sendable {
