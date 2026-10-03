@@ -70,11 +70,16 @@ func NewClient(baseURL string, st SessionStore) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Store:   st,
-		// Each request gets a fresh connection: a dead keep-alive socket must surface as a failed
-		// attempt the caller retries with the same idempotency key, not be re-sent silently.
+		// Connections are reused: on a 300 ms link a new connection costs a round trip per request.
+		// Go's transport re-sends a POST on a reused connection only when none of it was written,
+		// so the server cannot have seen it. Any other loss surfaces as an error that the caller
+		// retries with the same idempotency key.
 		HTTP: &http.Client{
-			Timeout:   20 * time.Second,
-			Transport: &http.Transport{DisableKeepAlives: true},
+			Timeout: 20 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 4,
+				IdleConnTimeout:     30 * time.Second,
+			},
 		},
 	}
 }

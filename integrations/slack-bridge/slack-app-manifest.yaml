@@ -1,0 +1,39 @@
+# Paste at https://api.slack.com/apps -> Create New App -> From an app manifest.
+# Replace the request_url host with your tunnel's host before creating the app, or edit it later
+# under Event Subscriptions (Slack sends a url_verification challenge, which the bridge answers).
+#
+# Bot scopes and why each is needed:
+#   channels:history       message.channels events, and conversations.history to reconcile a post
+#                          whose reply was lost before reposting it
+#   chat:write             chat.postMessage, chat.update and chat.delete for the bridge's own posts
+#   chat:write.customize   post a Toj message under its author's name instead of the bot's
+#   users:read             users.info, to show a Slack author's name in Toj
+#   metadata.message:read  read the metadata the bridge attaches to its posts (Toj group and message
+#                          id) when it reconciles against history
+#
+# The signing secret (Basic Information) and the bot token (OAuth & Permissions, xoxb-) go in the
+# bridge's environment as SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN. Never commit them.
+display_information:
+  name: Toj Bridge
+  description: Mirrors one Toj group into a Slack channel and back.
+  background_color: "#111111"
+features:
+  bot_user:
+    display_name: Toj Bridge
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - chat:write
+      - chat:write.customize
+      - users:read
+      - metadata.message:read
+settings:
+  event_subscriptions:
+    request_url: https://REPLACE-WITH-TUNNEL-HOST/slack/events
+    bot_events:
+      - message.channels
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

@@ -139,16 +139,29 @@ func run(log *slog.Logger) error {
 	}
 	defer st.Close()
 	tojClient := toj.NewClient(env("TOJ_BASE_URL", "http://127.0.0.1:8788"), st)
-	if err := tojClient.Load(ctx); err != nil {
+	if err := retryStartup(ctx, log, "load toj session", func() error {
+		err := tojClient.Load(ctx)
 		if errors.Is(err, store.ErrNotFound) {
-			return errors.New("no Toj session: run `bridge login` first")
+			return permanent{errors.New("no Toj session: run `bridge login` first")}
 		}
-		return fmt.Errorf("load toj session: %w", err)
+		if err != nil && !toj.Retryable(err) {
+			return permanent{err}
+		}
+		return err
+	}); err != nil {
+		return err
 	}
 	slackClient := slack.NewClient(env("SLACK_API_URL", "https://slack.com/api"), token)
-	identity, err := slackClient.AuthTest(ctx)
-	if err != nil {
-		return fmt.Errorf("slack auth.test: %w", err)
+	var identity slack.Identity
+	if err := retryStartup(ctx, log, "slack auth.test", func() (err error) {
+		identity, err = slackClient.AuthTest(ctx)
+		var apiErr *slack.APIError
+		if errors.As(err, &apiErr) {
+			return permanent{err} // a bad token will not fix itself
+		}
+		return err
+	}); err != nil {
+		return err
 	}
 
 	b := &bridge.Bridge{
@@ -156,8 +169,14 @@ func run(log *slog.Logger) error {
 		BotID: identity.BotID, AppID: os.Getenv("SLACK_APP_ID"),
 		Controls: controls, MinInterval: interval, Log: log,
 	}
-	if err := b.Prepare(ctx); err != nil {
-		return fmt.Errorf("prepare: %w", err)
+	if err := retryStartup(ctx, log, "prepare", func() error {
+		err := b.Prepare(ctx)
+		if err != nil && !toj.Retryable(err) {
+			return permanent{err}
+		}
+		return err
+	}); err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
@@ -200,6 +219,30 @@ func run(log *slog.Logger) error {
 		return nil
 	}
 	return err
+}
+
+type permanent struct{ error }
+
+// retryStartup repeats a startup step that failed on the network. The link to Toj or Slack can be
+// down when the process starts; that is a reason to wait, not to exit.
+func retryStartup(ctx context.Context, log *slog.Logger, step string, fn func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		var p permanent
+		if errors.As(err, &p) {
+			return fmt.Errorf("%s: %w", step, p.error)
+		}
+		log.Warn("startup step failed, retrying", "step", step, "err", err)
+		delay := min(time.Duration(200<<min(attempt, 5))*time.Millisecond, 5*time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 }
 
 func snapshot(s *bridge.Stats) map[string]int64 {
