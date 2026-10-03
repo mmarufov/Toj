@@ -1808,6 +1808,119 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleEditConflictRestoresTheUsersEditDraft() async throws {
+        let outcome = try await runStaleEdit(
+            status: 409,
+            body: #"{"error":"message was edited on another device","code":"edit_conflict","currentEditVersion":1}"#
+        )
+        XCTAssertEqual(outcome.draft, "my corrected text")
+        XCTAssertEqual(outcome.composerMode, .editing(messageId: outcome.lineId, original: "original"))
+        XCTAssertTrue(outcome.pendingMutations.isEmpty)
+        XCTAssertTrue(outcome.paths.contains("/cloud/v1/messages/edit"))
+    }
+
+    /// Servers before the `edit_conflict` code (staging included) answered a stale edit with 400.
+    @MainActor
+    func testLegacyStaleEditAnswerAlsoRestoresTheUsersEditDraft() async throws {
+        let outcome = try await runStaleEdit(
+            status: 400,
+            body: #"{"error":"message was edited on another device","code":"invalid_sync_request"}"#
+        )
+        XCTAssertEqual(outcome.draft, "my corrected text")
+        XCTAssertEqual(outcome.composerMode, .editing(messageId: outcome.lineId, original: "original"))
+        XCTAssertTrue(outcome.pendingMutations.isEmpty)
+    }
+
+    @MainActor
+    func testOtherBadEditRequestsAreNotTreatedAsConflicts() {
+        XCTAssertTrue(CloudAPIError(
+            status: 409, message: "x", retryAfter: nil, code: "edit_conflict"
+        ).isMessageEditConflict)
+        XCTAssertFalse(CloudAPIError(
+            status: 400, message: "only text messages can be edited", retryAfter: nil,
+            code: "invalid_sync_request"
+        ).isMessageEditConflict)
+        XCTAssertFalse(CloudAPIError(
+            status: 409, message: "message is unavailable", retryAfter: nil, code: "message_expired"
+        ).isMessageEditConflict)
+    }
+
+    @MainActor
+    private func runStaleEdit(status: Int, body: String) async throws -> (
+        draft: String, composerMode: ComposerMode, lineId: String,
+        pendingMutations: [PendingMessageMutation], paths: [String]
+    ) {
+        let store = try makeStore()
+        let accountId = "stale-edit-account"
+        let dialogId = "stale-edit-dialog"
+        try await store.upsertDialog(dialogId: dialogId, type: "direct", title: "Peer")
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 1),
+                updates: [CloudUpdate(
+                    pts: 1, ptsCount: 1, type: "message.new", dialogId: dialogId,
+                    dialogTitle: "Peer",
+                    message: CloudMessage(
+                        dialogId: dialogId, msgId: 7, senderAccountId: accountId,
+                        clientMsgId: UUID().uuidString.lowercased(), kind: "text",
+                        text: "original", editVersion: 0, state: "visible",
+                        serverTs: "2026-10-02T10:00:00.000Z"
+                    ),
+                    readerAccountId: nil, maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://stale-edit.invalid/cloud")))
+        let paths = LockedPaths()
+        CloudAPIMockURLProtocol.handler = { request in
+            let path = request.url!.path
+            paths.append(path)
+            let (code, payload): (Int, String) = switch path {
+            case "/cloud/v1/messages/edit": (status, body)
+            case "/cloud/v1/sync/difference":
+                (200, #"{"kind":"difference","state":{"pts":1},"updates":[],"hasMore":false}"#)
+            default: (404, #"{"error":"not found"}"#)
+            }
+            return (try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: code, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            )), Data(payload.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let model = CloudAppModel(
+            config: config,
+            api: CloudAPI(config: config, session: URLSession(configuration: configuration)),
+            localStore: store,
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(StoredCloudSession(
+            session: CloudSession(accountId: accountId, deviceId: "stale-edit-device", token: "stale-edit-token"),
+            phone: "+992900000301",
+            displayName: "Editor"
+        ))
+        model.activeDialogId = dialogId
+        await model.loadLocalLines(dialogId: dialogId)
+        let line = try XCTUnwrap(model.lines.first(where: { $0.msgId == 7 }))
+        model.beginEditing(line)
+        model.draft = "my corrected text"
+
+        await model.edit(line, text: "my corrected text")
+
+        return (
+            model.draft, model.composerMode, line.id,
+            try await store.messageMutations(dialogId: dialogId), paths.values
+        )
+    }
+
+    @MainActor
     func testReactionAndForwardRequestsCarryStableSourceAndMutationIdentifiers() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
@@ -6200,6 +6313,23 @@ private final class LockedMediaRequests: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+}
+
+private final class LockedPaths: @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: [String] = []
+
+    func append(_ path: String) {
+        lock.lock()
+        paths.append(path)
+        lock.unlock()
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths
     }
 }
 

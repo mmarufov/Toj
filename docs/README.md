@@ -47,6 +47,7 @@ local measurements.
 | [Session, receipt, client-address and fan-out hardening](results/step1-hardening.md) | Render client-address verification, statements per group send, overlapping-send deadlock test, negative controls |
 | [Sync under injected network faults](results/sync-chaos.md) | Toxiproxy sweep of the sync protocol: messages lost, duplicated and mismatched, and convergence time ([pre-registration](results/sync-chaos-preregistration.md)) |
 | [OTP fraud rules on replayed SMS pumping](results/otp-fraud-replay.md) | Simulated SMS-pumping attacks against the sign-in fraud rules, reported on held-out seeds ([pre-registration](results/otp-fraud-preregistration.md)) |
+| [Slack bridge under faults](results/slack-bridge.md) | The Toj-Slack bridge against a fake Slack that retries, duplicates, reorders and rate-limits, Toxiproxy on the Toj link, and SIGKILLs: lost, duplicated, echoed, ordering, latency ([pre-registration](results/slack-bridge-preregistration.md)) |
 
 ## Implementation plans
 
@@ -59,6 +60,12 @@ with the code, the code is right.
 | [Groups v1](plans/groups-v1.md) | Group messaging |
 | [Saved Messages](plans/saved-messages.md) | Saved Messages and the self-dialog |
 | [Group calls and screen share](plans/group-calls-screen-share.md) | SFU group calling, ReplayKit broadcast |
+
+## Integrations
+
+| Document | What it covers |
+| --- | --- |
+| [Slack bridge](../integrations/slack-bridge/README.md) | A Go developer integration that mirrors a Toj group into a Slack channel and back. Not part of the app and not deployed |
 
 ## Contributing and security
 

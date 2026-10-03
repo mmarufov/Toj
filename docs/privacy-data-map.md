@@ -53,6 +53,25 @@ they protect.
 | Read state, message mutations, call history, group activity, and safety workflow state | Normal feature use | PostgreSQL sync, lifecycle, budget, and audit rows | Apple receives only the push delivery needed to wake an eligible device | Feature-specific retention; call metadata 30 days; report audit metadata 365 days after resolution | true | App Functionality | ProductInteraction / Usage Data |
 | Sanitized call outcome and quality buckets | One terminal call telemetry submission | Low-cardinality operational log without call, account, device, phone, SDP, candidate, key, or media identifiers | Operational logging/metrics processor only if configured under the same no-tracking contract | Short operational metrics window | false | App Functionality | PerformanceData / Diagnostics |
 | Call telemetry authorization/deduplication receipt | Authenticated telemetry ingress | Call/device receipt used only to authorize one submission | None | Call lifecycle/cleanup window | true | App Functionality | ProductInteraction and DeviceID / Usage Data and Identifiers |
+| Group message text mirrored to Slack (only groups an operator has paired with a Slack channel) | Slack bridge (`integrations/slack-bridge`), a separate service signed in as a visible group member | The bridge's own SQLite file holds the message map, pending work and Slack event ids; message text is cleared from it once mirrored | Slack (Salesforce, United States) receives the text, the sender's Toj display name, and the Toj group and message ids as message metadata | Toj side unchanged; Slack copies follow the Slack workspace's retention, and the bridge deletes its Slack copy when the Toj message is deleted | true | App Functionality | Not an app collection path: no manifest change; see the Slack bridge section |
+
+## Slack bridge (developer integration)
+
+`integrations/slack-bridge` mirrors a Toj group into a Slack channel and back. It is not part of the
+app and changes nothing the app collects. It does move content to a third party, so these rules
+hold:
+
+- **Opt-in per group.** The bridge mirrors only the pairs in its `BRIDGE_PAIRS` setting. Nothing is
+  bridged by default.
+- **Visible.** The bridge is an ordinary Toj account and must be added to the group as a member,
+  so every member sees it in the member list. Its messages in Toj carry the Slack author's name.
+- **Text leaves Toj.** Mirrored text, the sender's display name and the Toj ids go to Slack, a US
+  service outside Toj's domestic hosting. Slack-to-Toj text is stored by Toj like any other
+  cloud-chat message.
+- **Secret Chats can never be bridged.** A bridge would have to hold the chat's keys, which defeats
+  end-to-end encryption.
+- **Local state.** The bridge keeps message text in its SQLite file only until it is mirrored, then
+  clears it. Slack event ids are kept for 24 hours for deduplication.
 
 ## Explicit exclusions in the current release
 
