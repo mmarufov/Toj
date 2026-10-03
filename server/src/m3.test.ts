@@ -2111,6 +2111,87 @@ describe("M3 cloud sync", () => {
     expect(liveBody).toBe("");
   });
 
+  test("edits, deletes, reactions and reads wake sockets on other server instances", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "wake the other node",
+    });
+    const previousNotificationURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL = TEST_URL;
+    // Bob's socket lives on node A; every change is made through node B. Node B has no socket for
+    // Bob, so a hint can only reach him through the database notification.
+    const socketNode = startCloudServer(0, db, null, null, { backgroundWorkers: true });
+    const mutationNode = startCloudServer(0, db, null, null, { backgroundWorkers: true });
+    const socket = new WebSocket(`ws://127.0.0.1:${socketNode.port}/v1/ws`, {
+      headers: { authorization: `Bearer ${bob.token}` },
+    });
+    const hints: number[] = [];
+    socket.onmessage = (message) => {
+      try {
+        const value = JSON.parse(String(message.data));
+        if (value.type === "sync_hint") hints.push(Number(value.pts));
+      } catch {}
+    };
+    const post = async (path: string, token: string, body: unknown) => {
+      const response = await fetch(`http://127.0.0.1:${mutationNode.port}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(200);
+      await response.json();
+    };
+    const bobPts = async () => Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${bob.accountId}`)[0].pts);
+    const expectHint = async (label: string) => {
+      const pts = await bobPts();
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline && !hints.some((hint) => hint >= pts)) await Bun.sleep(25);
+      if (!hints.some((hint) => hint >= pts)) throw new Error(`${label}: no cross-node hint for pts ${pts}`);
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.onopen = () => resolve();
+        socket.onerror = () => reject(new Error("websocket error"));
+      });
+      // Let both LISTEN connections reach readiness before committing anything.
+      await Bun.sleep(150);
+      await post("/v1/messages/edit", alice.token, {
+        dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(),
+        body: "edited on node B", expectedEditVersion: 0,
+      });
+      await expectHint("edit");
+      await post("/v1/messages/react", alice.token, {
+        dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(), emoji: "👍",
+      });
+      await expectHint("reaction");
+      await post("/v1/messages/delete", alice.token, {
+        dialogId, msgId: sent.msgId, clientMutationId: crypto.randomUUID(),
+      });
+      await expectHint("delete");
+      const second = await sendMessage(db, {
+        senderAccountId: alice.accountId,
+        senderDeviceId: alice.deviceId,
+        dialogId,
+        clientMsgId: crypto.randomUUID(),
+        body: "read me",
+      });
+      await expectHint("send");
+      // A read reaches only the reader's own devices, here Bob's socket on node A.
+      await post("/v1/read", bob.token, { dialogId, maxReadMsgId: second.msgId });
+      await expectHint("read");
+    } finally {
+      socket.close();
+      await Promise.race([Promise.all([socketNode.stop(true), mutationNode.stop(true)]), Bun.sleep(1_000)]);
+      if (previousNotificationURL === undefined) delete process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+      else process.env.TOJ_CALL_NOTIFY_DATABASE_URL = previousNotificationURL;
+    }
+  }, 15_000);
+
   test("only a message sender can edit or delete and stale edits are rejected", async () => {
     const { alice, bob, dialogId } = await makePair();
     const sent = await sendMessage(db, {

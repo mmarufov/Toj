@@ -1765,6 +1765,8 @@ async function mutateMessage(sql: SQL, p: {
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}`;
     const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
     if (!message) throw new SyncError("message not found after mutation");
+    // Sockets on other server instances learn of the change only through this notification.
+    await notifySyncWakeups(tx, pushes);
     return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
   });
 }
@@ -1842,6 +1844,7 @@ export async function setReaction(sql: SQL, p: {
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}`;
     const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
     if (!message) throw new SyncError("message not found");
+    await notifySyncWakeups(tx, pushes);
     return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
   });
 }
@@ -2748,6 +2751,7 @@ export async function readHistory(sql: SQL, p: {
       recipientAccountIds: access.type === "group" ? [p.accountId] : undefined,
       data: JSON.parse(data),
     }));
+    await notifySyncWakeups(tx, pushes);
     return { dialogId: p.dialogId, maxReadMsgId: n(member.last_read_msg_id), unreadCount, pushes };
   });
 }
