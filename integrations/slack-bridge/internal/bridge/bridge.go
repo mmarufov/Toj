@@ -84,6 +84,18 @@ type Bridge struct {
 	wakeOut    map[string]chan struct{}
 	EventsWake chan struct{}
 	Pacers     map[string]*slack.Pacer
+
+	// crash stands in for a kill -9 in unit tests: at a named point it returns an error that aborts
+	// the operation exactly where the process would have died. Nil outside tests.
+	crash func(point string) error
+}
+
+func (b *Bridge) reach(point string) error {
+	faults.Reach(point)
+	if b.crash != nil {
+		return b.crash(point)
+	}
+	return nil
 }
 
 func (b *Bridge) init() {

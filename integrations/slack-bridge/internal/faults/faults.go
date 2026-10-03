@@ -16,9 +16,11 @@ import (
 // measured count at zero; main refuses to start with any of them unless TOJ_BRIDGE_ALLOW_NEGATIVE_CONTROL=1.
 type Controls struct {
 	DisableLoopGuard   bool // mirror every message, including the bridge's own
-	DisableEventDedupe bool // process every Slack delivery, including retries of a seen event_id
+	DisableEventDedupe bool // process every Slack delivery: no event_id check and no message-map check
 	DisableReconcile   bool // repost an attempted intent without checking channel history
 	CursorOutsideTx    bool // commit the Toj cursor before, and separately from, the intents
+	RandomTojIDs       bool // send Slack messages to Toj with a random clientMsgId
+	IgnoreRetryAfter   bool // retry a 429 at once instead of waiting out Retry-After
 }
 
 const EnvControls = "TOJ_BRIDGE_NEGATIVE_CONTROL"
@@ -36,6 +38,10 @@ func ParseControls(value string) (Controls, error) {
 			c.DisableReconcile = true
 		case "cursor_tx":
 			c.CursorOutsideTx = true
+		case "client_msg_id":
+			c.RandomTojIDs = true
+		case "retry_after":
+			c.IgnoreRetryAfter = true
 		default:
 			return c, fmt.Errorf("unknown negative control %q", name)
 		}
@@ -44,7 +50,8 @@ func ParseControls(value string) (Controls, error) {
 }
 
 func (c Controls) Any() bool {
-	return c.DisableLoopGuard || c.DisableEventDedupe || c.DisableReconcile || c.CursorOutsideTx
+	return c.DisableLoopGuard || c.DisableEventDedupe || c.DisableReconcile || c.CursorOutsideTx ||
+		c.RandomTojIDs || c.IgnoreRetryAfter
 }
 
 func (c Controls) String() string {
@@ -60,6 +67,12 @@ func (c Controls) String() string {
 	}
 	if c.CursorOutsideTx {
 		names = append(names, "cursor_tx")
+	}
+	if c.RandomTojIDs {
+		names = append(names, "client_msg_id")
+	}
+	if c.IgnoreRetryAfter {
+		names = append(names, "retry_after")
 	}
 	return strings.Join(names, ",")
 }

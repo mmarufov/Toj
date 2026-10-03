@@ -2,10 +2,12 @@ package bridge
 
 import (
 	"context"
+
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"strconv"
 	"time"
 
@@ -151,11 +153,15 @@ func (b *Bridge) slackNew(ctx context.Context, e store.PendingEvent, pair Pair, 
 		}
 		return b.finishEvent(ctx, e, "echo", nil)
 	}
+	// The map is the bridge's second dedupe of Slack deliveries, after the event_id table. A
+	// Toj-origin row is the bridge's own post, which only reaches here with the loop guard off.
 	if mapping, err := store.MappingBySlack(ctx, b.Store.DB, pair.SlackChannel, m.TS); err == nil {
-		if mapping.Deleted {
+		if mapping.Origin == "slack" && mapping.Deleted {
 			return b.finishEvent(ctx, e, "tombstoned", nil)
 		}
-		return b.finishEvent(ctx, e, "already_mirrored", nil)
+		if mapping.Origin == "slack" && !b.Controls.DisableEventDedupe {
+			return b.finishEvent(ctx, e, "already_mirrored", nil)
+		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
@@ -178,7 +184,11 @@ func (b *Bridge) slackNew(ctx context.Context, e store.PendingEvent, pair Pair, 
 // sendToToj sends with clientMsgId = UUIDv5(channel, ts). A retry of the same Slack message, from
 // any layer, returns the message the first attempt created.
 func (b *Bridge) sendToToj(ctx context.Context, pair Pair, ts, text string) (int64, string, error) {
-	res, err := b.Toj.Send(ctx, pair.TojDialog, SlackSendID(pair.SlackChannel, ts), text)
+	clientMsgID := SlackSendID(pair.SlackChannel, ts)
+	if b.Controls.RandomTojIDs {
+		clientMsgID = uuid.NewString()
+	}
+	res, err := b.Toj.Send(ctx, pair.TojDialog, clientMsgID, text)
 	if err != nil {
 		if toj.Retryable(err) {
 			b.Stats.TojSendRetries.Add(1)
@@ -193,7 +203,9 @@ func (b *Bridge) sendToToj(ctx context.Context, pair Pair, ts, text string) (int
 	if res.Duplicate {
 		b.Stats.TojDuplicateAcks.Add(1)
 	}
-	faults.Reach(faults.AfterTojSend)
+	if err := b.reach(faults.AfterTojSend); err != nil {
+		return 0, "", err
+	}
 	return res.MsgID, "sent", nil
 }
 

@@ -16,6 +16,10 @@ import (
 
 type sqlTx = sql.Tx
 
+// BeforePageCommit is inside the page transaction, after the cursor is written. Only unit tests use
+// it; a kill there is the same as any kill before the commit.
+const BeforePageCommit = "before_page_commit"
+
 // ApplyPage turns one Toj difference page into outbound intents and advances the cursor, in one
 // transaction. A crash before the commit replays the page from the old cursor; a crash after it
 // finds the intents already written. Either way nothing is lost and nothing is planned twice.
@@ -38,7 +42,9 @@ func (b *Bridge) ApplyPage(ctx context.Context, page toj.Difference) error {
 			return err
 		}
 		if len(page.Updates) > 0 {
-			faults.Reach(faults.AfterCursorCommit)
+			if err := b.reach(faults.AfterCursorCommit); err != nil {
+				return err
+			}
 		}
 		if err := b.Store.Tx(ctx, plan); err != nil {
 			return err
@@ -48,7 +54,13 @@ func (b *Bridge) ApplyPage(ctx context.Context, page toj.Difference) error {
 			if err := plan(tx); err != nil {
 				return err
 			}
-			return store.SetCursor(ctx, tx, page.State.PTS)
+			if err := store.SetCursor(ctx, tx, page.State.PTS); err != nil {
+				return err
+			}
+			if len(page.Updates) > 0 {
+				return b.reach(BeforePageCommit) // a crash here rolls the whole page back
+			}
+			return nil
 		})
 		if err != nil {
 			return err
@@ -248,7 +260,9 @@ func (b *Bridge) post(ctx context.Context, pacer *slack.Pacer, in store.Intent) 
 		return b.slackFailure(ctx, pacer, in, err, true)
 	}
 	b.Stats.SlackPosts.Add(1)
-	faults.Reach(faults.AfterSlackPost)
+	if err := b.reach(faults.AfterSlackPost); err != nil {
+		return err
+	}
 	return b.recordPost(ctx, in, ts, "posted")
 }
 
@@ -270,7 +284,9 @@ func (b *Bridge) slackFailure(ctx context.Context, pacer *slack.Pacer, in store.
 	switch {
 	case errors.As(err, &limited):
 		b.Stats.SlackRateLimited.Add(1)
-		pacer.RateLimited(limited.RetryAfter)
+		if !b.Controls.IgnoreRetryAfter {
+			pacer.RateLimited(limited.RetryAfter)
+		}
 		if attempted {
 			if undoErr := b.Store.UndoAttempt(ctx, in.ID); undoErr != nil {
 				return undoErr
