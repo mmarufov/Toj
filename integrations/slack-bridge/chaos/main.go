@@ -92,6 +92,7 @@ type options struct {
 	Label          string   `json:"label"`
 	Controls       string   `json:"negativeControls"`
 	ControlSet     string   `json:"controlSet"`
+	P429           float64  `json:"p429"`
 	KillPoints     []string `json:"killPoints"`
 	Pacer          string   `json:"pacer"`
 	GapMs          int      `json:"gapMs"`
@@ -118,6 +119,7 @@ func parseOptions(args []string) options {
 	fs.BoolVar(&o.Mild, "mild", false, "CI smoke toxics")
 	fs.StringVar(&o.Label, "label", "", "free-text label stored in the results")
 	fs.StringVar(&o.Controls, "negative-control", "", "TOJ_BRIDGE_NEGATIVE_CONTROL for the bridge")
+	fs.Float64Var(&o.P429, "p-429", 0.03, "probability the fake answers a channel call with 429")
 	fs.StringVar(&o.ControlSet, "control-set", "", "run each item once on the first scenario instead of the sweep: "+
 		"controls[@kill-point] separated by ';', e.g. 'loop_guard;cursor_tx@after_cursor_commit'")
 	fs.StringVar(&killList, "kill-points", strings.Join(defaultKillPoints, ","), "kill k uses point k mod n")
@@ -231,14 +233,14 @@ func machine() string {
 	return fmt.Sprintf("%s; %d cores", output("uname", "-sr"), runtime.NumCPU())
 }
 
-func slackConfig(seed uint64) slackfake.Config {
+func slackConfig(seed uint64, p429 float64) slackfake.Config {
 	return slackfake.Config{
 		SigningSecret: "chaos-signing-secret", BotToken: "xoxb-chaos", BotID: "B0BRIDGE", BotUserID: "U0BRIDGE",
 		AppID: "A0BRIDGE", Seed: seed,
 		RetrySchedule: []time.Duration{time.Second, 6 * time.Second, 30 * time.Second},
 		AckTimeout:    3 * time.Second, Concurrency: 8,
 		PDuplicate: 0.05, ReorderJitter: 300 * time.Millisecond, PSlowAck: 0.05,
-		PRateLimit: 0.03, RetryAfter: time.Second, PDropReply: 0.03,
+		PRateLimit: p429, RetryAfter: time.Second, PDropReply: 0.03,
 	}
 }
 
@@ -284,7 +286,7 @@ func sweep(o options) (*report, error) {
 		Postgres: strings.SplitN(output("psql", dbURL, "-tAc", "SELECT version()"), ",", 2)[0], Toxiproxy: proxy.version(),
 		Command: "go run ./chaos " + strings.Join(os.Args[1:], " "), Options: o,
 		Simulated: "Slack is the in-process fake (internal/slackfake); every Slack-side number is simulated Slack",
-	}, SlackFaults: slackConfig(o.Seed)}
+	}, SlackFaults: slackConfig(o.Seed, o.P429)}
 
 	// Three accounts per sweep: Toj limits OTP requests per network, so runs share them and each run
 	// gets a new group. The bridge's session is carried from run to run and rotates as it goes.
@@ -337,6 +339,9 @@ func sweep(o options) (*report, error) {
 		var labels []scenario
 		for i, item := range strings.Split(o.ControlSet, ";") {
 			controls, killPoint, _ := strings.Cut(strings.TrimSpace(item), "@")
+			if controls == "none" {
+				controls = "" // the same run with every protection on, as the comparison
+			}
 			run := o
 			run.Controls = controls
 			if killPoint != "" {
@@ -491,7 +496,7 @@ func runOnce(ctx context.Context, o options, sc scenario, si, run int, seed uint
 	}
 	st.Close()
 
-	cfg := slackConfig(seed)
+	cfg := slackConfig(seed, o.P429)
 	fake := slackfake.New(cfg)
 	fake.AddUser("U0ALICE", "alice")
 	fake.AddUser("U0BOB", "bob")
